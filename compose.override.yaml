@@ -1,0 +1,50 @@
+# Dev overrides — applied automatically by `docker compose`.
+# Bind-mounts source for hot reload, exposes DB/Redis to the host, adds MailHog.
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  web:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      COOKIE_SECURE: "false"
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+    volumes:
+      - ./app:/srv/app
+      - ./alembic:/srv/alembic
+      - ./alembic.ini:/srv/alembic.ini
+      - ./clipfinder.py:/srv/clipfinder.py
+      - ./pipeline.py:/srv/pipeline.py
+      - ./clipfinder.toml:/srv/clipfinder.toml
+      - media:/media
+    ports:
+      - "8001:8000"
+
+  worker:
+    command: ["arq", "app.worker.WorkerSettings", "--watch", "app"]
+    environment:
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+    volumes:
+      - ./app:/srv/app
+      - ./clipfinder.py:/srv/clipfinder.py
+      - ./pipeline.py:/srv/pipeline.py
+      - ./clipfinder.toml:/srv/clipfinder.toml
+      - media:/media
+
+  # local SMTP catch-all — web UI on http://localhost:8025 (MailHog's maintained successor)
+  mailhog:
+    image: axllent/mailpit:v1.21
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "8025:8025"
+    restart: unless-stopped

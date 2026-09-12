@@ -1,0 +1,280 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Instrument+Sans:wght@400;500;600&display=swap">
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Instrument Sans", system-ui, sans-serif; background: #0b0d14; color: #f4f5fa; -webkit-font-smoothing: antialiased; }
+    .display { font-family: "Space Grotesk", system-ui, sans-serif; }
+    a { color: #b7abff; } a:hover { color: #d3ccff; }
+    .glass { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(20px) saturate(140%); }
+    ::-webkit-scrollbar { width: 8px; } ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 8px; }
+    @keyframes ws1 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(120px,80px); } }
+    @keyframes ws2 { 0%,100% { transform: translate(0,0); } 50% { transform: translate(-100px,-60px); } }
+    @media (prefers-reduced-motion: reduce) { .blob { animation: none !important; } }
+  </style>
+</helmet>
+
+<div style="position: relative; width: 1440px; height: 1010px; overflow: hidden; background:
+     radial-gradient(1000px 600px at 0% 0%, #16192a 0%, transparent 55%),
+     radial-gradient(900px 600px at 100% 100%, #132029 0%, transparent 55%),
+     #0b0d14;">
+
+  <div style="position: absolute; inset: 0; overflow: hidden; z-index: 0; pointer-events: none;">
+    <div class="blob" style="position: absolute; top: -180px; left: 320px; width: 620px; height: 620px; border-radius: 999px; filter: blur(110px); background: radial-gradient(circle, rgba(139,124,250,0.28), transparent 68%); animation: ws1 46s ease-in-out infinite;"></div>
+    <div class="blob" style="position: absolute; bottom: -200px; right: 180px; width: 640px; height: 640px; border-radius: 999px; filter: blur(120px); background: radial-gradient(circle, rgba(70,200,234,0.22), transparent 68%); animation: ws2 54s ease-in-out infinite;"></div>
+  </div>
+
+  <div style="position: relative; z-index: 1; height: 100%; display: flex; flex-direction: column; padding: 18px;">
+
+    <!-- top bar -->
+    <div class="glass" style="display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-radius: 16px;">
+      <div style="display: flex; align-items: center; gap: 13px;">
+        <div style="width: 26px; height: 26px; border-radius: 8px; display: grid; place-items: center; background: linear-gradient(135deg, #8b7cfa, #46c8ea);">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#0b0d14" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg>
+        </div>
+        <span class="display" style="font-weight: 700; font-size: 16px;">clipfinder</span>
+        <span style="width: 1px; height: 20px; background: rgba(255,255,255,0.14); margin: 0 4px;"></span>
+        <span style="font-size: 13.5px; color: #c2c6d2;">stream_vod_04.mp4</span>
+        <span style="font-size: 12.5px; color: #7f8598;">47:12 · 720p</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 10px;">
+        <span style="display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: #7ee0b4; padding: 6px 12px; border-radius: 999px; background: rgba(126,224,180,0.12); border: 1px solid rgba(126,224,180,0.25);">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg>
+          Analysis complete
+        </span>
+        <button style="font-family: inherit; font-weight: 600; font-size: 13.5px; color: #0b0d14; padding: 9px 18px; border-radius: 11px; border: 0; cursor: pointer; background: linear-gradient(135deg, #a99bff, #46c8ea); box-shadow: 0 8px 22px rgba(139,124,250,0.34);">
+          Render queue · 3
+        </button>
+      </div>
+    </div>
+
+    <!-- workspace grid -->
+    <div style="flex-grow: 1; display: grid; grid-template-columns: 336px minmax(0, 1fr) 336px; gap: 16px; margin-top: 16px; min-height: 0;">
+
+      <!-- LEFT: AI highlights -->
+      <div class="glass" style="border-radius: 18px; display: flex; flex-direction: column; overflow: hidden;">
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 16px 16px 12px;">
+          <span class="display" style="font-size: 14px; font-weight: 600;">AI Highlights</span>
+          <span style="font-size: 12px; color: #7f8598;">8 found · ranked</span>
+        </div>
+        <div style="flex-grow: 1; overflow-y: auto; padding: 0 12px 12px; display: flex; flex-direction: column; gap: 9px;">
+
+          <!-- selected row -->
+          <div style="padding: 13px; border-radius: 13px; background: rgba(139,124,250,0.13); border: 1px solid rgba(139,124,250,0.4);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;">
+              <span class="display" style="font-size: 12.5px; color: #cbc4ff;">04:12 – 04:41</span>
+              <span style="display: flex; gap: 5px;">
+                <span class="display" style="font-size: 11px; font-weight: 600; color: #0b0d14; padding: 2px 7px; border-radius: 999px; background: #7ee0b4;">9.1</span>
+                <span class="display" style="font-size: 11px; font-weight: 600; color: #cbd3e0; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,0.1);">V4</span>
+              </span>
+            </div>
+            <div style="font-size: 13px; line-height: 1.45; color: #eceef4;">“I declare war on Russia! I declare war! No safety goggles.”</div>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 10px;">
+              <button style="font-family: inherit; font-size: 12px; font-weight: 600; color: #0b0d14; padding: 6px 12px; border-radius: 9px; border: 0; cursor: pointer; background: #b7abff;">Loaded in editor</button>
+              <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #b9bdcc; cursor: pointer;">
+                <span style="width: 15px; height: 15px; border-radius: 5px; display: grid; place-items: center; background: #7ee0b4;">
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#0b0d14" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 5 5L20 7"/></svg>
+                </span>
+                Queued
+              </label>
+            </div>
+          </div>
+
+          <!-- other rows -->
+          <div style="padding: 13px; border-radius: 13px; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;">
+              <span class="display" style="font-size: 12.5px; color: #9aa0b4;">18:47 – 19:09</span>
+              <span style="display: flex; gap: 5px;"><span class="display" style="font-size: 11px; font-weight: 600; color: #0b0d14; padding: 2px 7px; border-radius: 999px; background: #8fd0ee;">8.4</span><span class="display" style="font-size: 11px; font-weight: 600; color: #cbd3e0; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,0.1);">V5</span></span>
+            </div>
+            <div style="font-size: 13px; line-height: 1.45; color: #cdd0da;">“How the hell did y'all find my third grade photo from when I was eight?”</div>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 10px;">
+              <button style="font-family: inherit; font-size: 12px; font-weight: 600; color: #dfe2ec; padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.16); cursor: pointer; background: transparent;">Load in editor</button>
+              <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #868ca0; cursor: pointer;"><span style="width: 15px; height: 15px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.22);"></span>Queue</label>
+            </div>
+          </div>
+
+          <div style="padding: 13px; border-radius: 13px; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;">
+              <span class="display" style="font-size: 12.5px; color: #9aa0b4;">31:02 – 31:24</span>
+              <span style="display: flex; gap: 5px;"><span class="display" style="font-size: 11px; font-weight: 600; color: #0b0d14; padding: 2px 7px; border-radius: 999px; background: #8fd0ee;">8.0</span><span class="display" style="font-size: 11px; font-weight: 600; color: #cbd3e0; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,0.1);">V3</span></span>
+            </div>
+            <div style="font-size: 13px; line-height: 1.45; color: #cdd0da;">“Nick 830, it's you! It's me! It's really family-friendly Nick right here!”</div>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 10px;">
+              <button style="font-family: inherit; font-size: 12px; font-weight: 600; color: #dfe2ec; padding: 6px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.16); cursor: pointer; background: transparent;">Load in editor</button>
+              <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #868ca0; cursor: pointer;"><span style="width: 15px; height: 15px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.22);"></span>Queue</label>
+            </div>
+          </div>
+
+          <div style="padding: 13px; border-radius: 13px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); opacity: 0.55;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px;">
+              <span class="display" style="font-size: 12.5px; color: #9aa0b4;">39:55 – 40:18</span>
+              <span style="display: flex; gap: 5px;"><span class="display" style="font-size: 11px; font-weight: 600; color: #0b0d14; padding: 2px 7px; border-radius: 999px; background: #d7c98f;">7.2</span></span>
+            </div>
+            <div style="font-size: 13px; line-height: 1.45; color: #c2c6d2;">“Come on bro, I want a dance battle. Do that again.”</div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- CENTER: player + timeline editor -->
+      <div style="display: flex; flex-direction: column; gap: 14px; min-height: 0;">
+        <div class="glass" style="border-radius: 18px; padding: 14px; display: flex; flex-direction: column; gap: 12px;">
+          <!-- video -->
+          <div style="position: relative; aspect-ratio: 16 / 9; border-radius: 12px; overflow: hidden; background: linear-gradient(150deg, #1b1f2e, #10131d); display: grid; place-items: center;">
+            <div style="width: 62px; height: 62px; border-radius: 999px; display: grid; place-items: center; background: rgba(255,255,255,0.14); backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.22);">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="#f4f5fa"><path d="M8 5v14l11-7z"/></svg>
+            </div>
+            <span style="position: absolute; left: 14px; bottom: 12px; font-family: 'Space Grotesk'; font-size: 12px; color: #cbd0dc; background: rgba(0,0,0,0.4); padding: 3px 8px; border-radius: 7px;">04:18 / 47:12</span>
+          </div>
+
+          <!-- TIMELINE editor -->
+          <div style="display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <span class="display" style="font-size: 13px; font-weight: 600; color: #dfe2ec;">Timeline</span>
+              <span style="font-size: 12px; color: #7f8598;">drag the handles, or click a highlight below</span>
+            </div>
+
+            <!-- scrubber -->
+            <div style="position: relative; height: 56px; border-radius: 12px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09); overflow: hidden;">
+              <!-- highlight markers -->
+              <div style="position: absolute; top: 8px; bottom: 8px; left: 8.9%; width: 1%; border-radius: 4px; background: rgba(139,124,250,0.85);" title="04:12 – 04:41 · 9.1"></div>
+              <div style="position: absolute; top: 8px; bottom: 8px; left: 39.7%; width: 0.8%; border-radius: 4px; background: rgba(70,200,234,0.8);"></div>
+              <div style="position: absolute; top: 8px; bottom: 8px; left: 65.8%; width: 0.8%; border-radius: 4px; background: rgba(70,200,234,0.8);"></div>
+              <div style="position: absolute; top: 8px; bottom: 8px; left: 84.6%; width: 0.7%; border-radius: 4px; background: rgba(224,102,140,0.7);"></div>
+
+              <!-- current selection window -->
+              <div style="position: absolute; top: 0; bottom: 0; left: 7.6%; width: 10.4%; background: rgba(139,124,250,0.16); border-left: 2px solid #b7abff; border-right: 2px solid #b7abff;"></div>
+              <!-- in / out handles -->
+              <div style="position: absolute; top: 50%; left: 7.6%; transform: translate(-50%,-50%); width: 12px; height: 30px; border-radius: 5px; background: #b7abff; box-shadow: 0 2px 8px rgba(0,0,0,0.4); cursor: ew-resize; display: grid; place-items: center;">
+                <span style="width: 2px; height: 12px; background: rgba(11,13,20,0.5);"></span>
+              </div>
+              <div style="position: absolute; top: 50%; left: 18%; transform: translate(-50%,-50%); width: 12px; height: 30px; border-radius: 5px; background: #b7abff; box-shadow: 0 2px 8px rgba(0,0,0,0.4); cursor: ew-resize; display: grid; place-items: center;">
+                <span style="width: 2px; height: 12px; background: rgba(11,13,20,0.5);"></span>
+              </div>
+              <!-- playhead -->
+              <div style="position: absolute; top: -2px; bottom: -2px; left: 9.1%; width: 2px; background: #f4f5fa;"></div>
+              <div style="position: absolute; top: -6px; left: 9.1%; transform: translateX(-50%); width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid #f4f5fa;"></div>
+            </div>
+
+            <!-- readout + controls -->
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+              <div style="display: flex; align-items: baseline; gap: 10px;">
+                <span class="display" style="font-size: 15px; font-weight: 600;">04:12 – 04:41</span>
+                <span style="font-size: 12.5px; color: #7f8598;">selection · 0:29</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <button style="font-family: inherit; font-size: 12.5px; color: #dfe2ec; padding: 7px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.14); cursor: pointer; background: transparent;">Set in</button>
+                <button style="font-family: inherit; font-size: 12.5px; color: #dfe2ec; padding: 7px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.14); cursor: pointer; background: transparent;">Set out</button>
+                <button style="display: inline-flex; align-items: center; gap: 6px; font-family: inherit; font-size: 12.5px; color: #dfe2ec; padding: 7px 12px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.14); cursor: pointer; background: transparent;">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Preview
+                </button>
+                <span style="display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: #b9bdcc; padding: 6px 10px; border-radius: 9px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);">
+                  9:16
+                  <span style="width: 30px; height: 16px; border-radius: 999px; background: rgba(255,255,255,0.14); position: relative;"><span style="position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 999px; background: #7f8598;"></span></span>
+                </span>
+                <button style="display: inline-flex; align-items: center; gap: 7px; font-family: inherit; font-weight: 600; font-size: 12.5px; color: #0b0d14; padding: 8px 14px; border-radius: 10px; border: 0; cursor: pointer; background: linear-gradient(135deg, #a99bff, #46c8ea);">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#0b0d14" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+                  Add this cut
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- highlight strip (click to load into editor) -->
+        <div class="glass" style="border-radius: 16px; padding: 12px 14px; flex-grow: 1; min-height: 0; overflow: hidden;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+            <span class="display" style="font-size: 12.5px; font-weight: 600; color: #cbd0dc;">Recommended cut points</span>
+            <span style="font-size: 11.5px; color: #7f8598;">by minute · click to jump</span>
+          </div>
+          <div style="display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;">
+            <button style="flex-shrink: 0; text-align: left; font-family: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(139,124,250,0.4); background: rgba(139,124,250,0.13); cursor: pointer; color: #f4f5fa;">
+              <div class="display" style="font-size: 12px; color: #cbc4ff;">04:12</div>
+              <div style="font-size: 11.5px; color: #b9bdcc; margin-top: 2px;">war on Russia</div>
+            </button>
+            <button style="flex-shrink: 0; text-align: left; font-family: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.045); cursor: pointer; color: #f4f5fa;">
+              <div class="display" style="font-size: 12px; color: #9aa0b4;">18:47</div>
+              <div style="font-size: 11.5px; color: #9aa0b4; margin-top: 2px;">third grade photo</div>
+            </button>
+            <button style="flex-shrink: 0; text-align: left; font-family: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.045); cursor: pointer; color: #f4f5fa;">
+              <div class="display" style="font-size: 12px; color: #9aa0b4;">31:02</div>
+              <div style="font-size: 11.5px; color: #9aa0b4; margin-top: 2px;">Nick 830</div>
+            </button>
+            <button style="flex-shrink: 0; text-align: left; font-family: inherit; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.045); cursor: pointer; color: #f4f5fa;">
+              <div class="display" style="font-size: 12px; color: #9aa0b4;">39:55</div>
+              <div style="font-size: 11.5px; color: #9aa0b4; margin-top: 2px;">dance battle</div>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: render queue + gallery -->
+      <div style="display: flex; flex-direction: column; gap: 14px; min-height: 0;">
+        <div class="glass" style="border-radius: 18px; padding: 14px; display: flex; flex-direction: column; gap: 10px;">
+          <div style="display: flex; align-items: center; justify-content: space-between;">
+            <span class="display" style="font-size: 14px; font-weight: 600;">Render queue</span>
+            <span style="font-size: 12px; color: #7f8598;">3 cuts</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 11px; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);">
+            <span class="display" style="font-size: 12px; color: #cbc4ff; min-width: 62px;">04:12</span>
+            <span style="flex-grow: 1; font-size: 12.5px; color: #dfe2ec;">war on Russia</span>
+            <span style="font-size: 10.5px; color: #8b7cfa; padding: 2px 6px; border-radius: 999px; background: rgba(139,124,250,0.16);">AI</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 11px; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);">
+            <span class="display" style="font-size: 12px; color: #9aa0b4; min-width: 62px;">22:30</span>
+            <span style="flex-grow: 1; font-size: 12.5px; color: #dfe2ec;">manual cut</span>
+            <span style="font-size: 10.5px; color: #7ee0b4; padding: 2px 6px; border-radius: 999px; background: rgba(126,224,180,0.16);">HAND</span>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; padding: 10px; border-radius: 11px; background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);">
+            <span class="display" style="font-size: 12px; color: #9aa0b4; min-width: 62px;">31:02</span>
+            <span style="flex-grow: 1; font-size: 12.5px; color: #dfe2ec;">Nick 830 · 9:16</span>
+            <span style="font-size: 10.5px; color: #8b7cfa; padding: 2px 6px; border-radius: 999px; background: rgba(139,124,250,0.16);">AI</span>
+          </div>
+          <button style="margin-top: 4px; font-family: inherit; font-weight: 600; font-size: 13.5px; color: #0b0d14; padding: 11px; border-radius: 11px; border: 0; cursor: pointer; background: linear-gradient(135deg, #a99bff, #46c8ea); box-shadow: 0 10px 26px rgba(139,124,250,0.32);">
+            Render all 3
+          </button>
+        </div>
+
+        <div class="glass" style="border-radius: 18px; padding: 14px; flex-grow: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 11px;">
+            <span class="display" style="font-size: 14px; font-weight: 600;">Rendered clips</span>
+            <span style="font-size: 12px; color: #7f8598;">2 ready</span>
+          </div>
+          <div style="flex-grow: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;">
+            <div style="border-radius: 12px; overflow: hidden; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09);">
+              <div style="position: relative; aspect-ratio: 16 / 9; background: linear-gradient(150deg, #21202e, #14131d); display: grid; place-items: center;">
+                <div style="width: 40px; height: 40px; border-radius: 999px; display: grid; place-items: center; background: rgba(255,255,255,0.16);"><svg width="16" height="16" viewBox="0 0 24 24" fill="#f4f5fa"><path d="M8 5v14l11-7z"/></svg></div>
+                <span style="position: absolute; right: 8px; bottom: 8px; font-family: 'Space Grotesk'; font-size: 10.5px; color: #cbd0dc; background: rgba(0,0,0,0.45); padding: 2px 6px; border-radius: 6px;">0:29</span>
+              </div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 11px;">
+                <span style="font-size: 12px; color: #dfe2ec;">01_war-on-russia.mp4</span>
+                <a href="#" style="display: inline-flex; color: #b7abff;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a>
+              </div>
+            </div>
+            <div style="border-radius: 12px; overflow: hidden; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.09);">
+              <div style="position: relative; aspect-ratio: 9 / 16; max-height: 150px; margin: 0 auto; background: linear-gradient(150deg, #1c2530, #12181e); display: grid; place-items: center;">
+                <div style="width: 36px; height: 36px; border-radius: 999px; display: grid; place-items: center; background: rgba(255,255,255,0.16);"><svg width="14" height="14" viewBox="0 0 24 24" fill="#f4f5fa"><path d="M8 5v14l11-7z"/></svg></div>
+                <span style="position: absolute; right: 8px; bottom: 8px; font-family: 'Space Grotesk'; font-size: 10px; color: #cbd0dc; background: rgba(0,0,0,0.45); padding: 2px 5px; border-radius: 5px;">0:24 · 9:16</span>
+              </div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 9px 11px;">
+                <span style="font-size: 12px; color: #dfe2ec;">02_manual-cut.mp4</span>
+                <a href="#" style="display: inline-flex; color: #b7abff;"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></svg></a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

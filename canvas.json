@@ -1,0 +1,13 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 1440, "h": 1990, "title": "Landing" },
+    { "file": "Workspace.dc.html", "x": 1560, "y": 0, "w": 1440, "h": 1010, "title": "App — highlights + trim" },
+    { "file": "DirectionB.dc.html", "x": 0, "y": 2150, "w": 1440, "h": 880, "title": "Direction B (lo-fi)" }
+  ],
+  "annotations": [
+    { "id": "note-main", "x": -300, "y": 20, "w": 250, "text": "LEADING DIRECTION — dark, atmospheric glass with a drifting mesh background.\n\nLanding (this one) + App (to the right) are the deliverable. Static mockups." },
+    { "id": "note-app", "x": 1560, "y": -150, "w": 320, "text": "The manual-cut feature lives here: click a highlight to load its range, or drag the two handles to set your own in/out. Queue AI + hand cuts together, render horizontal or 9:16." },
+    { "id": "note-dirb", "x": -300, "y": 2170, "w": 250, "text": "ALTERNATE — lighter, centered, calmer, one focal action. Wireframe on purpose. If this vibe wins, Landing gets rebuilt into it." }
+  ],
+  "launch": { "view": "canvas" }
+}

@@ -1,0 +1,33 @@
+# {$DOMAIN} is ":80" in dev (plain HTTP) or "clips.example.com" in prod (auto-HTTPS).
+{$DOMAIN} {
+	encode zstd gzip
+
+	# resumable uploads (tusd) — stream, don't buffer
+	@files path /files /files/*
+	handle @files {
+		reverse_proxy tusd:1080 {
+			flush_interval -1
+		}
+	}
+
+	# API + media
+	@api path /api/* /media/*
+	handle @api {
+		reverse_proxy web:8000
+	}
+
+	# SPA — static build in prod; in dev the web container also serves it
+	handle {
+		reverse_proxy web:8000
+	}
+
+	request_body {
+		max_size 2GB
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

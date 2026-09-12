@@ -1,0 +1,34 @@
+# clipfinder configuration.  CLI flags override anything set here.
+
+[picker]
+backend      = "groq"                    # "groq" (free) | "claude" (better, needs ANTHROPIC_API_KEY)
+groq_model   = "openai/gpt-oss-20b"      # 20b: fast, easy on the free tier · 120b: sharper picks, more waiting
+claude_model = "claude-opus-5"           # or "claude-sonnet-5" / "claude-haiku-4-5"
+temperature  = 0.3                       # 0 = most consistent between runs, higher = more variety
+
+[clips]
+count        = 6                         # clips per video
+taste        = "chaotic reactions, screaming, quotable lines; skip calm talking"
+min_seconds  = 10.0
+max_seconds  = 45.0
+lead_seconds = 0.4                       # padding kept BEFORE each clip's snapped start
+tail_seconds = 0.8                       # padding kept AFTER each clip's snapped end
+snap_max_shift = 4.0                     # how far (s) an edge may move to land on a sentence / pause
+min_words      = 5                       # drop clips with fewer spoken words (unless score >= 9.5)
+max_gap_seconds = 6.0                    # silent stretch this long inside a clip -> a moment boundary
+
+[transcript]
+filter_hallucinations = true            # drop held screams / repeated nonsense / low-confidence mishears
+min_avg_logprob       = -1.15           # Whisper confidence floor (more negative = keep more)
+max_compression_ratio = 2.5             # above this a segment is repetitive hallucination
+coherence_check       = true            # 1 extra LLM call: drop clips whose transcript reads as word-salad
+
+[output]
+vertical = false                        # true = also render a 1080x1920 centre crop
+loudnorm = true                         # normalize every rendered clip to -14 LUFS (the socials target)
+vision   = false                        # true = Claude scores one frame per clip (needs ANTHROPIC_API_KEY)
+
+[source]
+# extra folders the web app's "pick from this machine" browser scans
+# (Downloads / Videos / Movies / Desktop are always included)
+folders = ['C:\Users\leosa\Downloads\Video\streamer']

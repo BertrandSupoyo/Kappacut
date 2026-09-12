@@ -1,0 +1,11 @@
+.env
+clips/
+web_data/
+media/
+*.mp4
+__pycache__/
+*.pyc
+.venv/
+.ruff_cache/
+frontend/node_modules/
+frontend/dist/

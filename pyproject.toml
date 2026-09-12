@@ -1,0 +1,44 @@
+[project]
+name = "clipfinder"
+version = "0.2.0"
+description = "Find short-form clips in long videos — multi-user web app"
+requires-python = ">=3.12"
+
+# Pinned to what resolved on the Phase 0/1 discovery pass. Nothing floats.
+dependencies = [
+  # web
+  "fastapi==0.141.1",
+  "uvicorn[standard]==0.52.4",
+  "python-multipart==0.0.32",
+  "pydantic==2.13.5",
+  "pydantic-settings==2.15.0",
+  # database
+  "sqlalchemy[asyncio]==2.0.52",
+  "asyncpg==0.31.0",
+  "alembic==1.19.1",
+  "greenlet==3.5.5",
+  # queue + cache (used from Phase 4; pinned now so the image is stable)
+  "arq==0.28.0",
+  "redis[hiredis]==5.3.1",
+  # auth (Phase 2)
+  "fastapi-users[sqlalchemy]==15.0.5",
+  "fastapi-users-db-sqlalchemy==7.0.0",
+  "pwdlib[argon2]==0.3.0",
+  "pyjwt==2.13.0",
+  "email-validator==2.3.0",
+  # email (Phase 2) — rate limiting is a small Redis helper in app/ratelimit.py, no lib
+  "aiosmtplib==5.1.2",
+  # engine (unchanged)
+  "groq==1.7.0",
+  "anthropic==1.3.0",
+  "python-dotenv==1.2.3",
+  "httpx==0.28.1",
+]
+
+[tool.setuptools]
+py-modules = ["clipfinder", "pipeline"]
+packages = ["app", "app.models"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

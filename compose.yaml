@@ -1,0 +1,172 @@
+name: clipfinder
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-clipfinder}:${POSTGRES_PASSWORD:-clipfinder}@postgres:5432/${POSTGRES_DB:-clipfinder}
+  REDIS_URL: redis://redis:6379/0
+  MEDIA_ROOT: /media
+  WEB_DIR: /srv/web
+  PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  JWT_SECRET: ${JWT_SECRET:-dev-insecure-change-me}
+  VERIFICATION_TOKEN_SECRET: ${VERIFICATION_TOKEN_SECRET:-dev-insecure-change-me-2}
+  RESET_PASSWORD_TOKEN_SECRET: ${RESET_PASSWORD_TOKEN_SECRET:-dev-insecure-change-me-3}
+  ENVIRONMENT: ${ENVIRONMENT:-dev}
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clipfinder}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clipfinder}
+      POSTGRES_DB: ${POSTGRES_DB:-clipfinder}
+    volumes:
+      # Postgres 18+ images want the mount one level up (data goes in a version subdir).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clipfinder} -d ${POSTGRES_DB:-clipfinder}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    logging: *logging
+
+  web:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment: *app-env
+    volumes:
+      - media:/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  worker:
+    build: .
+    command: ["arq", "app.worker.WorkerSettings"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *app-env
+    volumes:
+      - media:/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+    # Hard guardrail so a misbehaving/oversubscribed ffmpeg run can never starve web/postgres/
+    # redis on the same box, on top of FFMPEG_THREADS (which sizes each *job's* share).
+    # Uncomment and set to (vCPU count - ~1) for the box; see DEPLOY.md "Capacity notes".
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "3.0"
+
+  # nightly pg_dump | gzip into the `backups` volume, keep the last BACKUP_KEEP.
+  # Uses the postgres image so the client version always matches the server.
+  # Ship `backups` offsite from the host (restic / rclone) — see DEPLOY.md.
+  backup:
+    image: postgres:18-alpine
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-clipfinder}
+      PGUSER: ${POSTGRES_USER:-clipfinder}
+      PGDATABASE: ${POSTGRES_DB:-clipfinder}
+      PGHOST: postgres
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        while true; do
+          f="/backups/clipfinder-$$(date -u +%Y%m%d-%H%M%S).sql.gz"
+          echo "dumping -> $$f"
+          pg_dump --no-owner --no-privileges | gzip -6 > "$$f" || echo "dump failed"
+          ls -1t /backups/clipfinder-*.sql.gz 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+          sleep 86400
+        done
+    volumes:
+      - backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+  tusd:
+    image: ghcr.io/tus/tusd:v2
+    command:
+      - -host=0.0.0.0
+      - -port=1080
+      - -base-path=/files/
+      - -behind-proxy
+      - -upload-dir=/media/_uploads
+      - -max-size=2147483648
+      - -hooks-http=http://web:8000/api/upload/hooks
+      - -hooks-http-forward-headers=Cookie,Authorization
+      - -hooks-enabled-events=pre-create,post-finish,post-terminate
+    volumes:
+      - media:/media
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+  caddy:
+    image: caddy:2.11-alpine
+    ports:
+      - "${HTTP_PORT:-8000}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  pgdata:
+  redis_data:
+  media:
+  backups:
+  caddy_data:
+  caddy_config:
