@@ -98,9 +98,3 @@ def sfx_path(user_id: uuid.UUID | None, filename: str) -> Path:
         raise ValueError("bad sfx name")
     base = builtin_sfx_dir() if user_id is None else user_sfx_dir(user_id)
     return _inside(base / filename)
-
-
-def dir_bytes(path: Path) -> int:
-    if not path.is_dir():
-        return 0
-    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())

@@ -1,110 +1,72 @@
 # clipfinder
 
-Find short-form clips in long videos with Whisper + Claude. No training, no local ML,
-nothing Smart App Control blocks.
+Find short-form clips in long videos — transcribe with Groq Whisper, pick the best
+moments with an LLM (Groq free tier by default, Claude optionally), then reframe,
+caption, color-grade and render them. Self-hosted, multi-user, open signup.
 
-## Web app
+## Architecture
+
+FastAPI (`app/`) + async SQLAlchemy + Postgres + Redis + an `arq` worker + a React/Vite
+frontend (`frontend/`), served behind Caddy with resumable uploads via `tusd`. Everything
+runs as one Docker Compose stack (`compose.yaml`). The core engine (`clipfinder.py`,
+wrapped by `pipeline.py`) is unchanged from clipfinder's original single-user design —
+the app around it handles accounts, quotas, job queuing and multi-tenant storage.
+
+- `clipfinder.py` — transcribe, pick clips (Groq or Claude), verify/refine, cut, caption
+- `pipeline.py` — thin `analyze()`/`render()` wrapper the web app calls
+- `app/` — FastAPI app: auth (cookie-based, fastapi-users), projects/jobs/editor routes,
+  quotas, the credit ledger, AI thumbnails, the arq worker
+- `frontend/` — the SPA: project list, upload, the clip editor, render panel
+- `alembic/` — DB migrations
+
+## Running it
 
 ```powershell
-$py = "..\.venv-1\Scripts\python.exe"
-& $py -m uvicorn server:app --port 8000
-# open http://127.0.0.1:8000
+cp .env.example .env    # fill in GROQ_API_KEY at minimum
+docker compose up -d
+docker compose exec web alembic upgrade head
+cd frontend && npm run dev   # dev only — prod serves the built SPA via Caddy/web
 ```
 
-Upload a video → watch it transcribe and rank highlights → on the timeline, click a
-highlight to load its range or drag the two handles for your own in/out → edit the
-auto-captions and pick a style (Clean / Bold / Box / Pop · bottom/center/top · size) with
-a live preview on the player → queue AI + hand cuts together → **Render** → play /
-download the clips (captions burned in).
+Open `http://localhost:8000` (or the Vite dev server's URL for hot reload). Full
+production deployment steps (VPS provisioning, secrets, TLS, backups, capacity sizing)
+are in `DEPLOY.md`.
 
-Keyboard: `space` play/pause · `i`/`o` set in/out · `k` preview selection · `←`/`→` step
-(shift = 5 s) · `Ctrl/⌘+Enter` add cut.
+## Project history
 
-Uploads and clips live in `web_data/<job id>/` (gitignored). Files: `server.py` (FastAPI),
-`pipeline.py` (`analyze` / `render` / `build_ass` around `clipfinder.py`), `web/` (static
-UI). Design mockups: `Main.dc.html` / `Workspace.dc.html`; build plan: `PLAN.md`.
+- `PLAN-multiuser.md` — the original 8-phase migration from a local single-user CLI/tool
+  to this multi-user app.
+- `PLAN-boost.md` — the feature roadmap built on top of it (taste-driven picking,
+  auto-render, content-category detection, trend-aware scoring, the credit ledger,
+  multi-provider AI thumbnails).
 
-## CLI
+## CLI (still available, for local single-video use outside the web app)
 
 ```
 ffmpeg  -> mono audio
 Groq    -> timestamped transcript  (whisper-large-v3-turbo, free)
-Claude  -> ranked standalone clips  (structured JSON)
+Groq/Claude -> ranked standalone clips  (structured JSON)
 ffmpeg  -> cut each clip
 ```
 
-## Setup
-
-1. Keys in `.env` (already has the Groq key; add the Anthropic one):
-
-   ```
-   GROQ_API_KEY=gsk_...          # console.groq.com   (free)
-   ANTHROPIC_API_KEY=sk-ant-...  # console.anthropic.com
-   ```
-
-2. Install (into the existing `.venv-1`):
-
-   ```powershell
-   ..\.venv-1\Scripts\python.exe -m pip install anthropic groq
-   ```
-
-## Run
-
 ```powershell
-$py = "..\.venv-1\Scripts\python.exe"
-
-# one video
-& $py clipfinder.py "C:\Users\leosa\Downloads\Video\streamer\IShowSpeed Most Random Moments!.mp4"
-
-# whole folder, 8 clips each
-& $py clipfinder.py "C:\Users\leosa\Downloads\Video\streamer" --n 8
-
-# tune it
-& $py clipfinder.py video.mp4 --taste "chaotic reactions, quotable lines; skip slow talking" `
-      --vertical --vision --model claude-sonnet-5
-
-# just see the picks, don't cut
-& $py clipfinder.py video.mp4 --dry-run
+python clipfinder.py path\to\video.mp4
+python clipfinder.py path\to\folder --n 8
+python clipfinder.py video.mp4 --taste "chaotic reactions, quotable lines; skip slow talking" --vertical --picker claude
+python clipfinder.py video.mp4 --dry-run   # just see the picks, don't cut
 ```
-
-## Output
-
-`<video folder>/clips/<video name>/`
-- `NN_title-slug.mp4` — the cut clips
-- `clips.json` — start/end, title, hook, quote, score (+ visual score with `--vision`)
-
-## Flags
 
 | flag | effect |
 |---|---|
 | `--n 10` | clips per video |
-| `--taste "..."` | free-text editing preference, passed to Claude |
-| `--model` | `claude-opus-5` (default) · `claude-sonnet-5` · `claude-haiku-4-5` |
-| `--vertical` | also render a 1080x1920 centre crop |
-| `--vision` | Claude looks at one frame per clip and scores it 1-5 |
+| `--taste "..."` | free-text editing preference passed to the picker |
+| `--picker groq` (default, free) / `--picker claude` | which LLM ranks the clips |
+| `--model` | Claude model when `--picker claude` — `claude-opus-5` (default) · `claude-sonnet-5` · `claude-haiku-4-5` |
+| `--vertical` | also render a 1080×1920 centre crop |
+| `--vision` | Claude looks at one frame per clip and scores it 1-5 (needs `ANTHROPIC_API_KEY`) |
 | `--dry-run` | transcript + picks only, no cutting |
 
-## Picker: Groq (default, free) vs Claude
+Output: `<video folder>/clips/<video name>/NN_title-slug.mp4` + `clips.json`.
 
-- `--picker groq` (default) uses `openai/gpt-oss-120b` on Groq's free tier. **No cost.**
-  The free tier is 8000 tokens/minute, so the transcript is processed in ~4-minute
-  windows and the run pauses ~60s whenever it hits the limit - a 30-min video takes a
-  few minutes of mostly waiting. Only `GROQ_API_KEY` is needed.
-- `--picker claude` uses Claude (`--model claude-opus-5` default). Better judgement on
-  hooks / payoffs, one shot over the whole transcript, ~$0.02-0.10 per video. Needs
-  `ANTHROPIC_API_KEY` with billing set up.
-
-`--vision` (Claude looks at one frame per clip) always needs `ANTHROPIC_API_KEY`.
-
-## Cost
-
-| step | groq picker | claude picker |
-|---|---|---|
-| transcription (Groq Whisper) | free | free |
-| clip selection | free | ~$0.02 (haiku) / ~$0.04 (sonnet) / ~$0.10 (opus) per ~30-min video |
-
-## Note on source quality
-
-Clips inherit the source resolution - the tool never upscales a horizontal clip (a
-360p source stays 360p). `--vertical` output is forced to 1080x1920 for the platforms,
-so a low-res source will look soft cropped to vertical.
+Clips inherit the source resolution — the tool never upscales a horizontal clip, and
+`--vertical` output is forced to 1080×1920, so a low-res source looks soft cropped.

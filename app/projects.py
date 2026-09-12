@@ -419,12 +419,6 @@ async def list_outputs(
 
 # --------------------------------------------------------------- media serving
 
-async def _owned_for_media(
-    project_id: uuid.UUID, user: User, session: AsyncSession
-) -> Project:
-    return await _owned(project_id, user, session)
-
-
 @media_router.get("/{project_id}/source")
 async def media_source(
     project_id: uuid.UUID,

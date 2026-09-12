@@ -1027,10 +1027,6 @@ def find_clips(segments: list[dict], cfg: dict, loud: list[float] | None = None)
 
 # ---- stage 2: verify the arc, refine the bounds, score each beat -------------
 
-def _clip_transcript(c: Clip, segments: list[dict]) -> str:
-    return " ".join(s["text"].strip() for s in segments
-                    if s["start"] < c.end_seconds and s["end"] > c.start_seconds)
-
 
 def _norm_line(t: str) -> str:
     return re.sub(r"[^a-z0-9 ]", "", (t or "").lower()).strip()

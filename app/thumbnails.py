@@ -19,7 +19,6 @@ provider fail its own calls, which the performance router already routes around.
 """
 from __future__ import annotations
 
-import base64
 import logging
 import time
 from collections.abc import Awaitable, Callable

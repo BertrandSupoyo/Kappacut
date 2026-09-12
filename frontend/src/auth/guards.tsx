@@ -10,14 +10,6 @@ function Loading() {
   );
 }
 
-export function RequireAuth({ children }: { children: ReactNode }) {
-  const { user, loading } = useAuth();
-  const loc = useLocation();
-  if (loading) return <Loading />;
-  if (!user) return <Navigate to="/login" state={{ from: loc.pathname }} replace />;
-  return <>{children}</>;
-}
-
 export function RequireVerified({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
   const loc = useLocation();
