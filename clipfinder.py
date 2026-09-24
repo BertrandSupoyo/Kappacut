@@ -190,7 +190,19 @@ FFMPEG_THREADS = 0
 
 
 def _thread_args() -> list[str]:
+    """`-threads` is a per-stream option: placed BEFORE `-i` it caps the decoder, placed
+    before the output file it caps the encoder. Both need it — libx264 is the expensive
+    half, and for a long time only the decoder was actually being capped here."""
     return ["-threads", str(FFMPEG_THREADS)] if FFMPEG_THREADS > 0 else []
+
+
+def _filter_thread_args(complex_graph: bool = False) -> list[str]:
+    """Neither `-threads` caps the FILTER graph, and the blur-fill path (gblur at sigma up
+    to 80) is the most expensive filter this app runs — so cap that separately."""
+    if FFMPEG_THREADS <= 0:
+        return []
+    flag = "-filter_complex_threads" if complex_graph else "-filter_threads"
+    return [flag, str(FFMPEG_THREADS)]
 
 
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -309,12 +321,17 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
         vf = (f"crop=w={bw}:h={bh}:x=(iw-{bw})*{px:.4f}:y=(ih-{bh})*{py:.4f},"
               "scale=1080:1920:flags=lanczos" + col_vf + sub_chain)
 
-    cmd = [FFMPEG, "-y", *_thread_args(), "-ss", f"{start:.2f}", "-i", str(video), "-t", f"{end - start:.2f}"]
+    cmd = [FFMPEG, "-y", *_thread_args(), *_filter_thread_args(fc is not None),
+           "-ss", f"{start:.2f}", "-i", str(video), "-t", f"{end - start:.2f}"]
     if fc is not None:
         cmd += ["-filter_complex", fc, "-map", map_v, "-map", "0:a?"]
     else:
         cmd += ["-vf", vf]
-    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
+    # yuv420p: a 10-bit source (phone HEVC / HDR) otherwise encodes to High 10 profile,
+    # which Safari, many Android devices and the social uploaders all refuse — the clip
+    # downloads fine and then won't play, with nothing logged anywhere.
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", *_thread_args()]
     if loudnorm:
         cmd += ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"]
     cmd += ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out_arg]

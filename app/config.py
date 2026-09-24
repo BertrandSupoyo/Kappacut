@@ -11,6 +11,15 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The placeholder values below are checked in, so they're public knowledge: anyone who
+# knows them can mint a session cookie for any account. check_production_ready() refuses
+# to boot a public deployment that still carries them.
+_DEV_SECRETS = {
+    "jwt_secret": "dev-insecure-change-me",
+    "verification_token_secret": "dev-insecure-change-me-2",
+    "reset_password_token_secret": "dev-insecure-change-me-3",
+}
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -89,6 +98,45 @@ class Settings(BaseSettings):
     @property
     def is_prod(self) -> bool:
         return self.environment.lower() in ("prod", "production")
+
+    @property
+    def is_public(self) -> bool:
+        """Prod, or anything served over https — the second test catches the deploy that
+        set PUBLIC_BASE_URL but forgot ENVIRONMENT, which is exactly the slip that would
+        otherwise ship the dev secrets to the internet."""
+        return self.is_prod or self.public_base_url.lower().startswith("https://")
+
+    def check_production_ready(self) -> None:
+        """Raise unless this process is safe to expose. Called from the web lifespan and
+        the worker startup so a misconfigured deploy fails loudly at boot instead of
+        quietly signing sessions with a secret that's published in this repo."""
+        if not self.is_public:
+            return
+
+        problems: list[str] = []
+        for field, dev_value in _DEV_SECRETS.items():
+            value = getattr(self, field)
+            if not value or value == dev_value:
+                problems.append(
+                    f"{field.upper()} is unset or still the checked-in dev default "
+                    f"— generate one with `openssl rand -hex 32`"
+                )
+        secrets = [getattr(self, f) for f in _DEV_SECRETS]
+        if len(set(secrets)) != len(secrets):
+            problems.append(
+                "JWT_SECRET / VERIFICATION_TOKEN_SECRET / RESET_PASSWORD_TOKEN_SECRET "
+                "must be three DISTINCT values"
+            )
+        if not self.cookie_secure:
+            problems.append("COOKIE_SECURE must be true so the session cookie never rides plain HTTP")
+
+        if problems:
+            raise RuntimeError(
+                "refusing to start: this deployment looks public "
+                f"(environment={self.environment!r}, public_base_url={self.public_base_url!r}) but\n  - "
+                + "\n  - ".join(problems)
+                + "\nSet these in .env (see .env.example) and restart."
+            )
 
 
 @lru_cache

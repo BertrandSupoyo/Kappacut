@@ -2,6 +2,14 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	# tusd's hook endpoint is an internal call (tusd -> web, on the compose network only).
+	# It moves staged files and enqueues jobs on the caller's behalf, so nothing outside
+	# may reach it. `handle` blocks match in the order written — this one comes first.
+	@hooks path /api/upload/hooks*
+	handle @hooks {
+		respond 404
+	}
+
 	# resumable uploads (tusd) — stream, don't buffer
 	@files path /files /files/*
 	handle @files {
@@ -13,12 +21,18 @@
 	# API + media
 	@api path /api/* /media/*
 	handle @api {
-		reverse_proxy web:8000
+		reverse_proxy web:8000 {
+			# app/ratelimit.py buckets per client IP; {remote_host} is the real peer and
+			# header_up REPLACES anything the client sent, so this can't be spoofed.
+			header_up X-Real-IP {remote_host}
+		}
 	}
 
 	# SPA — static build in prod; in dev the web container also serves it
 	handle {
-		reverse_proxy web:8000
+		reverse_proxy web:8000 {
+			header_up X-Real-IP {remote_host}
+		}
 	}
 
 	request_body {

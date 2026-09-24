@@ -14,6 +14,7 @@ import logging
 import shutil
 import time
 import uuid
+from pathlib import Path
 
 from sqlalchemy import select, update
 
@@ -38,6 +39,35 @@ async def _set_job(job_id: uuid.UUID, **fields) -> None:
     async with async_session_maker() as s:
         await s.execute(update(Job).where(Job.id == job_id).values(**fields))
         await s.commit()
+
+
+async def _fail(job_id: uuid.UUID, error: str, project_id: uuid.UUID | None = None) -> None:
+    """Terminal failure for a job (and the project it belongs to, when analyze owns it).
+
+    Every path out of a job has to land here: a row left at 'running' counts against
+    `quota_concurrent_jobs` forever, which locks the user out of starting anything new
+    until a worker restart sweeps it.
+    """
+    await _set_job(job_id, status="error", error=error[:2000], finished_at=_now())
+    if project_id is not None:
+        async with async_session_maker() as s:
+            await s.execute(update(Project).where(Project.id == project_id).values(
+                status="failed", error=error[:2000],
+            ))
+            await s.commit()
+
+
+def _stageable_sfx(ranges: list[dict]) -> list[str]:
+    """The sfx filenames a render references, deduped — bare names only, the same rule
+    clipfinder.mix_sfx enforces, so a crafted `file` can't steer the copy out of the
+    staging dir (which would raise out of the staging loop and wedge the job)."""
+    names: list[str] = []
+    for r in ranges:
+        for s_ in (r.get("sfx") or []):
+            fn = (s_ or {}).get("file")
+            if isinstance(fn, str) and fn and Path(fn).name == fn and fn not in names:
+                names.append(fn)
+    return names
 
 
 def _clip_to_range(c: dict) -> dict:
@@ -86,7 +116,7 @@ async def _try_auto_render(project_id: uuid.UUID, user_id: uuid.UUID, clips: lis
         async with async_session_maker() as s:
             user = await s.get(User, user_id)
             await _guard_enqueue(s, user)
-            await check_quota(s, user, "render")
+            await check_quota(s, user, "render", count=len(ranges))
             render_job = Job(user_id=user_id, project_id=project_id, kind="render",
                               status="queued", payload={"ranges": ranges})
             s.add(render_job)
@@ -107,6 +137,9 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         if job is None:
             return
         project = await s.get(Project, job.project_id)
+        if project is None:           # deleted while the job sat in the queue
+            await _fail(job_id, "project no longer exists")
+            return
         job.status, job.started_at = "running", _now()
         project.status = "analyzing"
         await s.commit()
@@ -116,10 +149,7 @@ async def run_analyze(job_id: uuid.UUID) -> None:
 
     src = storage.find_source(user_id, project_id)
     if src is None:
-        await _set_job(job_id, status="error", error="source file missing", finished_at=_now())
-        async with async_session_maker() as s:
-            await s.execute(update(Project).where(Project.id == project_id).values(status="failed"))
-            await s.commit()
+        await _fail(job_id, "source file missing", project_id)
         return
 
     loop = asyncio.get_running_loop()
@@ -187,12 +217,7 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         with contextlib.suppress(Exception):
             await drainer
         log.exception("analyze %s failed", project_id)
-        await _set_job(job_id, status="error", error=f"{type(e).__name__}: {e}", finished_at=_now())
-        async with async_session_maker() as s:
-            await s.execute(update(Project).where(Project.id == project_id).values(
-                status="failed", error=str(e)[:2000],
-            ))
-            await s.commit()
+        await _fail(job_id, f"{type(e).__name__}: {e}", project_id)
 
 
 # --------------------------------------------------------------------- render
@@ -203,46 +228,21 @@ async def run_render(job_id: uuid.UUID) -> None:
         if job is None:
             return
         project = await s.get(Project, job.project_id)
+        if project is None:           # deleted while the job sat in the queue
+            await _fail(job_id, "project no longer exists")
+            return
         job.status, job.started_at = "running", _now()
         await s.commit()
         user_id, project_id = project.user_id, project.id
         ranges = list((job.payload or {}).get("ranges") or [])
 
-    src = storage.find_source(user_id, project_id)
-    if src is None or not ranges:
-        await _set_job(job_id, status="error", error="nothing to render", finished_at=_now())
-        return
-
-    async with async_session_maker() as s:
-        analysis = (
-            await s.execute(select(Analysis).where(Analysis.project_id == project_id))
-        ).scalar_one_or_none()
-        segments = analysis.segments if analysis else []
-
-    out_dir = storage.clips_dir(user_id, project_id)
-
-    # stage every referenced sfx file (builtin or the user's) into one dir for the renderer
-    sfx_stage = storage.project_dir(user_id, project_id) / "_sfxstage"
-    sfx_stage.mkdir(parents=True, exist_ok=True)
-    for r in ranges:
-        for s_ in (r.get("sfx") or []):
-            fn = (s_ or {}).get("file")
-            if not fn or (sfx_stage / fn).exists():
-                continue
-            for cand in (storage.builtin_sfx_dir() / fn, storage.user_sfx_dir(user_id) / fn):
-                if cand.is_file():
-                    shutil.copy2(cand, sfx_stage / fn)
-                    break
-
-    loop = asyncio.get_running_loop()
+    # Everything below runs inside the try/finally: setup used to sit outside it, so a
+    # failure while staging (a bad sfx name, a full disk) escaped with the row still at
+    # 'running' — an unkillable job that blocks the user's concurrency slot.
+    out_dir: Path | None = None
+    sfx_stage: Path | None = None
+    drainer: asyncio.Task | None = None
     q: asyncio.Queue = asyncio.Queue()
-
-    def on_clip(rec: dict) -> None:
-        loop.call_soon_threadsafe(q.put_nowait, ("clip", rec))
-
-    def on_stage(msg: str) -> None:
-        loop.call_soon_threadsafe(q.put_nowait, ("stage", msg))
-
     done = 0
 
     async def drain() -> None:
@@ -268,8 +268,38 @@ async def run_render(job_id: uuid.UUID) -> None:
                     await s.execute(update(Job).where(Job.id == job_id).values(progress_pct=done))
                     await s.commit()
 
-    drainer = asyncio.create_task(drain())
     try:
+        src = storage.find_source(user_id, project_id)
+        if src is None or not ranges:
+            await _fail(job_id, "nothing to render")
+            return
+
+        async with async_session_maker() as s:
+            analysis = (
+                await s.execute(select(Analysis).where(Analysis.project_id == project_id))
+            ).scalar_one_or_none()
+            segments = analysis.segments if analysis else []
+
+        out_dir = storage.clips_dir(user_id, project_id)
+
+        # stage every referenced sfx file (builtin or the user's) into one dir for the renderer
+        sfx_stage = storage.project_dir(user_id, project_id) / "_sfxstage"
+        sfx_stage.mkdir(parents=True, exist_ok=True)
+        for fn in _stageable_sfx(ranges):
+            for cand in (storage.builtin_sfx_dir() / fn, storage.user_sfx_dir(user_id) / fn):
+                if cand.is_file():
+                    shutil.copy2(cand, sfx_stage / fn)
+                    break
+
+        loop = asyncio.get_running_loop()
+
+        def on_clip(rec: dict) -> None:
+            loop.call_soon_threadsafe(q.put_nowait, ("clip", rec))
+
+        def on_stage(msg: str) -> None:
+            loop.call_soon_threadsafe(q.put_nowait, ("stage", msg))
+
+        drainer = asyncio.create_task(drain())
         cfg = pipeline.get_cfg()
         await asyncio.to_thread(functools.partial(
             pipeline.render, src, ranges, cfg, out_dir, segments, sfx_stage,
@@ -277,14 +307,17 @@ async def run_render(job_id: uuid.UUID) -> None:
         ))
         q.put_nowait(None)
         await drainer
+        drainer = None
         await _set_job(job_id, status="done", stage="done", finished_at=_now(),
                        result={"clips": done, "total": len(ranges)})
         log.info("render %s done — %d clip(s)", project_id, done)
     except Exception as e:  # noqa: BLE001
-        q.put_nowait(None)
-        with contextlib.suppress(Exception):
-            await drainer
+        if drainer is not None:
+            q.put_nowait(None)
+            with contextlib.suppress(Exception):
+                await drainer
         log.exception("render %s failed", project_id)
-        await _set_job(job_id, status="error", error=f"{type(e).__name__}: {e}", finished_at=_now())
+        await _fail(job_id, f"{type(e).__name__}: {e}")
     finally:
-        shutil.rmtree(sfx_stage, ignore_errors=True)
+        if sfx_stage is not None:
+            shutil.rmtree(sfx_stage, ignore_errors=True)

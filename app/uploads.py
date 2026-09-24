@@ -7,6 +7,14 @@ project dir and enqueue analysis). The client's cookie is forwarded via
 
 Flow:  SPA `POST /api/projects` → gets an id → Uppy/tus upload to `/files/` with metadata
 `{projectId, filename}` → tusd calls these hooks.
+
+SECURITY: the body of these requests is written by tusd, but the only thing proving the
+caller IS tusd is the network (the Caddyfile 404s `/api/upload/hooks` from outside, and
+this endpoint is CSRF-exempt because tusd can't echo a browser cookie as a header). So
+nothing in the payload is trusted: the staged path must sit inside our upload dir, the
+byte count comes from the file on disk rather than `Size`, the extension falls back to
+the one validated at project creation, and post-finish re-runs every gate pre-create ran
+— it is the call that actually spends worker and Groq budget.
 """
 from __future__ import annotations
 
@@ -26,6 +34,7 @@ from app.models.job import Job
 from app.models.project import Project
 from app.models.usage import UsageEvent
 from app.models.user import User
+from app.projects import VIDEO_EXTS
 from app.queue import enqueue_analyze
 from app.quota import QuotaError, check_quota
 
@@ -72,6 +81,40 @@ async def _one_active_job(session: AsyncSession, user_id) -> bool:
     return bool(n)
 
 
+def _staged_path(raw) -> Path | None:
+    """The finished upload tusd wants us to import — only if it really is one of ours.
+
+    Without this, a caller-supplied path turns `os.replace` below into "move any file on
+    the media volume into my project, then download it at /media/<id>/source".
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    staging = (storage.MEDIA / "_uploads").resolve()
+    try:
+        p = Path(raw).resolve()
+    except OSError:
+        return None
+    if staging not in p.parents or not p.is_file():
+        return None
+    return p
+
+
+def _discard(staged: Path) -> None:
+    staged.unlink(missing_ok=True)
+    staged.with_name(staged.name + ".info").unlink(missing_ok=True)
+
+
+async def _abandon(session: AsyncSession, project: Project, staged: Path, reason: str) -> JSONResponse:
+    """A finished upload we can't accept. tusd ignores RejectUpload at post-finish, so drop
+    the bytes and park the reason on the project where the SPA already shows errors."""
+    _discard(staged)
+    project.status = "failed"
+    project.error = reason
+    await session.commit()
+    log.warning("post-finish refused for %s: %s", project.id, reason)
+    return _ACK
+
+
 @router.post("/api/upload/hooks")
 async def tusd_hook(request: Request, session: AsyncSession = Depends(get_session)):
     try:
@@ -113,15 +156,39 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
         return _ACK
 
     if hook_type == "post-finish":
-        size = int(upload.get("Size") or upload.get("Offset") or 0)
-        staged = (upload.get("Storage") or {}).get("Path")
-        if not staged or not Path(staged).is_file():
-            log.error("post-finish: staged file missing for %s", project_id)
+        staged = _staged_path((upload.get("Storage") or {}).get("Path"))
+        if staged is None:
+            log.error("post-finish: staged file missing or outside the upload dir for %s", project_id)
             return _ACK
-        ext = Path(meta.get("filename") or "video.mp4").suffix.lower() or ".mp4"
+
+        if project.status in ("queued", "analyzing"):
+            # a replayed/duplicate hook — drop the bytes, but never touch the state of the
+            # analysis that's already running
+            log.warning("post-finish ignored for %s: already %s", project_id, project.status)
+            _discard(staged)
+            return _ACK
+
+        # `Size` is caller-supplied; the file on disk is the only honest number
+        size = staged.stat().st_size
+
+        # pre-create checked these, but that call can simply be skipped — re-check here,
+        # where the worker time and the Groq budget actually get spent.
+        if await _one_active_job(session, user.id):
+            return await _abandon(session, project, staged, "You already have a job running.")
+        try:
+            await check_quota(session, user, "analyze")
+            await check_quota(session, user, "upload", extra_bytes=size)
+        except QuotaError as e:
+            return await _abandon(session, project, staged, f"You've hit your {e.limit} limit.")
+
+        # an unvetted extension would name the file on disk; fall back to the one
+        # create_project already validated against VIDEO_EXTS
+        ext = Path(meta.get("filename") or "").suffix.lower()
+        if ext not in VIDEO_EXTS:
+            ext = project.source_ext if project.source_ext in VIDEO_EXTS else ".mp4"
         dest = storage.source_path(user.id, project.id, ext)
         os.replace(staged, dest)                       # same volume → atomic
-        Path(staged + ".info").unlink(missing_ok=True)
+        staged.with_name(staged.name + ".info").unlink(missing_ok=True)
 
         project.source_ext = ext
         project.source_bytes = size

@@ -18,9 +18,22 @@ from app.config import settings
 _redis = aioredis.from_url(settings.redis_url, decode_responses=True)
 
 
+def client_ip(request: Request) -> str:
+    """The caller's real IP.
+
+    Every request arrives through Caddy, so `request.client.host` is the proxy's container
+    IP — identical for everyone. Using it would collapse every limit below into ONE global
+    bucket (ten bad logins from anybody would lock out the whole site). Caddy sets
+    `X-Real-IP` with `header_up`, which REPLACES any value the client sent, so it can't be
+    spoofed from outside. The fallback only applies when something talks to this app
+    directly, which in compose means it's already inside the private network.
+    """
+    return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+
+
 def rate_limit(bucket: str, limit: int, window_seconds: int) -> Callable:
     async def dependency(request: Request) -> None:
-        ip = request.client.host if request.client else "unknown"
+        ip = client_ip(request)
         key = f"rl:{bucket}:{ip}"
         try:
             n = await _redis.incr(key)
@@ -54,7 +67,7 @@ class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
             and not path.endswith("/events")
             and not path.startswith("/api/upload/hooks")
         ):
-            ip = request.client.host if request.client else "unknown"
+            ip = client_ip(request)
             key = f"rl:global:{ip}"
             try:
                 n = await _redis.incr(key)

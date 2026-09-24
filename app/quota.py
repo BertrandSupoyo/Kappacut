@@ -105,7 +105,7 @@ async def project_count(session: AsyncSession, user_id) -> int:
 
 
 async def check_quota(
-    session: AsyncSession, user: User, action: str, *, extra_bytes: int = 0
+    session: AsyncSession, user: User, action: str, *, extra_bytes: int = 0, count: int = 1
 ) -> None:
     if action == "project":
         n = await project_count(session, user.id)
@@ -130,5 +130,9 @@ async def check_quota(
     elif action == "render":
         used = await renders_today(session, user.id)
         cap = settings.quota_renders_per_day
-        if used >= cap:
-            raise QuotaError("renders", used, cap, resets_at=_day_start() + dt.timedelta(days=1))
+        # `count` = how many clips this job will cut. The cap counts CLIPS, not jobs: one
+        # request carrying a thousand ranges used to pass a 40-a-day limit untouched and
+        # then hold the worker for hours, since only the enqueue was ever checked.
+        if used + count > cap:
+            raise QuotaError("renders", used + count, cap,
+                             resets_at=_day_start() + dt.timedelta(days=1))

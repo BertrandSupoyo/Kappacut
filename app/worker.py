@@ -14,13 +14,14 @@ import uuid
 
 from arq import cron
 from arq.connections import RedisSettings
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app import groq_gate
 from app.config import settings
 from app.db import async_session_maker, engine
 from app.jobs import run_analyze, run_render
 from app.models.job import Job
+from app.models.project import Project
 from app.retention import run_gc
 from app.sfx_synth import synth_builtins
 
@@ -43,17 +44,42 @@ async def retention_gc(ctx: dict) -> None:
 async def on_startup(ctx: dict) -> None:
     import clipfinder as cf
 
+    settings.check_production_ready()          # same boot guard the web process runs
     groq_gate.install()                       # clipfinder.GROQ_GATE -> shared TPM bucket
     cf.FFMPEG_THREADS = settings.ffmpeg_threads  # cap per-job core usage under concurrency
     await asyncio.to_thread(synth_builtins)   # builtin sfx onto the media volume
     async with async_session_maker() as s:    # any job left 'running' died with a worker
+        orphaned = set((await s.execute(
+            select(Job.project_id).where(Job.status == "running")
+        )).scalars().all())
         res = await s.execute(
             update(Job).where(Job.status == "running")
             .values(status="error", error="worker restarted")
         )
+        # The job row is only half the state. A project whose analyze job died still reads
+        # 'analyzing', and the SPA polls that forever with no error to show — so fail the
+        # ones now left with no live job. A project whose job is merely 'queued' is
+        # untouched: arq will still run it after this restart.
+        stuck = 0
+        if orphaned:
+            has_live_job = (
+                select(Job.id)
+                .where(Job.project_id == Project.id, Job.status.in_(("queued", "running")))
+                .exists()
+            )
+            stuck = (await s.execute(
+                update(Project)
+                .where(
+                    Project.id.in_(orphaned),
+                    Project.status.in_(("queued", "analyzing")),
+                    ~has_live_job,
+                )
+                .values(status="failed", error="worker restarted")
+            )).rowcount or 0
         await s.commit()
         if res.rowcount:
-            log.warning("swept %d orphaned running job(s)", res.rowcount)
+            log.warning("swept %d orphaned running job(s); failed %d stuck project(s)",
+                        res.rowcount, stuck)
 
 
 async def on_shutdown(ctx: dict) -> None:

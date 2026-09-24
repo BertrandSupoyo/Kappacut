@@ -36,6 +36,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
     import clipfinder as cf
 
+    settings.check_production_ready()   # dev secrets / insecure cookies never reach a public deploy
     settings.media_root.mkdir(parents=True, exist_ok=True)
     # tusd runs as a non-root uid; give it a writable staging dir inside the shared volume
     staging = settings.media_root / "_uploads"

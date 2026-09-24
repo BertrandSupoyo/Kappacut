@@ -31,6 +31,10 @@ media_router = APIRouter(prefix="/media", tags=["media"])
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".m2ts", ".mts"}
 _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+# A render job holds one worker slot for its whole duration, so a single request must not
+# be able to enqueue unbounded work. The per-day clip quota is the real limit; this is a
+# structural backstop on one payload.
+MAX_RANGES_PER_JOB = 100
 
 
 def _now() -> dt.datetime:
@@ -53,6 +57,31 @@ async def _latest_job(session: AsyncSession, project_id: uuid.UUID, kind: str) -
             .limit(1)
         )
     ).scalar_one_or_none()
+
+
+def _validate_ranges(raw: object) -> list[dict]:
+    """Shape-check the render payload before it reaches the queue.
+
+    The worker runs one ffmpeg process per range, minutes after the request that caused
+    them has already returned 200 — so junk numbers surface as a failed job nobody can
+    trace, and an over-long list as CPU nobody authorised.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "no ranges")
+    if len(raw) > MAX_RANGES_PER_JOB:
+        raise HTTPException(
+            400, f"too many clips in one render ({len(raw)}; max {MAX_RANGES_PER_JOB})"
+        )
+    for i, r in enumerate(raw):
+        if not isinstance(r, dict):
+            raise HTTPException(400, f"range {i}: expected an object")
+        try:
+            start, end = float(r["start"]), float(r["end"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, f"range {i}: start and end must be numbers")
+        if not 0 <= start < end:
+            raise HTTPException(400, f"range {i}: needs 0 <= start < end")
+    return raw
 
 
 async def _guard_enqueue(session: AsyncSession, user: User) -> None:
@@ -301,11 +330,9 @@ async def start_render(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     p = await _owned(project_id, user, session)
-    ranges = (body or {}).get("ranges") or []
-    if not ranges:
-        raise HTTPException(400, "no ranges")
+    ranges = _validate_ranges((body or {}).get("ranges"))
     await _guard_enqueue(session, user)
-    await check_quota(session, user, "render")
+    await check_quota(session, user, "render", count=len(ranges))
 
     job = Job(user_id=user.id, project_id=p.id, kind="render", status="queued",
               payload={"ranges": ranges})
