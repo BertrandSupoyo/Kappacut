@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,16 +30,15 @@ async def _ensure_builtins(session: AsyncSession) -> None:
             await session.execute(select(SfxAsset).where(SfxAsset.user_id.is_(None)))
         ).scalars()
     }
-    d = storage.builtin_sfx_dir()
+    missing = [f"{n}.m4a" for n in BUILTIN_NAMES if f"{n}.m4a" not in have]
+    if not missing:
+        return
     added = False
-    for name in BUILTIN_NAMES:
-        fn = f"{name}.m4a"
-        if fn in have:
-            continue
-        f = d / fn
-        if f.is_file():
-            session.add(SfxAsset(user_id=None, filename=fn, name=name,
-                                 bytes=f.stat().st_size))
+    for fn in missing:
+        meta = await run_in_threadpool(storage.head, storage.builtin_sfx_key(fn))
+        if meta:
+            session.add(SfxAsset(user_id=None, filename=fn, name=Path(fn).stem,
+                                 bytes=int(meta["ContentLength"])))
             added = True
     if added:
         await session.commit()
@@ -73,25 +72,29 @@ async def sfx_upload(
     if ext not in SFX_EXTS:
         raise HTTPException(400, f"audio only ({', '.join(sorted(SFX_EXTS))})")
     stem = cf.slugify(Path(file.filename or "sfx").stem) or "sfx"
-    d = storage.user_sfx_dir(user.id)
-    dest = d / f"{stem}{ext}"
+
+    # Read first, then name it: the 8 MB cap is small enough to hold in memory, and it
+    # means a rejected upload never creates an object to clean up.
+    chunks, size = [], 0
+    while chunk := await file.read(1 << 20):
+        size += len(chunk)
+        if size > SFX_MAX_BYTES:
+            raise HTTPException(413, "file too large (8 MB max)")
+        chunks.append(chunk)
+    if not size:
+        raise HTTPException(400, "empty file")
+
+    filename = f"{stem}{ext}"
     n = 1
-    while dest.exists():
-        dest = d / f"{stem}-{n}{ext}"
+    while await run_in_threadpool(storage.exists, storage.user_sfx_key(user.id, filename)):
+        filename = f"{stem}-{n}{ext}"
         n += 1
+    await run_in_threadpool(
+        storage.put_bytes, storage.user_sfx_key(user.id, filename), b"".join(chunks)
+    )
 
-    size = 0
-    with dest.open("wb") as fh:
-        while chunk := await file.read(1 << 20):
-            size += len(chunk)
-            if size > SFX_MAX_BYTES:
-                fh.close()
-                dest.unlink(missing_ok=True)
-                raise HTTPException(413, "file too large (8 MB max)")
-            fh.write(chunk)
-
-    asset = SfxAsset(user_id=user.id, filename=dest.name,
-                     name=dest.stem.replace("-", " "), bytes=size)
+    asset = SfxAsset(user_id=user.id, filename=filename,
+                     name=Path(filename).stem.replace("-", " "), bytes=size)
     session.add(asset)
     await session.commit()
     return {"id": str(asset.id), "file": asset.filename, "name": asset.name,
@@ -107,7 +110,6 @@ async def media_sfx(
     asset = await session.get(SfxAsset, asset_id)
     if asset is None or (asset.user_id is not None and asset.user_id != user.id):
         raise HTTPException(404, "no such sfx")
-    p = storage.sfx_path(asset.user_id, asset.filename)
-    if not p.is_file():
-        raise HTTPException(404, "sfx file missing")
-    return FileResponse(p, headers={"Cache-Control": "private, max-age=86400"})
+    # ownership is settled above; only then is a URL signed
+    return RedirectResponse(storage.presign_get(storage.sfx_key(asset.user_id, asset.filename)),
+                            status_code=302)

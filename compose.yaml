@@ -3,8 +3,15 @@ name: clipfinder
 x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-clipfinder}:${POSTGRES_PASSWORD:-clipfinder}@postgres:5432/${POSTGRES_DB:-clipfinder}
   REDIS_URL: redis://redis:6379/0
-  MEDIA_ROOT: /media
   WEB_DIR: /srv/web
+  # All media lives in the bucket (PLAN-v2.md Phase A). MEDIA_ROOT survives only for the
+  # one-shot `migrate-media` command and can go once that has run and been verified.
+  MEDIA_ROOT: /media
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?set S3_ENDPOINT_URL in .env — see .env.example}
+  S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET in .env}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?set S3_ACCESS_KEY_ID in .env}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?set S3_SECRET_ACCESS_KEY in .env}
+  S3_REGION: ${S3_REGION:-auto}
   PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
   GROQ_API_KEY: ${GROQ_API_KEY:-}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -60,6 +67,8 @@ services:
         required: false
     environment: *app-env
     volumes:
+      # Only `app.cli migrate-media` reads this. Drop the mount and the `media` volume
+      # once the migration has run and been verified.
       - media:/media
     depends_on:
       postgres:
@@ -82,8 +91,8 @@ services:
       - path: .env
         required: false
     environment: *app-env
-    volumes:
-      - media:/media
+    # No media mount: the worker pulls each source into a temp dir it owns and uploads the
+    # clips back. Its scratch space is the container filesystem — see quota.assert_disk_ok.
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,6 +139,10 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # tusd writes multipart uploads straight into the bucket under `uploads/`; the app's
+  # post-finish hook then server-side-copies the finished object to the project's source
+  # key. No shared volume, and nothing to sweep — expiry of abandoned partials is a bucket
+  # lifecycle rule on that prefix (see DEPLOY.md).
   tusd:
     image: ghcr.io/tus/tusd:v2
     command:
@@ -137,13 +150,19 @@ services:
       - -port=1080
       - -base-path=/files/
       - -behind-proxy
-      - -upload-dir=/media/_uploads
+      - -s3-bucket=${S3_BUCKET}
+      - -s3-endpoint=${S3_ENDPOINT_URL}
+      - -s3-object-prefix=uploads/
+      - -s3-part-size=52428800
       - -max-size=2147483648
       - -hooks-http=http://web:8000/api/upload/hooks
       - -hooks-http-forward-headers=Cookie,Authorization
       - -hooks-enabled-events=pre-create,post-finish,post-terminate
-    volumes:
-      - media:/media
+    environment:
+      # tusd's s3store reads the standard AWS variables
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      AWS_REGION: ${S3_REGION:-auto}
     depends_on:
       web:
         condition: service_healthy

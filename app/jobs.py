@@ -11,7 +11,7 @@ import contextlib
 import datetime as dt
 import functools
 import logging
-import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -147,8 +147,8 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         job_taste = (job.payload or {}).get("taste")
         auto_render = project.auto_render
 
-    src = storage.find_source(user_id, project_id)
-    if src is None:
+    src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
+    if src_key is None:
         await _fail(job_id, "source file missing", project_id)
         return
 
@@ -170,7 +170,13 @@ async def run_analyze(job_id: uuid.UUID) -> None:
                 last = time.monotonic()
 
     drainer = asyncio.create_task(drain())
+    # ffmpeg and Whisper both need a seekable local file, so the source comes down once
+    # into a temp dir this job owns and that goes away with it — including on a crash.
+    tmp = tempfile.TemporaryDirectory(prefix="clipfinder_analyze_")
     try:
+        src = await asyncio.to_thread(
+            storage.download, src_key, Path(tmp.name) / Path(src_key).name
+        )
         cfg = pipeline.get_cfg()          # fresh dict per call (cf.load_config builds dict(DEFAULTS))
         if job_taste:
             cfg["taste"] = job_taste
@@ -218,6 +224,8 @@ async def run_analyze(job_id: uuid.UUID) -> None:
             await drainer
         log.exception("analyze %s failed", project_id)
         await _fail(job_id, f"{type(e).__name__}: {e}", project_id)
+    finally:
+        tmp.cleanup()
 
 
 # --------------------------------------------------------------------- render
@@ -240,10 +248,12 @@ async def run_render(job_id: uuid.UUID) -> None:
     # failure while staging (a bad sfx name, a full disk) escaped with the row still at
     # 'running' — an unkillable job that blocks the user's concurrency slot.
     out_dir: Path | None = None
-    sfx_stage: Path | None = None
     drainer: asyncio.Task | None = None
     q: asyncio.Queue = asyncio.Queue()
     done = 0
+    # One temp dir for the whole job — source in, clips out, sfx staged. It goes away in
+    # `finally`, so a crashed render cannot leave a 2 GB source behind in the container.
+    tmp = tempfile.TemporaryDirectory(prefix="clipfinder_render_")
 
     async def drain() -> None:
         nonlocal done
@@ -256,21 +266,29 @@ async def run_render(job_id: uuid.UUID) -> None:
                 await _set_job(job_id, stage=str(val))
             else:
                 done += 1
+                # Upload as each clip lands rather than in a batch at the end: the SSE
+                # already reports them one by one, so this is what makes that honest —
+                # a clip the user is told about is a clip they can actually fetch.
+                local = out_dir / val["file"]
+                size = await asyncio.to_thread(
+                    storage.put_file,
+                    storage.clip_key(user_id, project_id, val["file"]), local, "video/mp4",
+                ) if local.exists() else 0
                 async with async_session_maker() as s:
                     s.add(RenderOutput(
                         project_id=project_id, job_id=job_id,
                         filename=val["file"], duration=float(val.get("duration") or 0.0),
                         vertical=bool(val.get("vertical")), captions=bool(val.get("captions")),
                         sfx_count=int(val.get("sfx") or 0),
-                        bytes=(out_dir / val["file"]).stat().st_size if (out_dir / val["file"]).exists() else 0,
+                        bytes=size,
                     ))
                     s.add(UsageEvent(user_id=user_id, project_id=project_id, kind="render_clip", quantity=1))
                     await s.execute(update(Job).where(Job.id == job_id).values(progress_pct=done))
                     await s.commit()
 
     try:
-        src = storage.find_source(user_id, project_id)
-        if src is None or not ranges:
+        src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
+        if src_key is None or not ranges:
             await _fail(job_id, "nothing to render")
             return
 
@@ -280,15 +298,18 @@ async def run_render(job_id: uuid.UUID) -> None:
             ).scalar_one_or_none()
             segments = analysis.segments if analysis else []
 
-        out_dir = storage.clips_dir(user_id, project_id)
+        root = Path(tmp.name)
+        src = await asyncio.to_thread(storage.download, src_key, root / Path(src_key).name)
+        out_dir = root / "clips"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        # stage every referenced sfx file (builtin or the user's) into one dir for the renderer
-        sfx_stage = storage.project_dir(user_id, project_id) / "_sfxstage"
+        # stage every referenced sfx object (builtin or the user's) into one dir for the renderer
+        sfx_stage = root / "sfx"
         sfx_stage.mkdir(parents=True, exist_ok=True)
         for fn in _stageable_sfx(ranges):
-            for cand in (storage.builtin_sfx_dir() / fn, storage.user_sfx_dir(user_id) / fn):
-                if cand.is_file():
-                    shutil.copy2(cand, sfx_stage / fn)
+            for key in (storage.builtin_sfx_key(fn), storage.user_sfx_key(user_id, fn)):
+                if await asyncio.to_thread(storage.exists, key):
+                    await asyncio.to_thread(storage.download, key, sfx_stage / fn)
                     break
 
         loop = asyncio.get_running_loop()
@@ -319,5 +340,4 @@ async def run_render(job_id: uuid.UUID) -> None:
         log.exception("render %s failed", project_id)
         await _fail(job_id, f"{type(e).__name__}: {e}")
     finally:
-        if sfx_stage is not None:
-            shutil.rmtree(sfx_stage, ignore_errors=True)
+        tmp.cleanup()

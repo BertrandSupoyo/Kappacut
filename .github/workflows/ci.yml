@@ -28,6 +28,11 @@ jobs:
       JWT_SECRET: ci
       VERIFICATION_TOKEN_SECRET: ci2
       RESET_PASSWORD_TOKEN_SECRET: ci3
+      S3_ENDPOINT_URL: http://localhost:9000
+      S3_BUCKET: ci
+      S3_ACCESS_KEY_ID: ci
+      S3_SECRET_ACCESS_KEY: ci
+      S3_REGION: auto
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +43,9 @@ jobs:
       - run: alembic revision --autogenerate -m ci-drift && test -z "$(grep -E 'op\.(create|drop|add|alter)' alembic/versions/*ci-drift*)"
         # autogenerate against the freshly-migrated DB must be empty (schema == models)
       - run: python -c "import app.main, app.worker, app.cli, clipfinder, pipeline"
+      # Key building, guards and presigning are pure-local — no bucket or network needed.
+      # Runs under plain python today; `pytest tests/` collects the same file unchanged.
+      - run: python tests/test_storage_keys.py
 
   frontend:
     runs-on: ubuntu-latest

@@ -28,7 +28,20 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://clipfinder:clipfinder@localhost:5432/clipfinder"
     redis_url: str = "redis://localhost:6379/0"
 
-    # where uploaded videos + rendered clips live (the shared `media` volume in prod)
+    # --- object storage (Phase A) ---------------------------------------
+    # All media lives in one S3-compatible bucket; R2 in prod (endpoint
+    # https://<account>.r2.cloudflarestorage.com, region "auto"). Nothing is served from
+    # local disk any more — see app/storage.py.
+    s3_endpoint_url: str = ""
+    s3_bucket: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_region: str = "auto"
+    # how long a presigned media URL stays valid; short, because it is handed to a browser
+    presign_ttl_seconds: int = 300
+
+    # Only still used by the one-shot volume->bucket migration in app/cli.py, and as the
+    # disk-space check's mount point. No media is read from or written to it at runtime.
     media_root: Path = Path("web_data")
     # the static frontend to serve (Phase 7 swaps this for the React build)
     web_dir: Path = Path("web")
@@ -129,6 +142,11 @@ class Settings(BaseSettings):
             )
         if not self.cookie_secure:
             problems.append("COOKIE_SECURE must be true so the session cookie never rides plain HTTP")
+        # A public deploy with no bucket would accept uploads and lose them — fail at boot,
+        # not on the first upload.
+        for field in ("s3_bucket", "s3_endpoint_url", "s3_access_key_id", "s3_secret_access_key"):
+            if not getattr(self, field):
+                problems.append(f"{field.upper()} is unset — media has nowhere to live")
 
         if problems:
             raise RuntimeError(

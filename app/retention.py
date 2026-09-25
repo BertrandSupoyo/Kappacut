@@ -4,9 +4,9 @@ Run daily from the arq worker (app/worker.py cron). `retention_delete_days = 0` 
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
-import time
 
 from sqlalchemy import func, select
 
@@ -21,21 +21,10 @@ from app.models.user import User
 log = logging.getLogger("clipfinder.retention")
 
 
-def _sweep_stale_uploads(older_than_s: int = 24 * 3600) -> int:
-    """Drop tusd partials that were abandoned mid-upload (tusd has no expiry flag here)."""
-    d = storage.MEDIA / "_uploads"
-    if not d.is_dir():
-        return 0
-    cutoff = time.time() - older_than_s
-    n = 0
-    for f in d.iterdir():
-        try:
-            if f.is_file() and f.stat().st_mtime < cutoff:
-                f.unlink()
-                n += 1
-        except OSError:
-            pass
-    return n
+# Abandoned tusd partials used to be swept from the local staging dir here. tusd writes
+# straight to the bucket now, so that job belongs to an S3 lifecycle rule on the `uploads/`
+# prefix (expire incomplete multipart uploads + objects after 24h) — configured once on the
+# bucket, not re-implemented on a cron. See PLAN-v2.md Phase A.
 
 
 def _idle_before(days: int) -> dt.datetime:
@@ -43,11 +32,10 @@ def _idle_before(days: int) -> dt.datetime:
 
 
 async def run_gc() -> dict:
-    stale_uploads = _sweep_stale_uploads()
     if settings.retention_delete_days <= 0:
-        return {"disabled": True, "stale_uploads": stale_uploads}
+        return {"disabled": True}
 
-    warned = deleted = skipped = 0
+    warned = deleted = skipped = objects = 0
     now = dt.datetime.now(dt.UTC)
     idle = func.coalesce(Project.last_opened_at, Project.created_at)
 
@@ -84,12 +72,11 @@ async def run_gc() -> dict:
             if active:
                 skipped += 1
                 continue
-            storage.delete_project_media(p.user_id, p.id)
+            objects += await asyncio.to_thread(storage.delete_project_media, p.user_id, p.id)
             await s.delete(p)  # cascades analyses / edits / jobs / outputs
             deleted += 1
         await s.commit()
 
-    log.info("retention GC: warned=%d deleted=%d skipped=%d stale_uploads=%d",
-             warned, deleted, skipped, stale_uploads)
-    return {"warned": warned, "deleted": deleted, "skipped": skipped,
-            "stale_uploads": stale_uploads}
+    log.info("retention GC: warned=%d deleted=%d (%d objects) skipped=%d",
+             warned, deleted, objects, skipped)
+    return {"warned": warned, "deleted": deleted, "objects": objects, "skipped": skipped}

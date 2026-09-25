@@ -11,19 +11,23 @@ Flow:  SPA `POST /api/projects` → gets an id → Uppy/tus upload to `/files/` 
 SECURITY: the body of these requests is written by tusd, but the only thing proving the
 caller IS tusd is the network (the Caddyfile 404s `/api/upload/hooks` from outside, and
 this endpoint is CSRF-exempt because tusd can't echo a browser cookie as a header). So
-nothing in the payload is trusted: the staged path must sit inside our upload dir, the
-byte count comes from the file on disk rather than `Size`, the extension falls back to
-the one validated at project creation, and post-finish re-runs every gate pre-create ran
-— it is the call that actually spends worker and Groq budget.
+nothing in the payload is trusted: the object key must sit under the `uploads/` prefix
+tusd owns, the byte count comes from the bucket rather than `Size`, the extension falls
+back to the one validated at project creation, and post-finish re-runs every gate
+pre-create ran — it is the call that actually spends worker and Groq budget.
+
+Phase A note: tusd writes to the bucket itself now, so importing a finished upload is a
+server-side copy rather than a file move. The threat model did not change with it.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
-import os
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -81,33 +85,27 @@ async def _one_active_job(session: AsyncSession, user_id) -> bool:
     return bool(n)
 
 
-def _staged_path(raw) -> Path | None:
-    """The finished upload tusd wants us to import — only if it really is one of ours.
+def _upload_key(storage_info: dict) -> str | None:
+    """The object tusd wants us to import — only if it really is one tusd wrote.
 
-    Without this, a caller-supplied path turns `os.replace` below into "move any file on
-    the media volume into my project, then download it at /media/<id>/source".
+    With the S3 backend the payload carries `{"Type": "s3store", "Bucket": ..., "Key": ...}`
+    instead of the filestore's `Path`. The guard is the same job as before: without it a
+    caller-supplied key turns the copy below into "adopt any object in the bucket as my
+    project's source, then read it at /media/<id>/source".
     """
-    if not isinstance(raw, str) or not raw:
-        return None
-    staging = (storage.MEDIA / "_uploads").resolve()
-    try:
-        p = Path(raw).resolve()
-    except OSError:
-        return None
-    if staging not in p.parents or not p.is_file():
-        return None
-    return p
+    key = (storage_info or {}).get("Key")
+    return key if storage.is_upload_key(key) else None
 
 
-def _discard(staged: Path) -> None:
-    staged.unlink(missing_ok=True)
-    staged.with_name(staged.name + ".info").unlink(missing_ok=True)
+async def _discard(key: str) -> None:
+    with contextlib.suppress(Exception):
+        await run_in_threadpool(storage.delete_key, key)
 
 
-async def _abandon(session: AsyncSession, project: Project, staged: Path, reason: str) -> JSONResponse:
+async def _abandon(session: AsyncSession, project: Project, key: str, reason: str) -> JSONResponse:
     """A finished upload we can't accept. tusd ignores RejectUpload at post-finish, so drop
     the bytes and park the reason on the project where the SPA already shows errors."""
-    _discard(staged)
+    await _discard(key)
     project.status = "failed"
     project.error = reason
     await session.commit()
@@ -156,20 +154,24 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
         return _ACK
 
     if hook_type == "post-finish":
-        staged = _staged_path((upload.get("Storage") or {}).get("Path"))
+        staged = _upload_key(upload.get("Storage") or {})
         if staged is None:
-            log.error("post-finish: staged file missing or outside the upload dir for %s", project_id)
+            log.error("post-finish: no usable upload key for %s (storage=%r)",
+                      project_id, upload.get("Storage"))
             return _ACK
 
         if project.status in ("queued", "analyzing"):
             # a replayed/duplicate hook — drop the bytes, but never touch the state of the
             # analysis that's already running
             log.warning("post-finish ignored for %s: already %s", project_id, project.status)
-            _discard(staged)
+            await _discard(staged)
             return _ACK
 
-        # `Size` is caller-supplied; the file on disk is the only honest number
-        size = staged.stat().st_size
+        # `Size` is caller-supplied; the object in the bucket is the only honest number
+        size = await run_in_threadpool(storage.size_of, staged)
+        if not size:
+            log.error("post-finish: upload object %s is missing or empty", staged)
+            return _ACK
 
         # pre-create checked these, but that call can simply be skipped — re-check here,
         # where the worker time and the Groq budget actually get spent.
@@ -181,14 +183,14 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
         except QuotaError as e:
             return await _abandon(session, project, staged, f"You've hit your {e.limit} limit.")
 
-        # an unvetted extension would name the file on disk; fall back to the one
-        # create_project already validated against VIDEO_EXTS
+        # an unvetted extension would name the object; fall back to the one create_project
+        # already validated against VIDEO_EXTS
         ext = Path(meta.get("filename") or "").suffix.lower()
         if ext not in VIDEO_EXTS:
             ext = project.source_ext if project.source_ext in VIDEO_EXTS else ".mp4"
-        dest = storage.source_path(user.id, project.id, ext)
-        os.replace(staged, dest)                       # same volume → atomic
-        staged.with_name(staged.name + ".info").unlink(missing_ok=True)
+        # server-side copy, then drop the upload object — no bytes through this process
+        await run_in_threadpool(storage.copy, staged, storage.source_key(user.id, project.id, ext))
+        await _discard(staged)
 
         project.source_ext = ext
         project.source_bytes = size

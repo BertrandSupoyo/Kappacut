@@ -23,9 +23,12 @@ services:
       - ./clipfinder.py:/srv/clipfinder.py
       - ./pipeline.py:/srv/pipeline.py
       - ./clipfinder.toml:/srv/clipfinder.toml
-      - media:/media
+      - media:/media          # migrate-media only
     ports:
       - "8001:8000"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
 
   worker:
     command: ["arq", "app.worker.WorkerSettings", "--watch", "app"]
@@ -37,7 +40,44 @@ services:
       - ./clipfinder.py:/srv/clipfinder.py
       - ./pipeline.py:/srv/pipeline.py
       - ./clipfinder.toml:/srv/clipfinder.toml
-      - media:/media
+
+  # local S3 so dev needs no R2 credentials — console on http://localhost:9001
+  # (.env.example's dev block points S3_* at this)
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-clipfinder}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-clipfinder-dev-secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # create the bucket once, then exit
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+        echo "bucket $${S3_BUCKET} ready"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-clipfinder}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-clipfinder-dev-secret}
+      S3_BUCKET: ${S3_BUCKET}
 
   # local SMTP catch-all — web UI on http://localhost:8025 (MailHog's maintained successor)
   mailhog:
@@ -48,3 +88,6 @@ services:
     ports:
       - "8025:8025"
     restart: unless-stopped
+
+volumes:
+  minio_data:

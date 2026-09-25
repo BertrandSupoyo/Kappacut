@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import shutil
+import tempfile
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,9 +55,14 @@ def _day_start() -> dt.datetime:
 
 
 def assert_disk_ok() -> None:
-    """Raise when the media volume is critically low — protects the box from a full disk."""
+    """Raise when local scratch space is critically low.
+
+    Media lives in the bucket now, so this no longer guards a media volume — it guards the
+    temp space the worker needs to pull a source down and cut clips into. Still the right
+    gate at upload time: no scratch, no render.
+    """
     try:
-        du = shutil.disk_usage(settings.media_root)
+        du = shutil.disk_usage(tempfile.gettempdir())
         free_pct = du.free / du.total * 100
     except Exception:
         return

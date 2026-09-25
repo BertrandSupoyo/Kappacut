@@ -4,6 +4,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,7 +63,7 @@ async def force_delete_project(
     p = await session.get(Project, project_id)
     if p is None:
         raise HTTPException(404, "no such project")
-    storage.delete_project_media(p.user_id, p.id)
+    await run_in_threadpool(storage.delete_project_media, p.user_id, p.id)
     await session.delete(p)
     await session.commit()
     return {"ok": True}

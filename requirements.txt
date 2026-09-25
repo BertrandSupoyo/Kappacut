@@ -23,6 +23,11 @@ email-validator==2.3.0
 
 aiosmtplib==5.1.2
 
+# object storage (Phase A) — S3-compatible; R2 in prod. Sync client on purpose: presigning
+# is local, the worker is already threaded, and request handlers wrap I/O in
+# run_in_threadpool, the same way they already do for ffmpeg.
+boto3==1.43.72
+
 groq==1.7.0
 anthropic==1.3.0
 python-dotenv==1.2.3

@@ -4,12 +4,13 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import tempfile
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +36,9 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 # be able to enqueue unbounded work. The per-day clip quota is the real limit; this is a
 # structural backstop on one payload.
 MAX_RANGES_PER_JOB = 100
+# Ceiling on /frame.jpg?t= when the project's duration isn't known yet — one ffmpeg run
+# and one stored object per distinct second, so this can't be left open.
+MAX_FRAME_SECOND = 6 * 3600
 
 
 def _now() -> dt.datetime:
@@ -207,7 +211,7 @@ async def delete_project(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     p = await _owned(project_id, user, session)
-    storage.delete_project_media(user.id, p.id)
+    await run_in_threadpool(storage.delete_project_media, user.id, p.id)
     await session.delete(p)  # cascades analyses / edits / jobs / outputs
     await session.commit()
     return {"ok": True}
@@ -226,20 +230,26 @@ async def upload_source(
     await _guard_enqueue(session, user)
     await check_quota(session, user, "analyze")
     ext = Path(file.filename or p.source_filename).suffix.lower() or p.source_ext or ".mp4"
-    dest = storage.source_path(user.id, p.id, ext)
+    if ext not in VIDEO_EXTS:
+        raise HTTPException(400, f"unsupported video type ({ext})")
 
+    # Spool to a temp file rather than memory (this accepts up to quota_max_upload_bytes)
+    # and only upload once the whole thing is here and within quota — a rejected upload
+    # never creates an object. The write itself goes through the threadpool so a 2 GB
+    # upload can't stall the event loop for every other request.
     size = 0
-    try:
-        with dest.open("wb") as fh:
+    with tempfile.TemporaryDirectory(prefix="clipfinder_upload_") as tmp:
+        staged = Path(tmp) / f"source{ext}"
+        with staged.open("wb") as fh:
             while chunk := await file.read(1 << 20):
                 size += len(chunk)
                 if size > settings.quota_max_upload_bytes:
                     raise HTTPException(413, "file exceeds the size limit")
-                fh.write(chunk)
+                await run_in_threadpool(fh.write, chunk)
         await check_quota(session, user, "upload", extra_bytes=size)
-    except Exception:
-        dest.unlink(missing_ok=True)
-        raise
+        await run_in_threadpool(
+            storage.put_file, storage.source_key(user.id, p.id, ext), staged
+        )
 
     p.source_ext = ext
     p.source_bytes = size
@@ -376,7 +386,9 @@ async def generate_clip_thumbnail(
     except ProviderError as e:
         raise HTTPException(502, f"thumbnail generation failed: {e}")
 
-    storage.thumbnail_path(p.user_id, p.id, clip_index).write_bytes(img)
+    await run_in_threadpool(
+        storage.put_bytes, storage.thumbnail_key(p.user_id, p.id, clip_index), img, "image/png"
+    )
     session.add(UsageEvent(user_id=user.id, project_id=p.id, kind="credit_thumbnail", quantity=1))
     await session.commit()
     return {"url": f"/media/{project_id}/thumbnails/{clip_index}.png"}
@@ -445,6 +457,39 @@ async def list_outputs(
 
 
 # --------------------------------------------------------------- media serving
+#
+# Every route here does the same two things in the same order: settle ownership against
+# the database, and only then sign a short-lived URL and redirect. The bytes never pass
+# through this process — `_owned()` is the entire access control, so it must run first
+# and a signed URL must never be built from anything the caller supplied.
+
+def _redirect(key: str) -> RedirectResponse:
+    return RedirectResponse(storage.presign_get(key), status_code=302)
+
+
+async def _derive(key: str, src_key: str, build: list, what: str) -> None:
+    """Generate a derived asset (waveform, frame) with ffmpeg and store it.
+
+    `build` is the ffmpeg argv with `{src}` and `{out}` placeholders — the source comes
+    down to a temp dir, ffmpeg runs against local files, the result goes up, and the temp
+    dir goes away. This is the only place the web process still runs ffmpeg; PLAN-v2.md
+    Phase B ("editor proxy") is where it stops doing even this.
+    """
+    import clipfinder as cf
+
+    def work() -> None:
+        with tempfile.TemporaryDirectory(prefix="clipfinder_derive_") as tmp:
+            root = Path(tmp)
+            src = storage.download(src_key, root / Path(src_key).name)
+            out = root / Path(key).name
+            cf.run([a.format(src=str(src), out=str(out)) for a in build])
+            storage.put_file(key, out)
+
+    try:
+        await run_in_threadpool(work)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"{what} failed: {e}")
+
 
 @media_router.get("/{project_id}/source")
 async def media_source(
@@ -453,10 +498,10 @@ async def media_source(
     session: AsyncSession = Depends(get_session),
 ):
     p = await _owned(project_id, user, session)
-    src = storage.find_source(p.user_id, p.id)
+    src = await run_in_threadpool(storage.find_source, p.user_id, p.id)
     if not src:
         raise HTTPException(404, "no source")
-    return FileResponse(src)
+    return _redirect(src)
 
 
 @media_router.get("/{project_id}/waveform.png")
@@ -465,22 +510,20 @@ async def media_waveform(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ):
+    import clipfinder as cf
+
     p = await _owned(project_id, user, session)
-    src = storage.find_source(p.user_id, p.id)
-    if not src:
-        raise HTTPException(404, "no source")
-    png = storage.waveform_path(p.user_id, p.id)
-    if not png.exists():
-        import clipfinder as cf
-        try:
-            await run_in_threadpool(cf.run, [
-                cf.FFMPEG, "-y", *cf._thread_args(), "-i", str(src), "-filter_complex",
-                "aformat=channel_layouts=mono,showwavespic=s=2000x150:colors=#a99bff:scale=sqrt",
-                "-frames:v", "1", str(png),
-            ])
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(500, f"waveform failed: {e}")
-    return FileResponse(png, headers={"Cache-Control": "private, max-age=86400"})
+    key = storage.waveform_key(p.user_id, p.id)
+    if not await run_in_threadpool(storage.exists, key):
+        src = await run_in_threadpool(storage.find_source, p.user_id, p.id)
+        if not src:
+            raise HTTPException(404, "no source")
+        await _derive(key, src, [
+            cf.FFMPEG, "-y", *cf._thread_args(), "-i", "{src}", "-filter_complex",
+            "aformat=channel_layouts=mono,showwavespic=s=2000x150:colors=#a99bff:scale=sqrt",
+            "-frames:v", "1", "{out}",
+        ], "waveform")
+    return _redirect(key)
 
 
 @media_router.get("/{project_id}/frame.jpg")
@@ -490,22 +533,23 @@ async def media_frame(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ):
+    import clipfinder as cf
+
     p = await _owned(project_id, user, session)
-    src = storage.find_source(p.user_id, p.id)
-    if not src:
-        raise HTTPException(404, "no source")
-    sec = max(0, int(t))
-    jpg = storage.frames_dir(p.user_id, p.id) / f"{sec}.jpg"
-    if not jpg.exists():
-        import clipfinder as cf
-        try:
-            await run_in_threadpool(cf.run, [
-                cf.FFMPEG, "-y", *cf._thread_args(), "-ss", str(sec), "-i", str(src),
-                "-frames:v", "1", "-vf", "scale=400:-2", "-q:v", "4", str(jpg),
-            ])
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(500, f"frame failed: {e}")
-    return FileResponse(jpg, headers={"Cache-Control": "private, max-age=86400"})
+    # clamp to the known duration: `t` is caller-supplied and every miss costs an ffmpeg
+    # run plus a stored object, so an unbounded value is an unbounded bill
+    limit = int(p.duration_seconds or 0) or MAX_FRAME_SECOND
+    sec = max(0, min(int(t), limit))
+    key = storage.frame_key(p.user_id, p.id, sec)
+    if not await run_in_threadpool(storage.exists, key):
+        src = await run_in_threadpool(storage.find_source, p.user_id, p.id)
+        if not src:
+            raise HTTPException(404, "no source")
+        await _derive(key, src, [
+            cf.FFMPEG, "-y", *cf._thread_args(), "-ss", str(sec), "-i", "{src}",
+            "-frames:v", "1", "-vf", "scale=400:-2", "-q:v", "4", "{out}",
+        ], "frame")
+    return _redirect(key)
 
 
 @media_router.get("/{project_id}/thumbnails/{clip_index}.png")
@@ -516,10 +560,10 @@ async def media_thumbnail(
     session: AsyncSession = Depends(get_session),
 ):
     p = await _owned(project_id, user, session)
-    png = storage.thumbnail_path(p.user_id, p.id, clip_index)
-    if not png.is_file():
+    key = storage.thumbnail_key(p.user_id, p.id, clip_index)
+    if not await run_in_threadpool(storage.exists, key):
         raise HTTPException(404, "no thumbnail generated yet")
-    return FileResponse(png, headers={"Cache-Control": "private, max-age=86400"})
+    return _redirect(key)
 
 
 @media_router.get("/{project_id}/clips/{name}")
@@ -531,9 +575,9 @@ async def media_clip(
 ):
     p = await _owned(project_id, user, session)
     try:
-        clip = storage.clip_path(p.user_id, p.id, name)
+        key = storage.clip_key(p.user_id, p.id, name)
     except ValueError:
         raise HTTPException(400, "bad name")
-    if not clip.is_file():
+    if not await run_in_threadpool(storage.exists, key):
         raise HTTPException(404, "no clip")
-    return FileResponse(clip)
+    return _redirect(key)

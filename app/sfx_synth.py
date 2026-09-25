@@ -1,6 +1,9 @@
-"""Synthesise the builtin sound effects onto the media volume (no auth/web imports —
-safe to call from the worker)."""
+"""Synthesise the builtin sound effects into the bucket (no auth/web imports — safe to
+call from the worker)."""
 from __future__ import annotations
+
+import tempfile
+from pathlib import Path
 
 from app import storage
 
@@ -22,13 +25,19 @@ BUILTIN_NAMES = tuple(_SYNTH)
 
 
 def synth_builtins() -> None:
+    """Idempotent: anything already in the bucket is left alone, so this stays cheap to
+    call on every worker start."""
     import clipfinder as cf
 
-    d = storage.builtin_sfx_dir()
-    for name, args in _SYNTH.items():
-        f = d / f"{name}.m4a"
-        if not f.exists():
+    missing = {n: a for n, a in _SYNTH.items()
+               if not storage.exists(storage.builtin_sfx_key(f"{n}.m4a"))}
+    if not missing:
+        return
+    with tempfile.TemporaryDirectory(prefix="clipfinder_sfx_") as tmp:
+        for name, args in missing.items():
+            f = Path(tmp) / f"{name}.m4a"
             try:
                 cf.run([cf.FFMPEG, "-y", *args, "-c:a", "aac", "-b:a", "128k", str(f)])
+                storage.put_file(storage.builtin_sfx_key(f.name), f, "audio/mp4")
             except Exception:  # noqa: BLE001 — a missing builtin is not fatal
                 pass

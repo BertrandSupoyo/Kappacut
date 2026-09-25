@@ -190,6 +190,35 @@ measure it. Storage was the binding constraint and Phase A removes the ceiling.
 
 ## Phase A — Media to S3-compatible object storage
 
+**Status: code-complete 2026-09-25 — not yet verified against a real bucket.** The
+verification checklist below is the gate; every box is still unticked. Deviations from the
+plan as written, and what they cost:
+
+- **Client library: `boto3` + `run_in_threadpool`, not an async S3 client.** The plan left
+  this open. Presigning signs locally (no I/O), the worker is already synchronous inside
+  `asyncio.to_thread`, and the web process does real S3 I/O on only a handful of paths — so
+  the sync client keeps `app/storage.py` a flat module of small functions instead of nested
+  async context managers, which is what made the rest of the phase mechanical. Request
+  handlers wrap I/O in `run_in_threadpool`, the same idiom already used for ffmpeg.
+- **`_seg()` allows a leading underscore.** Caught by the new tests: the shared `sfx/_builtin/`
+  prefix would otherwise be rejected by a first-character rule written to stop `.` and `..`.
+  An underscore has no traversal meaning, and allowing it preserves the identical-layout
+  property that makes `migrate-media` a straight copy.
+- **MinIO added to `compose.override.yaml`.** Not in the plan. Without it, `compose up` in dev
+  now requires real R2 credentials, which would have made the round-trip checklist below
+  unrunnable locally. `.env.example`'s dev block points at it and the bucket is created on
+  first boot.
+- **`tests/` exists now** — `test_storage_keys.py`, 11 tests, wired into CI. This is the
+  project's first test suite, and it closes the "Key-guard tests mirroring the `_inside()`
+  cases" checklist item below. Deliberately pytest-compatible but pytest-free so it runs
+  under plain `python` with no new dependency.
+- **`media_frame`'s `t` is now clamped** to the project duration (or `MAX_FRAME_SECOND`).
+  Listed as still-open at the bottom of this file; it became a one-line fix while that route
+  was being rewritten, so it was taken here rather than left.
+- **`assert_disk_ok` and `/api/health` now measure `tempfile.gettempdir()`**, not
+  `media_root`. The disk that matters is the worker's scratch space, since that is the only
+  local disk media touches any more.
+
 **Depends on:** nothing. Do this first; Phase B is independent but smaller.
 
 **Goal:** media lives in one bucket, survives the loss of the box, and stops being billed

@@ -32,17 +32,11 @@ from app.uploads import router as uploads_router
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    import os
-
     import clipfinder as cf
 
     settings.check_production_ready()   # dev secrets / insecure cookies never reach a public deploy
-    settings.media_root.mkdir(parents=True, exist_ok=True)
-    # tusd runs as a non-root uid; give it a writable staging dir inside the shared volume
-    staging = settings.media_root / "_uploads"
-    staging.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
-        os.chmod(staging, 0o777)
+    # No media staging dir any more: tusd writes straight to the bucket and this process
+    # only ever touches temp files (see app/storage.py).
     # same cap as the worker, for the on-demand waveform/frame ffmpeg calls this process makes
     cf.FFMPEG_THREADS = settings.ffmpeg_threads
     yield
@@ -85,6 +79,7 @@ async def _credit_handler(_: Request, exc: CreditError) -> JSONResponse:
 @app.get("/api/health")
 async def health() -> JSONResponse:
     import shutil
+    import tempfile
 
     db_ok = redis_ok = False
     queue_depth = 0
@@ -109,7 +104,8 @@ async def health() -> JSONResponse:
 
     disk_free_pct = 100.0
     try:
-        du = shutil.disk_usage(settings.media_root)
+        # scratch space, not a media volume — see quota.assert_disk_ok
+        du = shutil.disk_usage(tempfile.gettempdir())
         disk_free_pct = round(du.free / du.total * 100, 1)
     except Exception:
         pass
