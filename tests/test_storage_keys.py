@@ -114,8 +114,8 @@ def test_is_upload_key_refuses_anything_else():
 def test_presigned_url_is_scoped_signed_and_expiring():
     url = storage.presign_get(storage.clip_key(U, P, "01_x.mp4"), ttl=300)
     parsed, qs = urlparse(url), parse_qs(urlparse(url).query)
-    assert parsed.netloc == "minio:9000"
-    assert parsed.path.startswith("/clipfinder-test/")        # path-style addressing
+    assert parsed.netloc == urlparse(storage.settings.s3_endpoint_url).netloc
+    assert parsed.path.startswith(f"/{storage.settings.s3_bucket}/")  # path-style addressing
     assert f"users/{U}/projects/{P}/clips/01_x.mp4" in parsed.path
     assert qs["X-Amz-Algorithm"][0] == "AWS4-HMAC-SHA256"
     assert qs["X-Amz-Expires"][0] == "300"
