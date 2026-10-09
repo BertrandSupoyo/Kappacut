@@ -118,7 +118,9 @@ _KAR_MAX_WORDS, _KAR_MAX_SPAN = 5, 2.6
 
 def _ass_ts(t: float) -> str:
     t = max(0.0, t)
-    h = int(t // 3600); m = int(t % 3600 // 60); s = t % 60
+    h = int(t // 3600)
+    m = int(t % 3600 // 60)
+    s = t % 60
     return f"{h:d}:{m:02d}:{s:05.2f}"
 
 
@@ -158,7 +160,8 @@ def _chunk_words(ws: list[dict]) -> list[list[dict]]:
         cur.append(w)
         full = len(cur) >= _KAR_MAX_WORDS or w["end"] - cur[0]["start"] > _KAR_MAX_SPAN
         if full or (w["w"][-1:] in ".!?" and len(cur) >= 3):
-            groups.append(cur); cur = []
+            groups.append(cur)
+            cur = []
     if cur:
         groups.append(cur)
     merged: list[list[dict]] = []                            # fold tiny trailing groups back

@@ -143,7 +143,7 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         job.status, job.started_at = "running", _now()
         project.status = "analyzing"
         await s.commit()
-        user_id, project_id, ext = project.user_id, project.id, project.source_ext
+        user_id, project_id = project.user_id, project.id
         job_taste = (job.payload or {}).get("taste")
         auto_render = project.auto_render
 

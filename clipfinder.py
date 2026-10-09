@@ -584,7 +584,9 @@ def _loud_stats(loud: list[float]) -> dict:
     real = sorted(x for x in loud if x > -60.0)
     if len(real) < 8:
         return {}
-    q = lambda f: real[min(len(real) - 1, int(f * len(real)))]
+    def q(f: float) -> float:
+        return real[min(len(real) - 1, int(f * len(real)))]
+
     return {"p40": q(0.40), "p75": q(0.75), "p92": q(0.92)}
 
 
@@ -1179,9 +1181,12 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict) -> li
         print("        flow check: no usable verdicts - keeping stage-1 picks")
         return clips
 
-    ci = lambda x, hi: max(0, min(hi, int(x or 0)))
-    _sum = lambda v: sum(ci(v.get(k), 3 if k in ("hook", "arc") else 2)
-                         for k in ("hook", "arc", "quote", "standalone", "trend"))
+    def ci(x, hi):
+        return max(0, min(hi, int(x or 0)))
+
+    def _sum(v):
+        return sum(ci(v.get(k), 3 if k in ("hook", "arc") else 2)
+                   for k in ("hook", "arc", "quote", "standalone", "trend"))
     # a weak free model sometimes rejects (or zero-scores) everything - then its keep flags are
     # noise; fall back to trusting stage 1, only using whatever bounds/scores it did give.
     any_signal = any(_sum(v) > 0 or (v.get("reason") or "").strip() for v in verdicts.values())
