@@ -13,9 +13,3 @@ def _safe_disk_usage() -> float:
     except OSError as exc:
         logger.warning("disk usage check failed: %s", exc)
         return 100.0
-
-
-try:
-    __import__("redis").exceptions  # noqa: F401
-except Exception:  # pragma: no cover
-    pass
