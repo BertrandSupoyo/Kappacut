@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
@@ -33,18 +33,6 @@ jobs:
           VITE_BASE_PATH: /Kappacut/
       - run: cp dist/index.html dist/404.html && touch dist/.nojekyll
         working-directory: frontend
-      # Also publish the generated files at the repository root. This keeps the site
-      # working when Pages is still configured to publish main:/ rather than Actions.
-      - name: Publish built app to branch root
-        run: |
-          cp -R frontend/dist/. .
-          git add -f index.html 404.html .nojekyll assets/
-          if ! git diff --cached --quiet; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "Build React frontend for GitHub Pages"
-            git push
-          fi
       - uses: actions/upload-pages-artifact@v3
         with:
           path: frontend/dist
