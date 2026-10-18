@@ -61,6 +61,7 @@ def analyze(video_path: Path, cfg: dict, on_progress: ProgressCB = lambda p, m: 
         cf.apply_profile(cfg)        # categories.toml: length window, loudness weight, default taste
 
         on_progress(65, "Ranking the moments")
+        cfg["_progress"] = on_progress               # per-section updates from the picker
         clips, _usage = cf.find_clips(segments, cfg, loud)
 
         if cfg.get("coherence_check", True) and clips:

@@ -560,6 +560,63 @@ def test_an_echoed_placeholder_is_not_a_payoff_line():
     assert out and all(c.hook_line == "" and c.payoff_line == "" for c in out)
 
 
+def test_an_overlapping_top_up_is_replaced_not_lost():
+    # clips 0-1 strong; 2 is the best "thin" one but overlaps clip 0; 3 should take its place
+    segs = [_seg(i * 30, i * 30 + 25, " ".join(["word"] * 40)) for i in range(6)]
+    clips = [_clip(0, 20, score=5), _clip(30, 50, score=5), _clip(10, 28, score=5),
+             _clip(90, 110, score=5), _clip(120, 140, score=5), _clip(150, 170, score=5)]
+    vs = [{"index": 0, "keep": True, "hook": 3, "arc": 3, "quote": 2, "standalone": 2, "trend": 2, "rank": 1},
+          {"index": 1, "keep": True, "hook": 3, "arc": 3, "quote": 2, "standalone": 2, "trend": 2, "rank": 2},
+          {"index": 2, "keep": True, "hook": 3, "arc": 1, "quote": 2, "standalone": 2, "trend": 2, "rank": 3},
+          {"index": 3, "keep": True, "hook": 2, "arc": 1, "quote": 1, "standalone": 2, "trend": 1, "rank": 4},
+          {"index": 4, "keep": False, "hook": 0, "arc": 0, "quote": 0, "standalone": 0, "trend": 0, "rank": 5, "reason": "broken"},
+          {"index": 5, "keep": False, "hook": 0, "arc": 0, "quote": 0, "standalone": 0, "trend": 0, "rank": 6, "reason": "broken"}]
+    real = cf._groq_chat
+    cf._groq_chat = _scripted(vs)
+    try:
+        out = cf._verify_and_refine(clips, segs, _cfg(count=3, min_clips=3, quality_floor=40))
+    finally:
+        cf._groq_chat = real
+    starts = sorted(c.start_seconds for c in out)
+    assert len(out) == 3 and 10 not in starts and 90 in starts, starts
+
+
+def test_a_harsh_judge_still_leaves_three_clips_near_the_floor():
+    # two clips clear the floor (63, 64); the rest land ~52. Without the soft minimum the
+    # list stops at 2; with it, the best near-miss tops it up to 3 - and no further.
+    vs = [{"index": i, "keep": True, "hook": 1 + i % 2, "arc": 1, "quote": 0, "standalone": 1,
+           "trend": i % 2, "rank": i + 1} for i in range(6)]       # varied, so not the "flat" path
+    out = _verify(vs, count=5, floor=60)
+    assert len(out) == 3, len(out)
+
+
+def test_a_rejection_without_a_reason_is_ignored():
+    # seen live: keep=false on the judge's own #1 and #2 picks, reason ""
+    vs = [{"index": i, "keep": i == 5, "hook": 3 - i % 2, "arc": 2 + (i < 2), "quote": 1, "standalone": 2,
+           "trend": 2, "rank": i + 1, "reason": ""} for i in range(6)]
+    out = _verify(vs, count=4, floor=40)
+    assert len(out) == 4, len(out)
+
+
+def test_a_rejection_with_a_reason_still_drops_the_clip():
+    vs = [{"index": i, "keep": i != 0, "hook": 2, "arc": 2 + i % 2, "quote": 1, "standalone": 2, "trend": 2,
+           "rank": i + 1, "reason": "garbled word salad" if i == 0 else ""} for i in range(6)]
+    out = _verify(vs, count=6, floor=0)
+    assert all(c.start_seconds != 0 for c in out)
+
+
+def test_the_video_title_reaches_the_genre_prompt():
+    seen = []
+    real = cf._groq_chat
+    cf._groq_chat = lambda client, model, prompt, *a, **k: seen.append(prompt) or SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"category":"reaction","confidence":0.9}'))])
+    try:
+        cat = cf.detect_category([_seg(0, 5, "hey guys welcome back")], _cfg(video_title="This Try Not To Laugh Was SO Hard"))
+    finally:
+        cf._groq_chat = real
+    assert cat == "reaction" and "VIDEO TITLE: This Try Not To Laugh Was SO Hard" in seen[0]
+
+
 def test_no_reaction_candidates_for_podcasts():
     cfg = _cfg(count=5, category="podcast")
     cf.apply_profile(cfg)

@@ -200,6 +200,7 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         user_id, project_id = project.user_id, project.id
         job_payload = dict(job.payload or {})
         auto_render = project.auto_render
+        video_title = project.name or project.source_filename or ""
 
     src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
     if src_key is None:
@@ -232,6 +233,7 @@ async def run_analyze(job_id: uuid.UUID) -> None:
             storage.download, src_key, Path(tmp.name) / Path(src_key).name
         )
         cfg = _apply_options(pipeline.get_cfg(), job_payload)   # fresh dict per call
+        cfg["video_title"] = video_title            # "Try Not To Laugh…" says more than any transcript line
         result = await asyncio.to_thread(
             functools.partial(pipeline.analyze, src, cfg, on_progress)
         )
