@@ -1,0 +1,94 @@
+# Dev overrides — applied automatically by `docker compose`.
+# Bind-mounts source for hot reload, exposes DB/Redis to the host, adds MailHog.
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  web:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    environment:
+      COOKIE_SECURE: "false"
+      # media redirects go to the browser — sign them for the host-published s3mock port
+      S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:9090}
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+    volumes:
+      - ./app:/srv/app
+      - ./alembic:/srv/alembic
+      - ./alembic.ini:/srv/alembic.ini
+      - ./clipfinder.py:/srv/clipfinder.py
+      - ./pipeline.py:/srv/pipeline.py
+      - ./clipfinder.toml:/srv/clipfinder.toml
+      - ./categories.toml:/srv/categories.toml
+      - ./frontend/src/editor/colorPresets.json:/srv/color_presets.json
+      - media:/media          # migrate-media only
+    ports:
+      - "8001:8000"
+    depends_on:
+      minio:
+        condition: service_started
+
+  worker:
+    # Not `arq --watch`: that reload cancels the running job outright AND restarts inside the
+    # same process, so edited modules were never re-imported. watchfiles restarts the whole
+    # process on SIGINT; the worker then finishes its current job first (job_completion_wait).
+    # Engine + config files are watched too, so clipfinder.py / categories.toml edits load.
+    command:
+      - watchfiles
+      - --filter
+      - default
+      - --sigint-timeout
+      - "600"
+      - arq app.worker.WorkerSettings
+      - /srv/app
+      - /srv/clipfinder.py
+      - /srv/pipeline.py
+      - /srv/clipfinder.toml
+      - /srv/categories.toml
+      - /srv/color_presets.json
+    environment:
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+    volumes:
+      - ./app:/srv/app
+      - ./clipfinder.py:/srv/clipfinder.py
+      - ./pipeline.py:/srv/pipeline.py
+      - ./clipfinder.toml:/srv/clipfinder.toml
+      - ./categories.toml:/srv/categories.toml
+      - ./frontend/src/editor/colorPresets.json:/srv/color_presets.json
+
+  # local S3 so dev needs no R2 credentials — console on http://localhost:9001
+  # (.env.example's dev block points S3_* at this)
+  # (minio/minio and minio/mc are no longer published on Docker Hub, so the service keeps
+  # its name but runs adobe/s3mock, which creates the bucket itself on boot. Port 9090.)
+  minio:
+    image: adobe/s3mock:latest
+    user: "0:0"   # the named volume mounts root-owned; the image's default uid can't write it
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: ${S3_BUCKET:-clipfinder}
+      COM_ADOBE_TESTING_S3MOCK_STORE_ROOT: /data
+      COM_ADOBE_TESTING_S3MOCK_STORE_RETAIN_FILES_ON_EXIT: "true"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  # local SMTP catch-all — web UI on http://localhost:8025 (MailHog's maintained successor)
+  mailhog:
+    image: axllent/mailpit:v1.21
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "8025:8025"
+    restart: unless-stopped
+
+volumes:
+  minio_data:

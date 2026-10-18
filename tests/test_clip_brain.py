@@ -1,0 +1,558 @@
+"""The clip-picking "brain" and render helpers: lengths, sentence ends, quiet-gap splitting,
+the face camera path and its ffmpeg crop expression, the readable score, the verify step's
+ranking / flat-score / count handling, colour, captions and the analyze job's glue.
+
+Same convention as test_storage_keys.py: plain `test_*` functions, bare asserts, no pytest
+import, so it runs as `python tests/test_clip_brain.py` (CI) and under `pytest tests/`.
+No network: the verify step is driven by a scripted model reply, never Groq. The one ffmpeg
+test skips itself when ffmpeg isn't installed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("GROQ_API_KEY", "test-not-used")           # groq.Groq() needs one to construct
+for k, v in {"S3_ENDPOINT_URL": "http://minio:9000", "S3_BUCKET": "clipfinder-test",
+             "S3_ACCESS_KEY_ID": "testkey", "S3_SECRET_ACCESS_KEY": "testsecret"}.items():
+    os.environ.setdefault(k, v)
+
+import clipfinder as cf  # noqa: E402
+import pipeline  # noqa: E402
+
+
+def _cfg(**over):
+    cfg = dict(cf.DEFAULTS)
+    cfg.update({"min_seconds": 15.0, "max_seconds": 45.0, "snap_max_shift": 4.0,
+                "lead_seconds": 0.4, "tail_seconds": 0.8, "max_gap_seconds": 6.0,
+                "min_words": 5, "backend": "groq", "groq_model": "openai/gpt-oss-20b",
+                "groq_verify_model": "", "count": 3, "min_clips": 3, "taste": "", "category": ""})
+    cfg.update(over)
+    return cfg
+
+
+def _seg(a, b, text="one two three four five six"):
+    return {"start": float(a), "end": float(b), "text": text}
+
+
+def _clip(a, b, **kw):
+    return cf.Clip(start_seconds=a, end_seconds=b, **kw)
+
+
+# --------------------------------------------------------------- length + cut points
+
+def test_short_clip_grows_forward_to_a_sentence_end():
+    segs = [_seg(0, 5), _seg(5, 12), _seg(12, 20)]
+    c = _clip(2, 10)                                   # 8 s: under the 15 s minimum
+    cf._clamp_clip(c, 100.0, _cfg(), segs)
+    assert c.start_seconds == 2                        # setup untouched
+    assert c.end_seconds == 20                         # 2+15 lands mid-line, so it finishes the line
+
+
+def test_short_clip_reaches_back_only_at_the_end_of_the_video():
+    c = _clip(90, 95)
+    cf._clamp_clip(c, 96.0, _cfg(), [])
+    assert c.end_seconds == 96 and abs((c.end_seconds - c.start_seconds) - 15) < 1e-6
+
+
+def test_long_clip_is_capped_at_max_seconds():
+    c = _clip(0, 60)
+    cf._clamp_clip(c, 100.0, _cfg(), [])
+    assert c.end_seconds == 45
+
+
+def test_end_inside_a_sentence_finishes_it_when_close():
+    c = _clip(0, 20)
+    cf._end_on_sentence(c, [_seg(10, 22)], _cfg(), 100.0)
+    assert abs(c.end_seconds - 22.3) < 1e-6
+
+
+def test_end_inside_a_long_sentence_stops_before_it_when_that_keeps_the_minimum():
+    c = _clip(0, 25)
+    cf._end_on_sentence(c, [_seg(18, 40)], _cfg(), 100.0)
+    assert c.end_seconds == 18
+
+
+def test_end_on_a_pause_is_left_alone():
+    c = _clip(0, 20)
+    cf._end_on_sentence(c, [_seg(10, 15), _seg(25, 30)], _cfg(), 100.0)
+    assert c.end_seconds == 20
+
+
+def test_degenerate_pick_is_dropped():
+    segs = [_seg(0, 30, "a b c d e f g h i j k l m n o p q r s t")]
+    out = cf._finalize([_clip(10, 10)], segs, 3, _cfg())
+    assert out == []
+
+
+# --------------------------------------------------------------- topic-aware windows
+
+def _two_topics():
+    a = [_seg(t, t + 4, "ramen broth noodles spicy chili tasting kitchen") for t in range(0, 180, 5)]
+    b = [_seg(t, t + 4, "football stadium goalkeeper penalty referee supporters") for t in range(185, 420, 5)]
+    return a + b
+
+
+def test_window_cuts_where_the_topic_changes_not_on_the_clock():
+    wins = cf._windows(_two_topics(), 240)
+    assert abs(wins[0][-1]["end"] - 179) < 0.01            # ends with topic A at 3:00, not 4:00
+    assert any(s["start"] == 185 for s in wins[1])         # topic B opens the next window
+
+
+def test_windows_overlap_and_cover_everything():
+    segs = _two_topics()
+    wins = cf._windows(segs, 240)
+    assert wins[1][0]["start"] < wins[0][-1]["end"]        # the next window repeats the tail
+    assert wins[0][-1]["end"] - wins[1][0]["start"] <= cf.WINDOW_OVERLAP + 5
+    covered = {id(s) for w in wins for s in w}
+    assert covered == {id(s) for s in segs}
+    assert all(w[-1]["start"] - w[0]["start"] <= 240 for w in wins)
+
+
+def test_a_short_video_is_one_window():
+    segs = [_seg(t, t + 4) for t in range(0, 120, 5)]
+    assert len(cf._windows(segs, 240)) == 1 and cf._windows([], 240) == []
+
+
+def test_uniform_talk_still_ends_within_the_span():
+    segs = [_seg(t, t + 4.5, "same words every line here again") for t in range(0, 900, 5)]
+    wins = cf._windows(segs, 240)
+    assert len(wins) >= 4 and all(w[-1]["start"] - w[0]["start"] <= 240 for w in wins)
+
+
+# --------------------------------------------------------------- quiet vs loud gaps
+
+def _loud(quiet_from=10, quiet_to=20, level=-50.0, n=60):
+    return [level if quiet_from <= i < quiet_to else -30.0 for i in range(n)]
+
+
+def test_a_quiet_gap_splits_off_the_other_moment():
+    segs = [_seg(0, 10, "one two three four five"), _seg(20, 30, "six seven eight nine ten eleven")]
+    c = _clip(0, 30)
+    cf._trim_to_dense_block(c, segs, _cfg(), _loud(level=-50.0))
+    assert c.start_seconds > 18                        # kept the wordier second block
+
+
+def test_a_loud_gap_without_words_stays_in_the_clip():
+    segs = [_seg(0, 10, "one two three four five"), _seg(20, 30, "six seven eight nine ten eleven")]
+    c = _clip(0, 30)
+    cf._trim_to_dense_block(c, segs, _cfg(), _loud(level=-20.0))   # chewing / screaming
+    assert c.start_seconds == 0 and c.end_seconds == 30
+
+
+# --------------------------------------------------------------- face camera path
+
+def test_camera_ignores_jitter_inside_the_dead_zone():
+    times = [i * 0.5 for i in range(20)]
+    xs = [0.50 if i % 2 else 0.53 for i in range(20)]
+    path = cf._camera_path(times, xs, [0.4] * 20)
+    assert len(path) == 2                              # just the two ends: the camera never moved
+    assert all(abs(p[1] - path[0][1]) < 1e-9 for p in path)
+
+
+def test_camera_follows_a_real_move():
+    times = [i * 0.5 for i in range(30)]
+    xs = [0.3] * 10 + [0.7] * 20
+    path = cf._camera_path(times, xs, [0.4] * 30)
+    assert path[0][1] < 0.35 and path[-1][1] > 0.6
+
+
+def test_camera_fills_missed_detections():
+    times = [i * 0.5 for i in range(10)]
+    xs = [0.4, None, None, 0.4, 0.4, None, 0.4, 0.4, 0.4, None]
+    path = cf._camera_path(times, xs, [0.5 if x is not None else None for x in xs])
+    assert all(p[1] is not None and p[2] is not None for p in path)
+
+
+def test_camera_jumps_on_a_shot_change_instead_of_gliding():
+    times = [i * 0.5 + 0.25 for i in range(20)]               # 0.25 … 9.75 s
+    xs = [0.3 if t < 5 else 0.7 for t in times]
+    path = cf._camera_path(times, xs, [0.4] * 20, cuts=[5.0])
+    before = [p for p in path if p[0] < 5.0]
+    after = [p for p in path if p[0] >= 5.0]
+    assert before[-1][0] >= 4.98 and abs(before[-1][1] - 0.3) < 0.01   # held right up to the cut
+    assert after[0][0] == 5.0 and abs(after[0][1] - 0.7) < 0.01         # new framing on the cut frame
+    glide = cf._camera_path(times, xs, [0.4] * 20)                       # no cut info: eases across
+    assert not any(abs(p[1] - 0.7) < 0.01 and p[0] <= 5.3 for p in glide)
+
+
+def test_a_cut_between_matching_shots_does_not_jolt():
+    times = [i * 0.5 + 0.25 for i in range(20)]
+    path = cf._camera_path(times, [0.5] * 10 + [0.52] * 10, [0.4] * 20, cuts=[5.0])
+    assert all(abs(p[1] - 0.5) < 0.01 for p in path)
+
+
+def test_a_faceless_shot_holds_the_usual_position():
+    times = [i * 0.5 + 0.25 for i in range(30)]
+    xs = [0.6] * 10 + [None] * 10 + [0.6] * 10                # a food close-up in the middle
+    path = cf._camera_path(times, xs, [0.4 if v else None for v in xs], cuts=[5.0, 10.0])
+    assert all(abs(p[1] - 0.6) < 0.01 for p in path)
+
+
+def test_fast_cutting_still_renders():
+    if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+        print("    (skipped: ffmpeg not installed)")
+        return
+    times = [i * 0.5 + 0.25 for i in range(40)]
+    cuts = [float(c) for c in range(1, 20)]                   # a cut every second
+    xs = [0.25 if int(t) % 2 else 0.75 for t in times]
+    track = cf._camera_path(times, xs, [0.5] * 40, cuts=cuts)
+    assert len(track) > 30
+    x, y = cf._follow_xy({"track": track}, 0.0, 0.5, 0.5)
+    p = subprocess.run([cf.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=10:duration=20",
+                        "-vf", f"crop=w=ih*9/16:h=ih:x={x}:y={y}", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr[-400:]
+
+
+def test_track_expression_is_filtergraph_safe():
+    expr = cf._track_expr([[10, 0.2, 0.5], [15, 0.5, 0.5], [20, 0.8, 0.5]], 10.0, 1)
+    assert expr and "," not in expr.replace("\\,", "")  # every comma escaped for -vf
+    assert cf._track_expr([[10, 0.2, 0.5]], 10.0, 1) is None   # one point is not a path
+
+
+def test_follow_falls_back_to_static_placement_without_a_track():
+    x, y = cf._follow_xy({}, 0.0, 0.25, 0.5)
+    assert x == "(iw-ow)*0.2500" and y == "(ih-oh)*0.5000"
+
+
+def test_moving_crop_renders_in_ffmpeg():
+    if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+        print("    (skipped: ffmpeg not installed)")
+        return
+    x, y = cf._follow_xy({"track": [[0, 0.1, 0.5], [2, 0.9, 0.5]]}, 0.0, 0.5, 0.5)
+    p = subprocess.run([cf.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=10:duration=2",
+                        "-vf", f"crop=w=ih*9/16:h=ih:x={x}:y={y}", "-f", "null", "-"],
+                       capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr[-400:]
+
+
+def test_frame_on_centres_and_clamps():
+    assert cf.frame_on({"x": 0.5, "y": 0.4, "ar": 16 / 9}) == {"px": 0.5, "py": 0.5}
+    assert cf.frame_on({"x": 0.95, "y": 0.4, "ar": 16 / 9})["px"] == 1.0   # can't pan past the edge
+
+
+# --------------------------------------------------------------- readable score
+
+def test_score_is_0_to_100_and_rank_moves_it():
+    segs = [_seg(0, 20, " ".join(["word"] * 50))]
+    best, worst = _clip(0, 20, score=6), _clip(0, 20, score=6)
+    for c in (best, worst):
+        c.arc = {"hook": 2, "arc": 2, "quote": 1, "standalone": 1, "trend": 1}
+    best._rank_pct, worst._rank_pct = 1.0, 0.0
+    b, w = cf.score_breakdown(best, segs, None), cf.score_breakdown(worst, segs, None)
+    assert 0 <= w["total"] < b["total"] <= 100
+    assert set(b) == {"total", "hook", "story", "energy", "clarity", "pacing"}
+
+
+# --------------------------------------------------------------- verify step (scripted model)
+
+def _scripted(verdicts):
+    reply = SimpleNamespace(choices=[SimpleNamespace(
+        message=SimpleNamespace(content=json.dumps({"verdicts": verdicts})), finish_reason="stop")])
+    return lambda *a, **k: reply
+
+
+def _verify(verdicts, n=6, count=3, floor=0):
+    segs = [_seg(i * 30, i * 30 + 25, " ".join(["word"] * 40)) for i in range(n)]
+    clips = [_clip(i * 30, i * 30 + 20, score=5) for i in range(n)]
+    real = cf._groq_chat
+    cf._groq_chat = verdicts if callable(verdicts) else _scripted(verdicts)
+    try:
+        return cf._verify_and_refine(clips, segs, _cfg(count=count, min_clips=count, quality_floor=floor))
+    finally:
+        cf._groq_chat = real
+
+
+def test_count_is_a_maximum_weak_clips_are_not_padded_in():
+    # two strong clips, four the judge scored at the bottom; asked for 5
+    vs = [{"index": i, "keep": True, "hook": 3 if i < 2 else 0, "arc": 3 if i < 2 else 0,
+           "quote": 2 if i < 2 else 0, "standalone": 2 if i < 2 else 0, "trend": 2 if i < 2 else 0,
+           "rank": i + 1} for i in range(6)]
+    out = _verify(vs, count=5, floor=60)
+    assert len(out) == 2 and {c.start_seconds for c in out} == {0.0, 30.0}
+
+
+def test_a_rejected_clip_never_pads_the_list():
+    vs = [{"index": i, "keep": i != 1, "hook": 2, "arc": 3 if i != 1 else 1, "quote": 1,
+           "standalone": 1, "trend": 1, "rank": i + 1, "reason": "staples two moments" if i == 1 else ""}
+          for i in range(3)]
+    out = _verify(vs, n=3, count=3)
+    assert 30.0 not in {c.start_seconds for c in out}
+
+
+def test_nothing_clears_the_floor_still_returns_the_best_one():
+    vs = [{"index": i, "keep": True, "hook": 0, "arc": 0, "quote": 0, "standalone": 0, "trend": 0,
+           "rank": i + 1} for i in range(4)]
+    out = _verify(vs, n=4, count=3, floor=99)
+    assert len(out) == 1
+
+
+def test_verify_returns_the_top_ranked_clips_in_time_order():
+    vs = [{"index": i, "keep": True, "hook": 2, "arc": 2 + (i % 2), "quote": i % 3, "standalone": 1,
+           "trend": 1, "rank": r} for i, r in enumerate([6, 1, 5, 2, 4, 3])]
+    out = _verify(vs)
+    starts = [c.start_seconds for c in out]
+    assert len(out) == 3 and starts == sorted(starts)
+    assert {c.start_seconds for c in out} == {30.0, 90.0, 150.0}       # ranks 1, 2, 3
+
+
+def test_identical_scores_are_ignored_but_the_rank_still_counts():
+    vs = [{"index": i, "keep": True, "hook": 1, "arc": 2, "quote": 1, "standalone": 1, "trend": 1,
+           "rank": i + 1} for i in range(6)]
+    out = _verify(vs)
+    assert all(c.arc == {} for c in out)               # flat verdicts carry no information
+    assert all(c._rank_pct is not None for c in out)
+
+
+def test_a_failed_verify_still_respects_the_clip_count():
+    def outage(*a, **k):
+        raise RuntimeError("simulated outage")
+    out = _verify(outage, count=3)
+    assert len(out) == 3
+
+
+def test_verify_prompt_carries_no_example_scores():
+    # the old worked example's 2/3/2/2/2 was echoed onto every clip
+    assert '"hook":2' not in cf._VERIFY_BRIEF and '"rank"' in cf._VERIFY_SHAPE
+
+
+# --------------------------------------------------------------- render helpers
+
+def test_brightness_scales_like_the_preview():
+    m = cf.color_matrix({"preset": "none", "b": -0.24, "c": 1, "s": 1})
+    assert all(abs(m[i][i] - 0.76) < 1e-9 for i in range(3)) and all(row[3] == 0 for row in m)
+
+
+def test_neutral_look_adds_no_filter():
+    with tempfile.TemporaryDirectory() as d:
+        assert cf._color_chain({"preset": "none", "b": 0, "c": 1, "s": 1}, Path(d) / "x.cube") == ""
+        assert not (Path(d) / "x.cube").exists()
+
+
+def test_presets_come_from_the_shared_file():
+    presets = cf._color_presets()
+    assert {"none", "punchy", "warm", "cool", "film", "mono"} <= set(presets)
+    cool = cf.color_matrix({"preset": "cool", "b": 0, "c": 1, "s": 1})
+    assert cool[2][2] > cool[0][0]                             # cool: more blue gain than red
+    mono = cf.color_matrix({"preset": "mono", "b": 0, "c": 1, "s": 1})
+    assert abs(mono[0][1] - mono[1][1]) < 1e-9                 # greyscale: every output row the same
+
+
+def test_render_applies_exactly_the_preview_matrix():
+    """Push a known colour through the real lut3d and compare with the matrix maths the
+    editor's SVG filter uses. Skips without ffmpeg."""
+    if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+        print("    (skipped: ffmpeg not installed)")
+        return
+    look = {"preset": "cool", "b": -0.1, "c": 1.2, "s": 1.3}
+    m = cf.color_matrix(look)
+
+    def first_pixel(chain):
+        p = subprocess.run([cf.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=0x668C4D:s=16x16:d=0.1",
+                            "-vf", f"format=rgb24{',' + chain if chain else ''},format=rgb24", "-frames:v", "1",
+                            "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
+        assert p.returncode == 0, p.stderr[-300:]
+        return list(p.stdout[:3])
+
+    # lavfi's color source is generated in YUV, so read the real input pixel rather than
+    # assuming the hex value survived the conversion
+    src = [v / 255 for v in first_pixel("")]
+    want = [max(0.0, min(1.0, r[0] * src[0] + r[1] * src[1] + r[2] * src[2] + r[3])) * 255 for r in m]
+    with tempfile.TemporaryDirectory() as d:
+        got = first_pixel(cf._color_chain(look, Path(d) / "g.cube"))
+    assert all(abs(g - w) <= 1.5 for g, w in zip(got, want)), (got, [round(w, 1) for w in want])
+
+
+def test_captions_wrap_inside_the_frame():
+    with tempfile.TemporaryDirectory() as d:
+        p = pipeline.build_ass([{"start": 0, "end": 2, "text": "a long line " * 10}], "bold", "bottom",
+                               1.6, True, Path(d) / "c.ass")
+        assert "WrapStyle: 0" in p.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------- category profiles
+
+def test_profile_sets_length_loudness_and_default_taste():
+    cfg = _cfg(category="podcast")
+    cf.apply_profile(cfg)
+    assert (cfg["min_seconds"], cfg["max_seconds"]) == (20.0, 60.0)
+    assert cfg["energy_weight"] < 0.5 and "takes" in cfg["taste"]
+    assert "complete thought" in cf._steer_line(cfg)
+
+
+def test_users_own_taste_beats_the_genre_default():
+    cfg = _cfg(category="podcast", taste="only the cooking bits", taste_from_user=True)
+    cf.apply_profile(cfg)
+    assert cfg["taste"] == "only the cooking bits"
+
+
+def test_unknown_genre_falls_back_to_general():
+    cfg = _cfg(category="knitting")
+    cf.apply_profile(cfg)
+    assert cfg["energy_weight"] == 1.0 and cfg["min_seconds"] == 15.0
+
+
+def test_food_is_a_known_genre():
+    assert "food" in cf.CATEGORIES
+
+
+def test_energy_weight_changes_how_much_loudness_counts():
+    segs = [_seg(0, 20, " ".join(["word"] * 50))]
+    quiet_clip = _clip(0, 20, score=8)
+    loud = [-50.0] * 30 + [-20.0] * 30                      # the video gets loud later; the clip stays quiet
+    calm = cf.score_breakdown(quiet_clip, segs, [-50.0] * 60, 1.0)
+    assert calm["energy"] <= 0.5
+    low_w = cf.score_breakdown(quiet_clip, segs, loud, 0.3)["total"]
+    high_w = cf.score_breakdown(quiet_clip, segs, loud, 1.4)["total"]
+    assert low_w > high_w                                    # a quiet clip is punished less in a podcast
+
+
+# --------------------------------------------------------------- analyze-job glue
+
+def test_project_options_become_engine_settings():
+    from app.jobs import _apply_options
+    cfg = _apply_options(_cfg(count=6, taste="toml default"), {"count": 3, "content_type": "food",
+                                                              "taste": "Prioritize beat_type: fail."})
+    assert cfg["count"] == 3 and cfg["count_explicit"] and cfg["category_override"] == "food"
+    assert cfg["taste"] == "Prioritize beat_type: fail." and cfg["taste_from_user"]
+
+
+def test_choosing_only_count_and_type_keeps_the_genre_default_taste():
+    from app.jobs import _apply_options
+    cfg = _apply_options(_cfg(taste="toml default"), {"count": 3, "content_type": "podcast"})
+    assert cfg["taste"] == "toml default" and not cfg.get("taste_from_user")
+
+
+def test_older_jobs_with_options_in_the_taste_text_still_work():
+    from app.jobs import _apply_options
+    cfg = _apply_options(_cfg(), {"taste": "Content type: food. 5 clips."})
+    assert cfg["count"] == 5 and cfg["category_override"] == "food" and not cfg.get("taste_from_user")
+
+
+def test_content_type_is_read_from_the_taste_text():
+    from app.jobs import _TYPE_RE
+    assert _TYPE_RE.search("Content type: food. 3 clips.").group(1) == "food"
+    assert _TYPE_RE.search("Prioritize beat_type: fail.") is None
+
+def test_clip_count_is_read_from_the_taste_text():
+    from app.jobs import _COUNT_RE
+    assert _COUNT_RE.search("Prioritize beat_type: fail. 3 clips. Format: General.").group(1) == "3"
+    assert _COUNT_RE.search("10 clips.").group(1) == "10"
+    assert _COUNT_RE.search("lots of clips please") is None
+
+
+def test_auto_render_follows_the_face_only_when_asked():
+    from app.jobs import _clip_to_range
+    track = [[1.0, 0.4, 0.5], [3.0, 0.6, 0.5]]
+    base = {"start_seconds": 1, "end_seconds": 20, "title": "t", "face": {"track": track}}
+    on = dict(base, auto={"vertical": True, "crop": {"mode": "crop", "follow": True}})
+    off = dict(base, auto={"vertical": True, "crop": {"mode": "crop", "follow": False}})
+    assert _clip_to_range(on)["crop"]["track"] == track
+    assert "track" not in _clip_to_range(off)["crop"]
+
+
+def _rate_limited(retry_after: str):
+    import groq
+    import httpx
+    resp = httpx.Response(429, headers={"retry-after": retry_after},
+                          request=httpx.Request("POST", "https://api.groq.com/x"))
+    return groq.RateLimitError("rate limited", response=resp, body=None)
+
+
+def _flaky_client(errors: list, reply="ok"):
+    """A Groq client whose create() raises each queued error once, then returns `reply`."""
+    calls = []
+
+    def create(**kw):
+        calls.append(kw["model"])
+        if errors:
+            raise errors.pop(0)
+        return reply
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))), calls
+
+
+def _no_sleep():
+    slept, real = [], cf.time.sleep
+    cf.time.sleep = slept.append
+    return slept, real
+
+
+def test_a_per_minute_rate_limit_is_waited_out():
+    client, calls = _flaky_client([_rate_limited("7")])
+    slept, real = _no_sleep()
+    try:
+        assert cf._groq_chat(client, "m", "p", 0.0) == "ok"
+    finally:
+        cf.time.sleep = real
+    assert slept == [7] and calls == ["m", "m"]
+
+
+def test_a_daily_limit_fails_fast_with_a_readable_message():
+    client, calls = _flaky_client([_rate_limited("1800")])
+    slept, real = _no_sleep()
+    try:
+        cf._groq_chat(client, "openai/gpt-oss-20b", "p", 0.0)
+        raise AssertionError("expected GroqQuotaError")
+    except cf.GroqQuotaError as e:
+        assert "daily limit" in str(e) and "30 min" in str(e)
+    finally:
+        cf.time.sleep = real
+    assert slept == [] and calls == ["openai/gpt-oss-20b"]       # no hour-long sleep
+
+
+def test_judge_quota_spent_falls_back_to_the_picker_model():
+    vs = [{"index": i, "keep": True, "hook": 3, "arc": 3, "quote": 2, "standalone": 2,
+           "trend": 2, "rank": i + 1} for i in range(6)]
+    reply, used = _scripted(vs)(), []
+
+    def chat(client, model, prompt, temp, effort="low"):
+        used.append(model)
+        if model == "openai/gpt-oss-120b":
+            raise cf.GroqQuotaError(model, 3600)
+        return reply
+    segs = [_seg(i * 30, i * 30 + 25, " ".join(["word"] * 40)) for i in range(6)]
+    clips = [_clip(i * 30, i * 30 + 20, score=5) for i in range(6)]
+    real, cf._groq_chat = cf._groq_chat, chat
+    try:
+        out = cf._verify_and_refine(clips, segs, _cfg(groq_verify_model="openai/gpt-oss-120b"))
+    finally:
+        cf._groq_chat = real
+    assert used == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"] and len(out) == 3
+    assert all(c._rank_pct is not None for c in out)              # verdicts were applied
+
+
+def test_groq_budget_is_kept_per_model():
+    from app import groq_gate
+    seen = []
+    fake = SimpleNamespace(incrby=lambda k, n: seen.append(k) or n, expire=lambda *a: None,
+                           decrby=lambda *a: None)
+    real, groq_gate._r = groq_gate._r, fake
+    try:
+        groq_gate.gate(100, "openai/gpt-oss-20b")
+        groq_gate.gate(100, "openai/gpt-oss-120b")
+    finally:
+        groq_gate._r = real
+    assert seen[0] != seen[1] and "gpt-oss-20b" in seen[0] and "gpt-oss-120b" in seen[1]
+
+
+if __name__ == "__main__":
+    tests = [(n, f) for n, f in sorted(globals().items())
+             if n.startswith("test_") and callable(f)]
+    failed = 0
+    for name, fn in tests:
+        try:
+            fn()
+            print(f"  PASS  {name}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  FAIL  {name}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(1 if failed else 0)

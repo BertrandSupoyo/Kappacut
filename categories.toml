@@ -1,0 +1,100 @@
+# Per-genre clip-picking profiles. The detected (or chosen) content type selects one.
+#
+#   moment         what a great clip is in this genre - goes into the picker + judge prompts
+#   prefer_beats   beat types to favour (reaction | fail | bit | story | quote | wholesome)
+#   min_seconds / max_seconds   clip length window (overrides clipfinder.toml)
+#   energy_weight  how much loudness counts: 1.0 = as configured, 0.3 = barely, 1.4 = a lot
+#   hot_threshold  loudness spike needed for the punchy auto edit (lower = more clips "hot")
+#   default_taste  steering used when the user picked no options
+#
+# [category.general] is the fallback for anything unlisted.
+
+[category.general]
+moment        = "a self-contained moment with a clear setup and a payoff or reaction"
+prefer_beats  = ["reaction", "bit", "quote"]
+min_seconds   = 15
+max_seconds   = 45
+energy_weight = 1.0
+hot_threshold = 0.45
+default_taste = "moments that work with zero context; skip intros, outros and housekeeping"
+
+[category.gaming]
+moment        = "a spike: a clutch play, a fail, rage or a chat-worthy reaction, with the play that caused it"
+prefer_beats  = ["reaction", "fail", "bit"]
+min_seconds   = 12
+max_seconds   = 40
+energy_weight = 1.4
+hot_threshold = 0.35
+default_taste = "chaotic reactions, screaming, clutch or fail moments, quotable lines; skip calm talking"
+
+[category.reaction]
+moment        = "the thing being reacted to and the reaction itself, in one beat"
+prefer_beats  = ["reaction", "quote"]
+min_seconds   = 12
+max_seconds   = 40
+energy_weight = 1.3
+hot_threshold = 0.35
+default_taste = "big genuine reactions with the cause visible; skip long silent watching"
+
+[category.food]
+moment        = "a taste test, a reveal or a challenge milestone: the build-up, the first bite or step, and the honest reaction"
+prefer_beats  = ["reaction", "fail", "story"]
+min_seconds   = 15
+max_seconds   = 45
+energy_weight = 1.0
+hot_threshold = 0.4
+default_taste = "first bites, spice or challenge reactions, verdicts and reveals; skip ordering, travel and sponsor reads"
+
+[category.comedy]
+moment        = "a joke or bit with its setup and the punchline landing"
+prefer_beats  = ["bit", "quote", "reaction"]
+min_seconds   = 12
+max_seconds   = 40
+energy_weight = 1.1
+hot_threshold = 0.35
+default_taste = "complete bits with the punchline and the laugh; skip crowd work that needs context"
+
+[category.podcast]
+moment        = "a complete thought: a question and its answer, a strong opinion, or a story with a turn"
+prefer_beats  = ["story", "quote"]
+min_seconds   = 20
+max_seconds   = 60
+energy_weight = 0.3
+hot_threshold = 0.55
+default_taste = "insightful or surprising takes, strong opinions, stories with a turn; skip intros, ads and small talk"
+
+[category.interview]
+moment        = "a revealing answer to a clear question, ideally with the question kept in"
+prefer_beats  = ["story", "quote"]
+min_seconds   = 20
+max_seconds   = 60
+energy_weight = 0.3
+hot_threshold = 0.55
+default_taste = "revealing or quotable answers with the question kept in; skip pleasantries"
+
+[category.tutorial]
+moment        = "one useful tip or a before/after result that stands alone"
+prefer_beats  = ["quote", "story"]
+min_seconds   = 20
+max_seconds   = 60
+energy_weight = 0.2
+hot_threshold = 0.6
+default_taste = "one clear tip or result per clip; skip setup, gear lists and sponsor reads"
+
+[category.vlog]
+moment        = "an unexpected moment, a strong reaction or a funny exchange in the day"
+prefer_beats  = ["reaction", "bit", "wholesome"]
+min_seconds   = 15
+max_seconds   = 45
+energy_weight = 0.9
+hot_threshold = 0.45
+default_taste = "surprises, funny exchanges and honest reactions; skip travel filler and housekeeping"
+
+[category.sports]
+moment        = "the play and the reaction to it"
+prefer_beats  = ["reaction", "fail"]
+min_seconds   = 10
+max_seconds   = 35
+energy_weight = 1.4
+hot_threshold = 0.35
+default_taste = "big plays, misses and the reaction; skip slow build-ups"
