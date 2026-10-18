@@ -29,6 +29,13 @@ class QuotaError(Exception):
         super().__init__(f"quota '{limit}' exceeded ({used}/{cap})")
 
 
+def is_unlimited(user: User) -> bool:
+    """Admins (superusers) have no usage caps: minutes, storage, projects and renders.
+    What protects the server itself - free scratch disk, the per-file size tusd also
+    enforces, one running job at a time - still applies to them."""
+    return bool(getattr(user, "is_superuser", False))
+
+
 def minutes_cap(user: User) -> int:
     return int(user.quota_minutes_override or settings.quota_minutes_per_month)
 
@@ -113,6 +120,13 @@ async def project_count(session: AsyncSession, user_id) -> int:
 async def check_quota(
     session: AsyncSession, user: User, action: str, *, extra_bytes: int = 0, count: int = 1
 ) -> None:
+    if is_unlimited(user):
+        if action == "upload":
+            assert_disk_ok()
+            if extra_bytes > settings.quota_max_upload_bytes:
+                raise QuotaError("file_size", extra_bytes, settings.quota_max_upload_bytes)
+        return
+
     if action == "project":
         n = await project_count(session, user.id)
         if n >= settings.quota_projects:

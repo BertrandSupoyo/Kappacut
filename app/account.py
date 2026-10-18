@@ -9,6 +9,7 @@ from app.config import settings
 from app.db import get_session
 from app.models.user import User
 from app.quota import (
+    is_unlimited,
     minutes_cap,
     monthly_minutes,
     project_count,
@@ -26,7 +27,8 @@ async def my_usage(
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     return {
-        "plan": "free",
+        "plan": "admin" if is_unlimited(user) else "free",
+        "unlimited": is_unlimited(user),         # caps below are not enforced for this account
         "minutes": {"used": await monthly_minutes(session, user.id), "cap": minutes_cap(user)},
         "storage_mb": {
             "used": round(await storage_bytes(session, user.id) / 1024**2, 1),

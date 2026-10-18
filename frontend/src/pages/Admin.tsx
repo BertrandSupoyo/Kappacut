@@ -11,6 +11,7 @@ interface AdminUser {
   email: string;
   is_verified: boolean;
   is_superuser: boolean;
+  unlimited?: boolean;
   created_at: string;
   projects: number;
   minutes_used: number;
@@ -199,8 +200,8 @@ function UserRow({ u }: { u: AdminUser }) {
         {!u.is_verified && <span className="muted" style={{ marginLeft: 6, fontSize: "var(--fs-2xs)" }}>unverified</span>}
       </td>
       <td>{u.projects}</td>
-      <td>{u.minutes_used} / {u.minutes_cap}</td>
-      <td>{u.storage_mb} / {u.storage_cap_mb} MB</td>
+      <td>{u.minutes_used}{u.unlimited ? <span className="muted"> · no limit</span> : ` / ${u.minutes_cap}`}</td>
+      <td>{u.storage_mb}{u.unlimited ? <span className="muted"> MB · no limit</span> : ` / ${u.storage_cap_mb} MB`}</td>
       <td>
         <input
           className="admin-input"

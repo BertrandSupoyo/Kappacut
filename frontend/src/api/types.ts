@@ -88,6 +88,7 @@ export interface ProjectDetail {
 
 export interface Usage {
   plan: string;
+  unlimited?: boolean;          // admin: the caps below are not enforced
   minutes: { used: number; cap: number };
   storage_mb: { used: number; cap: number };
   renders_today: { used: number; cap: number };

@@ -14,7 +14,7 @@ from app.db import get_session
 from app.models.job import Job
 from app.models.project import Project
 from app.models.user import User
-from app.quota import minutes_cap, monthly_minutes, project_count, storage_bytes, storage_cap_bytes
+from app.quota import is_unlimited, minutes_cap, monthly_minutes, project_count, storage_bytes, storage_cap_bytes
 from app.queue import abort_job
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(current_superuser)])
@@ -30,6 +30,7 @@ async def list_users(session: AsyncSession = Depends(get_session)) -> dict:
             "email": u.email,
             "is_verified": u.is_verified,
             "is_superuser": u.is_superuser,
+            "unlimited": is_unlimited(u),
             "created_at": u.created_at.isoformat(),
             "projects": await project_count(session, u.id),
             "minutes_used": await monthly_minutes(session, u.id),
