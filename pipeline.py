@@ -97,6 +97,7 @@ def analyze(video_path: Path, cfg: dict, on_progress: ProgressCB = lambda p, m: 
         for i, c in enumerate(clips):
             rec = c.model_dump()
             rec["duration"] = round(c.end_seconds - c.start_seconds, 1)
+            rec["source"] = c._source                    # "picker" or "reaction" (the reaction finder)
             if not rec.get("title"):                     # the model sometimes skips it
                 said = next((s["text"] for s in segments
                              if s["end"] > c.start_seconds and s["start"] < c.end_seconds), "")

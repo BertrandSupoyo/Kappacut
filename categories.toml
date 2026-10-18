@@ -6,6 +6,7 @@
 #   energy_weight  how much loudness counts: 1.0 = as configured, 0.3 = barely, 1.4 = a lot
 #   hot_threshold  loudness spike needed for the punchy auto edit (lower = more clips "hot")
 #   default_taste  steering used when the user picked no options
+#   reactions      propose reaction beats (gasps, "Oh!", eating) as candidates; default true
 #
 # [category.general] is the fallback for anything unlisted.
 
@@ -62,6 +63,7 @@ max_seconds   = 60
 energy_weight = 0.3
 hot_threshold = 0.55
 default_taste = "insightful or surprising takes, strong opinions, stories with a turn; skip intros, ads and small talk"
+reactions     = false
 
 [category.interview]
 moment        = "a revealing answer to a clear question, ideally with the question kept in"
@@ -71,6 +73,7 @@ max_seconds   = 60
 energy_weight = 0.3
 hot_threshold = 0.55
 default_taste = "revealing or quotable answers with the question kept in; skip pleasantries"
+reactions     = false
 
 [category.tutorial]
 moment        = "one useful tip or a before/after result that stands alone"
@@ -80,6 +83,7 @@ max_seconds   = 60
 energy_weight = 0.2
 hot_threshold = 0.6
 default_taste = "one clear tip or result per clip; skip setup, gear lists and sponsor reads"
+reactions     = false
 
 [category.vlog]
 moment        = "an unexpected moment, a strong reaction or a funny exchange in the day"

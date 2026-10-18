@@ -459,6 +459,113 @@ def test_auto_render_follows_the_face_only_when_asked():
     assert "track" not in _clip_to_range(off)["crop"]
 
 
+# --------------------------------------------------------------- brain fixes A-E
+
+def test_payoff_line_just_after_the_end_is_pulled_in():
+    # seen on the Spicy Challenge clip #3: it ended at 162.7, the second its payoff began
+    segs = [_seg(141, 150, "tastes like straight tabasco sauce"), _seg(150, 162.7, "you came to see this"),
+            _seg(162.7, 177.3, "just like that we have brought the death tsukimen back from the dead")]
+    c = _clip(141, 162.7, payoff_line="Just like that we have brought the death Tsukimen back from the dead")
+    cf._reach_payoff(c, segs, _cfg(), 400)
+    assert c.end_seconds >= 177.3 and c.end_seconds - c.start_seconds <= 45
+
+
+def test_payoff_is_not_pulled_in_when_the_clip_would_get_too_long():
+    segs = [_seg(100, 140, "a long setup that keeps going on and on"),
+            _seg(141, 160, "and here is the payoff line at last")]
+    c = _clip(100, 140, payoff_line="and here is the payoff line at last")
+    cf._reach_payoff(c, segs, _cfg(max_seconds=45.0), 400)
+    assert c.end_seconds == 140                        # 60 s would break max_seconds
+
+
+def test_calls_to_action_are_trimmed_off_the_edges():
+    segs = [_seg(53.5, 54.5, "Don't go anywhere."), _seg(54.5, 55.3, "Don't click away."),
+            _seg(55.3, 58, "Actually, click the subscribe button."),
+            _seg(58, 75, "so we got the ten times fire level tsukimen and it looks unreal"),
+            _seg(75, 90, "the gyoza were cooked perfectly but they had one major flaw"),
+            _seg(90, 94, "thanks for watching guys")]
+    c = _clip(53, 94)
+    cf._trim_cta(c, segs, _cfg())
+    assert 57 < c.start_seconds <= 58 and 90 <= c.end_seconds < 92
+
+
+def test_a_clip_the_judge_rated_empty_falls_below_the_floor():
+    # clip #2: loud, clear talking (energy/clarity/pacing near 1) that the judge rated arc 0
+    segs = [_seg(0, 30, " ".join(["word"] * 80))]
+    loud = [-12.0] * 30 + [-20.0] * 60
+    empty = _clip(0, 30, score=5.8, arc={"hook": 1, "arc": 0, "quote": 0, "standalone": 1, "trend": 0})
+    good = _clip(0, 30, score=8.0, arc={"hook": 2, "arc": 2, "quote": 1, "standalone": 2, "trend": 2})
+    e = cf.score_breakdown(empty, segs, loud)["total"]
+    g = cf.score_breakdown(good, segs, loud)["total"]
+    assert e < 40 <= g, (e, g)
+
+
+def test_the_gate_leaves_well_rated_clips_alone():
+    segs = [_seg(0, 30, " ".join(["word"] * 80))]
+    c = _clip(0, 30, score=8.0, arc={"hook": 2, "arc": 2, "quote": 1, "standalone": 2, "trend": 2})
+    parts = cf.score_breakdown(c, segs, None)
+    plain = sum(cf.SCORE_WEIGHTS[k] * parts[k] for k in cf.SCORE_WEIGHTS) / sum(cf.SCORE_WEIGHTS.values()) * 100
+    assert abs(parts["total"] - plain) <= 1
+
+
+def _challenge_video():
+    """Talky first half, then an eating challenge: short reactions between long pauses
+    (modelled on the Spicy Challenge transcript, 5:55-7:52)."""
+    talk = [_seg(t, t + 9, "and then we headed over to the ramen shop to talk about the menu and the history")
+            for t in range(0, 340, 10)]
+    react = [_seg(355, 356.7, "The first dunk in there."), _seg(361.6, 365.1, "All right three two one Ohhhh"),
+             _seg(371.3, 372.5, "How bad is it?"), _seg(387.1, 390.1, "I can't eat it fast because it's all cold."),
+             _seg(405.1, 406.1, "The one in."), _seg(406.1, 407.1, "Get it down."), _seg(407.1, 409.1, "Oh"),
+             _seg(409.1, 409.9, "Oh!"), _seg(416.3, 417.2, "Dang."), _seg(418.3, 419.1, "The sweat."),
+             _seg(433.8, 435.3, "How much time is it?"), _seg(459.2, 460.2, "Alright, I'm done."),
+             _seg(462.2, 463.7, "I think it's nine flat.")]
+    return talk + react
+
+
+def test_the_reaction_finder_proposes_the_challenge():
+    segs = _challenge_video()
+    found = cf._reaction_candidates(segs, None, _cfg(count=5))
+    assert found and all(c._source == "reaction" for c in found)
+    assert any(c.start_seconds < 420 and c.end_seconds > 405 for c in found)   # "Oh! … Dang. The sweat."
+    assert all(c.start_seconds >= 340 for c in found)                        # not the talking
+
+
+def test_a_reaction_beat_survives_the_cleanup_rules():
+    # the old rules split it at the 6+ s pauses and set it aside as word-sparse
+    segs = _challenge_video()
+    picker = [_clip(t, t + 25, score=7.0) for t in (0, 100, 200, 300)]
+    out = cf._finalize(picker, segs, 5, _cfg(count=5, min_clips=5))
+    assert any(c._source == "reaction" and c.start_seconds >= 350 for c in out), \
+        [(c.start_seconds, c.end_seconds, c._source) for c in out]
+
+
+def test_a_reaction_beat_is_not_dropped_for_overlapping_a_weaker_pick():
+    # the real failure: two picker clips overlapping the challenge pushed the reaction out
+    segs = _challenge_video()
+    picker = [_clip(386.7, 407.4, score=6.6), _clip(434.9, 449.9, score=7.6)]
+    out = cf._finalize(picker, segs, 5, _cfg(count=5, min_clips=2))
+    assert any(c._source == "reaction" and c.start_seconds < 420 < c.end_seconds for c in out), \
+        [(c.start_seconds, c.end_seconds, c._source) for c in out]
+
+
+def test_a_stretched_exclamation_counts_however_long_the_line():
+    segs = [_seg(355, 356.7, "The first dunk in there."), _seg(361.6, 365.1, "All right three two one Ohhhh Alright 3 2 1")]
+    assert cf._react_weight(segs, 1) == 1.0
+
+
+def test_an_echoed_placeholder_is_not_a_payoff_line():
+    vs = [{"index": i, "keep": True, "hook": 2, "arc": 2, "quote": 1, "standalone": 2, "trend": 1, "rank": i + 1,
+           "hook_line": "<first line, verbatim>", "payoff_line": "<payoff line, verbatim>"} for i in range(6)]
+    out = _verify(vs, count=3)
+    assert out and all(c.hook_line == "" and c.payoff_line == "" for c in out)
+
+
+def test_no_reaction_candidates_for_podcasts():
+    cfg = _cfg(count=5, category="podcast")
+    cf.apply_profile(cfg)
+    assert cf._reaction_candidates(_challenge_video(), None, cfg) == []
+
+
 def _rate_limited(retry_after: str):
     import groq
     import httpx
