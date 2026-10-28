@@ -15,7 +15,7 @@ from app.db import get_session
 from app.email import send_reset_email, send_verify_email
 from app.models.user import User
 
-log = logging.getLogger("clipfinder.auth")
+log = logging.getLogger("kappacut.auth")
 
 
 async def get_user_db(session: AsyncSession = Depends(get_session)) -> AsyncIterator[SQLAlchemyUserDatabase]:

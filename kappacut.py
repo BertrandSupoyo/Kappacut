@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-clipfinder.py - find the best short-form clips in long videos. No training, no local ML.
+kappacut.py - find the best short-form clips in long videos. No training, no local ML.
 
 Pipeline per video:
     ffmpeg  ->  compressed mono audio
@@ -9,19 +9,19 @@ Pipeline per video:
     snap    ->  clip edges pulled to sentence / pause boundaries (no mid-word cuts)
     ffmpeg  ->  cut each clip  (+ optional 9:16 vertical render)
 
-Config: edit clipfinder.toml next to this script. CLI flags override it.
+Config: edit kappacut.toml next to this script. CLI flags override it.
 
 Usage
 -----
-    python clipfinder.py "C:/path/to/video.mp4"
-    python clipfinder.py "C:/Users/leosa/Downloads/Video/streamer"          # whole folder
-    python clipfinder.py video.mp4 --n 8 --taste "chaotic reactions; skip slow talking"
-    python clipfinder.py video.mp4 --picker claude          # better picks, ~$0.05/video
-    python clipfinder.py video.mp4 --vertical               # also render 1080x1920 crop
-    python clipfinder.py video.mp4 --lead 0.5 --tail 1.0    # more breathing room per clip
-    python clipfinder.py video.mp4 --dry-run                # transcript + picks, no cutting
+    python kappacut.py "C:/path/to/video.mp4"
+    python kappacut.py "C:/Users/leosa/Downloads/Video/streamer"          # whole folder
+    python kappacut.py video.mp4 --n 8 --taste "chaotic reactions; skip slow talking"
+    python kappacut.py video.mp4 --picker claude          # better picks, ~$0.05/video
+    python kappacut.py video.mp4 --vertical               # also render a 9:16 crop
+    python kappacut.py video.mp4 --lead 0.5 --tail 1.0    # more breathing room per clip
+    python kappacut.py video.mp4 --dry-run                # transcript + picks, no cutting
 
-Keys - clipfinder .env (or real env vars):
+Keys - Kappacut .env (or real env vars):
     GROQ_API_KEY=gsk_...          # console.groq.com   (free - always needed)
     ANTHROPIC_API_KEY=sk-ant-...  # console.anthropic.com  (only for --picker claude / --vision)
 """
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import functools
 import json
 import os
@@ -37,7 +38,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unicodedata
 from pathlib import Path
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError, field_validator
@@ -49,10 +52,14 @@ HERE = Path(__file__).resolve().parent
 DEFAULTS: dict = {
     # picker
     "backend": "groq",                       # "groq" (free) | "claude"
-    "groq_model": "openai/gpt-oss-20b",       # 20b: fast, light on the free tier. 120b: better picks, slower
+    # The Groq setup below is the tested default (README "The clip-picking model", 2026-10-25):
+    # picking alternates 20b/120b, one 120b judge at low effort re-ranks everything.
+    "groq_model": "openai/gpt-oss-20b",       # genre detection, and the picker when groq_pick_models is []
     "claude_model": "claude-opus-5",          # picks the moments (stage 1) — or claude-sonnet-5 / claude-haiku-4-5
     "verify_model": "",                        # stage-2 flow check; "" = same as claude_model
-    "groq_verify_model": "",                   # stage-2 judge on the Groq backend; "" = same as groq_model
+    "groq_verify_model": "openai/gpt-oss-120b",  # stage-2 judge on the Groq backend; "" = same as groq_model
+    "groq_pick_models": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],  # stage-1 windows rotate (own TPM + daily cap each)
+    "groq_verify_effort": "low",               # gpt-oss reasoning for the stage-2 judge; medium tested: ~3x cost, less reliable
     "quality_floor": 40,                       # 0-100: clips below it are dropped rather than padded in
     "vision_model": "",                        # one-frame vision pass; "" = same as claude_model
     "claude_budget": 0.0,                      # USD cap on Claude spend per video; 0 = no cap. Over cap -> fall back to Groq
@@ -85,6 +92,11 @@ GROQ_MAX_BYTES = 24 * 1024 * 1024            # free tier caps audio upload at 25
 AUDIO_CHUNK_SEC = 1200                        # 20-min audio chunks when a file is too big
 PICKER_WINDOW_SEC = 240                       # transcript window per Groq call (free tier: 8k TPM)
 GROQ_PICK_MAX_TOKENS = 5000
+# What the rate-limit gate books for a reply. Not GROQ_PICK_MAX_TOKENS: measured low-effort
+# replies use 190-540 tokens, and booking 5000 meant two calls never fit one minute's 8k
+# (one call a minute; a 20-min video sat ~7 min on "Ranking the moments"). The gate settles
+# to the real usage afterwards, and a rare long reply that trips Groq's 429 just waits it out.
+GROQ_RESERVE_REPLY_TOKENS = 1500
 
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "ffprobe"
@@ -208,8 +220,76 @@ def _filter_thread_args(complex_graph: bool = False) -> list[str]:
     return [flag, str(FFMPEG_THREADS)]
 
 
+# ---- stoppable ffmpeg -----------------------------------------------------------
+# The web app runs the pipeline in a worker thread. When arq times a job out (or aborts it)
+# only the coroutine is cancelled: the thread runs on, and so did every ffmpeg it started,
+# however long they took. Processes started inside proc_scope(name) are registered under
+# that name; cancel_scope(name) kills them and refuses to start any more.
+_PROCS: dict[str, set[subprocess.Popen]] = {}
+_ACTIVE_SCOPES: set[str] = set()
+_CANCELLED: set[str] = set()
+_PROCS_LOCK = threading.Lock()
+
+
+class Cancelled(RuntimeError):
+    """The job this work belonged to was stopped (cancel_scope)."""
+
+
+@contextlib.contextmanager
+def proc_scope(name: str):
+    """Register this thread's ffmpeg processes under `name` until the block ends."""
+    with _PROCS_LOCK:
+        _ACTIVE_SCOPES.add(name)
+    _THREAD.scope = name
+    try:
+        yield
+    finally:
+        _THREAD.scope = None
+        with _PROCS_LOCK:
+            _ACTIVE_SCOPES.discard(name)
+            _CANCELLED.discard(name)
+            _PROCS.pop(name, None)
+
+
+def cancel_scope(name: str) -> None:
+    """Kill the processes running under `name` and stop it from starting new ones."""
+    with _PROCS_LOCK:
+        if name not in _ACTIVE_SCOPES:
+            return
+        _CANCELLED.add(name)
+        procs = list(_PROCS.get(name, ()))
+    for p in procs:
+        with contextlib.suppress(Exception):
+            p.kill()
+
+
+def _check_cancelled() -> None:
+    if getattr(_THREAD, "scope", None) in _CANCELLED:
+        raise Cancelled("stopped")
+
+
+def _exec(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True), but stoppable by cancel_scope."""
+    scope = getattr(_THREAD, "scope", None)
+    with _PROCS_LOCK:
+        if scope in _CANCELLED:
+            raise Cancelled("stopped")
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, errors="replace", cwd=cwd)
+        if scope:
+            _PROCS.setdefault(scope, set()).add(p)
+    try:
+        out, err = p.communicate()
+    finally:
+        if scope:
+            with _PROCS_LOCK:
+                _PROCS.get(scope, set()).discard(p)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
-    p = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    p = _exec(cmd, cwd)
+    _check_cancelled()                    # killed mid-run: say so, not "command failed"
     if p.returncode:
         raise RuntimeError(f"command failed: {' '.join(str(c) for c in cmd[:4])} ...\n{p.stderr[-1000:]}")
     return p
@@ -219,6 +299,24 @@ def probe_duration(path: Path) -> float:
     p = run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nk=1:nw=1", str(path)])
     return float(p.stdout.strip() or 0.0)
+
+
+def probe_height(path: Path) -> int:
+    """Height of the first video stream (0 if unknown)."""
+    p = run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=height", "-of", "default=nk=1:nw=1", str(path)])
+    try:
+        return int(p.stdout.split()[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def vertical_size(src_height: int) -> tuple[int, int]:
+    """Vertical output frame for a source: full 1080x1920 only when the source has the
+    detail for it. A 720p source's 9:16 crop is ~405x720 pixels, so 1080x1920 just upscales
+    them - same picture as 720x1280, ~1.5-2x the encode time and ~2x the file size.
+    Unknown height keeps 1080x1920."""
+    return (720, 1280) if 0 < src_height < 1000 else (1080, 1920)
 
 
 def extract_audio(video: Path, workdir: Path) -> Path:
@@ -357,16 +455,22 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
     col_vf = f",{col}" if col else ""                 # colour grade goes before subtitles, never on the text
 
     fc = None                                     # -filter_complex string (fill mode only)
+    ow, oh = vertical_size(probe_height(video)) if vertical else (0, 0)
     if not vertical:
         vf = r"scale=-2:min(1080\,ih)" + col_vf + sub_chain   # only downscale, never upscale
     elif mode in ("fill", "cropfill"):            # blurred copy fills the bars; foreground = whole frame or a crop
         blur = max(2.0, min(80.0, float(crop.get("blur", 24))))
         sub_fc = f";[v]subtitles={subs.name}[vout]" if subs is not None else ""
         map_v = "[vout]" if subs is not None else "[v]"
-        bg = (f"[b]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+        # The fill is blurred at 1/4 size (sigma/4) and scaled back up: it looks the same
+        # once blurred, and full-res gblur was ~60% of a fill clip's render time. `blur` is
+        # in 1080-wide pixels (what the editor previews), so it shrinks with the frame.
+        sigma = blur * ow / 1080 / 4
+        bg = (f"[b]scale={ow // 4}:{oh // 4}:force_original_aspect_ratio=increase,"
+              f"crop={ow // 4}:{oh // 4},"
               # x0.94 like the preview's brightness(.94); eq's brightness would *subtract*
-              f"gblur=sigma={blur:.1f},colorchannelmixer=rr=0.94:gg=0.94:bb=0.94,"
-              f"eq=saturation=1.12[bg]")
+              f"gblur=sigma={sigma:.2f},colorchannelmixer=rr=0.94:gg=0.94:bb=0.94,"
+              f"eq=saturation=1.12,scale={ow}:{oh}:flags=bilinear[bg]")
         col_fg = f",{col}" if col else ""             # grade the framed subject, leave the blurred bars alone
         if mode == "cropfill":                    # subject you framed, blurred fill behind it
             z = max(1.0, min(4.0, float(crop.get("zoom", 1.0))))
@@ -377,9 +481,9 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
             bw = f"ih*{ar:.5f}/{z:.4f}"
             cx, cy = _follow_xy(crop, start, px, py)
             fg = (f"[a]crop=w={bw}:h={bh}:x={cx}:y={cy},"
-                  f"scale=1080:-2:flags=lanczos{col_fg}[fg]")
+                  f"scale={ow}:-2:flags=lanczos{col_fg}[fg]")
         else:
-            fg = f"[a]scale=1080:-2:flags=lanczos{col_fg}[fg]"
+            fg = f"[a]scale={ow}:-2:flags=lanczos{col_fg}[fg]"
         fc = f"[0:v]split=2[a][b];{bg};{fg};[bg][fg]overlay=(W-w)/2:(H-h)/2[v]" + sub_fc
         vf = None
     else:                                         # crop / manual reframe (px/py travel, zoom punch-in)
@@ -390,7 +494,7 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
         bh = f"ih/{z:.4f}"
         cx, cy = _follow_xy(crop, start, px, py)
         vf = (f"crop=w={bw}:h={bh}:x={cx}:y={cy},"
-              "scale=1080:1920:flags=lanczos" + col_vf + sub_chain)
+              f"scale={ow}:{oh}:flags=lanczos" + col_vf + sub_chain)
 
     cmd = [FFMPEG, "-y", *_thread_args(), *_filter_thread_args(fc is not None),
            "-ss", f"{start:.2f}", "-i", str(video), "-t", f"{end - start:.2f}"]
@@ -495,19 +599,28 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
     dropped: dict[str, int] = {}
     chunks = split_audio(mp3, workdir)
     for n, (part, offset) in enumerate(chunks, 1):
+        _check_cancelled()
         if len(chunks) > 1:
             print(f"    transcribing chunk {n}/{len(chunks)} ...", flush=True)
         kwargs = dict(file=(part.name, part.read_bytes()), model=GROQ_WHISPER,
                       response_format="verbose_json", language="en")
         if want_words:
             kwargs["timestamp_granularities"] = ["segment", "word"]
-        for attempt in range(4):
+        limited = hiccups = 0
+        while True:
             try:
                 data = client.audio.transcriptions.create(**kwargs)
                 break
-            except (groq.RateLimitError, groq.APIStatusError) as e:
-                if getattr(e, "status_code", None) not in (429, 413) or attempt == 3:
+            except (groq.APIConnectionError, groq.APIStatusError) as e:
+                if _transient(e) and hiccups < len(TRANSIENT_WAITS):
+                    wait = TRANSIENT_WAITS[hiccups]
+                    hiccups += 1
+                    print(f"    whisper connection problem ({type(e).__name__}) - retrying in {wait}s ...", flush=True)
+                    time.sleep(wait)
+                    continue
+                if getattr(e, "status_code", None) not in (429, 413) or limited == 3:
                     raise
+                limited += 1
                 wait = _retry_wait(e, GROQ_WHISPER)
                 print(f"    whisper rate limited - waiting {wait}s ...", flush=True)
                 time.sleep(wait)
@@ -571,14 +684,17 @@ class Clip(BaseModel):
     quote: str = ""
     score: float = 5.0
 
-    beat_type: str = "moment"           # reaction|bit|story|quote|fail|wholesome|moment
+    beat_type: str = "moment"           # reaction|bit|story|quote|fail|hot_take|argument|reveal|wholesome|moment
+    hook_type: str = ""                 # what the opening line does: claim|question|conflict|reveal|reaction|confession|story|none
     hook_line: str = ""                 # verbatim first line of the beat (boundary snap)
     payoff_line: str = ""               # verbatim payoff / last line of the beat
-    arc: dict = Field(default_factory=dict)   # {"hook":0-3,"arc":0-3,"quote":0-2,"standalone":0-2,"trend":0-2}
+    # {"hook":0-3,"arc":0-3,"quote":0-2,"standalone":0-2,"trend":0-2,"arousal":0-2}
+    arc: dict = Field(default_factory=dict)
 
     _energy: dict = PrivateAttr(default_factory=dict)   # measured loudness stats for this clip
     _rank_pct: float | None = PrivateAttr(default=None)  # verify's forced rank: 1.0 best … 0.0 worst
     _auto: dict = PrivateAttr(default_factory=dict)     # suggested edit (reframe / caption / colour / sfx)
+    _source: str = PrivateAttr(default="picker")        # "picker" (the LLM) or "reaction" (_reaction_candidates)
 
     @field_validator("score", mode="before")
     @classmethod
@@ -591,8 +707,8 @@ class Clip(BaseModel):
             v /= 10.0
         return max(1.0, min(10.0, v))
 
-    @field_validator("title", "hook", "why", "quote", "beat_type", "hook_line", "payoff_line",
-                     mode="before")
+    @field_validator("title", "hook", "why", "quote", "beat_type", "hook_type", "hook_line",
+                     "payoff_line", mode="before")
     @classmethod
     def _stringify(cls, v):
         return "" if v is None else str(v)
@@ -606,9 +722,16 @@ PICKER_BRIEF = (
     "You are a senior short-form video editor. From a long streamer compilation you pull "
     "the individual moments that work best as standalone YouTube Shorts / TikToks / Reels.\n"
     "A great clip: hook in the first 2 seconds, clear setup and payoff, a strong reaction "
-    "or a quotable line, zero outside context needed. 15-45s is the sweet spot; never "
-    "below 10s or above 75s. Clips must not overlap. Favour moments a viewer rewatches or "
+    "or a quotable line, zero outside context needed. Keep to the length window given with "
+    "the transcript; never below 10s or above 75s. Clips must not overlap. Favour moments a viewer rewatches or "
     "sends to a friend over merely 'interesting' ones.\n"
+    "Viewers decide in the first 1-3 seconds whether to swipe away, so the OPENING LINE is "
+    "the hook. Strong hooks: a bold or contrarian claim, a direct question, a conflict or "
+    "argument already under way, a surprising number or reveal, an emotional confession, "
+    "a reaction or action already happening. Weak openings: greetings, filler (okay so, um, "
+    "anyway, alright), slow scene-setting.\n"
+    "Prefer high-arousal moments - amusement, awe, outrage, shock, tension - over calm or "
+    "sad ones: they are what people share.\n"
     "The best clips are almost always where the ENERGY SPIKES - a sudden loud reaction, a "
     "shout, an outburst, a group losing it - with a quotable line right before or after the "
     "spike. Skip calm, level-toned explaining even when the words are fine.\n"
@@ -616,7 +739,10 @@ PICKER_BRIEF = (
     "- Every clip MUST contain a real spoken line you can put in the `quote` field. Never "
     "pick a stretch where the transcript is empty or near-empty (screaming, silence, music) "
     "- you cannot see the video, only the words.\n"
-    "- start_seconds must sit on the setup line, not on the punchline - include the build-up.\n"
+    "- start_seconds sits on the first line that GRABS (claim, question, conflict, the action "
+    "starting) - not on the punchline, and not on slow build-up before the grab. Keep an "
+    "earlier setup line only when the clip makes no sense without it, and then only the "
+    "shortest one (a few seconds).\n"
     "- One moment per clip. If the speaker jumps to a different topic or a different bit, "
     "END the clip before the jump - do not staple two moments together.\n"
     "- Ignore obviously garbled or repeated-nonsense lines in the transcript; build the clip "
@@ -633,12 +759,11 @@ def loudness_track(audio: Path) -> list[float]:
     """One RMS-level value (dB) per second of audio via ffmpeg astats. Louder = higher
     (roughly -20 = loud speech/hype, -40 = quiet). [] on any failure — degrade gracefully."""
     try:
-        p = subprocess.run(
+        p = _exec(
             [FFMPEG, "-hide_banner", "-v", "info", *_thread_args(), "-i", str(audio),
              "-af", "aresample=8000,asetnsamples=8000:p=0,astats=metadata=1:reset=1,"
                     "ametadata=print:key=lavfi.astats.Overall.RMS_level",
              "-f", "null", "-"],
-            capture_output=True, text=True,
         )
     except Exception:
         return []
@@ -845,6 +970,181 @@ def _nonoverlap(clips: list[Clip], k: int) -> list[Clip]:
     return kept
 
 
+def _match_line(line: str, segments: list[dict], lo: float, hi: float) -> dict | None:
+    """The first segment starting in [lo, hi] whose text is (or contains) `line`."""
+    want = _norm_line(line)
+    if len(want) <= 8:
+        return None
+    for s in segments:
+        if lo <= s["start"] <= hi:
+            st = _norm_line(s["text"])
+            if st and (want in st or st in want):
+                return s
+    return None
+
+
+PAYOFF_REACH = 20.0          # how far past the end a named payoff line may start and still be pulled in
+
+
+def _reach_payoff(c: Clip, segments: list[dict], cfg: dict, dur: float) -> None:
+    """The judge names the payoff line; if that line starts at or just after the clip's end,
+    the clip stops right before the moment it exists for (seen on 4 of 5 clips). Extend the
+    end through that line when the whole thing still fits in max_seconds."""
+    if not c.payoff_line:
+        return
+    s = _match_line(c.payoff_line, segments, c.end_seconds - 1.0, c.end_seconds + PAYOFF_REACH)
+    if not s or s["end"] <= c.end_seconds:
+        return
+    end = min(s["end"] + cfg["tail_seconds"], dur or s["end"] + cfg["tail_seconds"])
+    if end - c.start_seconds <= cfg["max_seconds"]:
+        c.end_seconds = end
+
+
+# calls to action: they open or close a lot of picks ("don't click away… subscribe") and are
+# never what a viewer shares
+_CTA_RE = re.compile(
+    # subscribe/-d/-ing/-rs, not "subscription": "they charged my subscription twice" is a story
+    r"\b(subscrib(e|ed|es|ing|ers?)|click (away|below|the link|the button|that button)|don'?t go anywhere|"
+    r"hit (the|that) (like|bell)|smash (the|that) like|like and subscribe|notification bell|"
+    r"links? (is |are )?in (the |my )?(description|bio)|thanks? (you )?(so much )?for watching|"
+    r"see (you|ya) (guys )?(in the |on the )?next|sponsor(ed|ing)? by|use (my )?code|patreon|"
+    r"follow me (on|at))\b", re.IGNORECASE)
+
+
+def _is_cta(text: str) -> bool:
+    return bool(_CTA_RE.search(text or ""))
+
+
+def _trim_cta(c: Clip, segments: list[dict], cfg: dict) -> None:
+    """Drop call-to-action lines from the clip's edges, and mark down a clip whose middle is
+    mostly one (a sponsor read). Middle lines stay - cutting there would make a jump cut."""
+    hits = sorted((s for s in segments if s["start"] < c.end_seconds and s["end"] > c.start_seconds),
+                  key=lambda s: s["start"])
+    if not hits:
+        return
+    i, j = 0, len(hits)
+    while i < j and _is_cta(hits[i]["text"]):
+        i += 1
+    while j > i and _is_cta(hits[j - 1]["text"]):
+        j -= 1
+    if i == j:                                     # nothing but CTA: leave it for the filters
+        c.score = max(1.0, c.score - 3.0)
+        return
+    if i:
+        c.start_seconds = max(c.start_seconds, hits[i]["start"] - cfg["lead_seconds"])
+    if j < len(hits):
+        c.end_seconds = min(c.end_seconds, hits[j - 1]["end"] + cfg["tail_seconds"])
+    words = [(len(s["text"].split()), _is_cta(s["text"])) for s in hits[i:j]]
+    total = sum(n for n, _ in words) or 1
+    if sum(n for n, cta in words if cta) / total > 0.3:
+        c.score = max(1.0, c.score - 2.0)
+
+
+# Words that carry nothing on their own. A first line made only of these ("Okay so.", "Um,
+# alright.", "Anyway.") spends the 1-3 s in which viewers decide whether to swipe away.
+_FILLER_WORDS = frozenset(
+    "so um uh umm uhh erm hmm mm okay ok alright all right anyway anyways yeah yea yep well "
+    "and but like basically guys hey hi hello now then just".split())   # not "oh": that's a reaction
+WEAK_OPEN_MAX_LINES = 2
+
+
+def _is_filler(text: str) -> bool:
+    words = _norm_line(text).split()
+    return 0 < len(words) <= 6 and all(w in _FILLER_WORDS for w in words)
+
+
+def _trim_weak_open(c: Clip, segments: list[dict], cfg: dict) -> None:
+    """Start on the first line that says something: drop up to two leading filler-only lines.
+    Only lines that start inside the clip, and never the last spoken line."""
+    hits = sorted((s for s in segments
+                   if s["start"] >= c.start_seconds - 0.5 and s["start"] < c.end_seconds),
+                  key=lambda s: s["start"])
+    i = 0
+    while i < min(WEAK_OPEN_MAX_LINES, len(hits) - 1) and _is_filler(hits[i]["text"]):
+        i += 1
+    if i:
+        c.start_seconds = max(c.start_seconds, hits[i]["start"] - cfg["lead_seconds"])
+
+
+# ---- reaction finder: moments carried by reactions, not by talking ----------------------
+# Eating, gaming and sports clips peak where people stop talking: "3, 2, 1… Ohhhh", "Oh!",
+# "Dang.", "The sweat." The picker reads words, and the clean-up rules split on silences and
+# drop word-sparse clips, so these never survived. This proposes them directly; the judge
+# still decides whether they're good.
+
+_REACT_RE = re.compile(
+    r"\b(o+h+|oo+f|ow+|ouch|wo+w|whoa+|dang|damn|god|omg|holy|no+pe?|wait|yo+|bro|dude|"
+    r"je+z|ge+z|yikes|u+gh|a+h+|ha(ha)+|wtf|insane|crazy|hot|spicy|burn\w*|water|help|"
+    r"sweat\w*|dying|tears?|cough\w*|choke?\w*|can'?t breathe)\b", re.IGNORECASE)
+# a stretched exclamation ("Ohhhh", "Nooo!", "Ahhh") is a reaction however long the line is
+_STRETCHED_RE = re.compile(r"\b(o{2,}h+|oh{3,}|no{3,}|a{2,}h+|ah{3,}|wo{3,}w)\b", re.IGNORECASE)
+REACT_MIN_EVENTS = 2.0       # summed event weight a window needs to become a candidate
+REACT_LINK_GAP = 16.0        # events further apart than this are separate moments
+REACT_SETUP_GAP = 8.0        # a normal line this close before the first event is its setup
+
+
+def _react_weight(segments: list[dict], k: int) -> float:
+    """How much segment k looks like a reaction: an exclamation counts fully, a short line
+    standing alone between pauses counts half ("How bad is it?")."""
+    s = segments[k]
+    words = len(s["text"].split())
+    if _STRETCHED_RE.search(s["text"]) or (words <= 10 and _REACT_RE.search(s["text"])):
+        return 1.0
+    if words <= 5:
+        before = s["start"] - segments[k - 1]["end"] if k else 99.0
+        after = segments[k + 1]["start"] - s["end"] if k + 1 < len(segments) else 99.0
+        if max(before, after) >= 3.0:
+            return 0.5
+    return 0.0
+
+
+def _reaction_candidates(segments: list[dict], loud: list[float] | None, cfg: dict) -> list[Clip]:
+    if not segments or not (cfg.get("profile") or {}).get("reactions", True):
+        return []
+    lo, hi = cfg["min_seconds"], cfg["max_seconds"]
+    stats = _loud_stats(loud or [])
+    w = [_react_weight(segments, k) for k in range(len(segments))]
+    found: list[tuple[float, Clip]] = []
+    for a in (k for k in range(len(segments)) if w[k]):
+        if a and not w[a - 1] and segments[a]["start"] - segments[a - 1]["end"] <= REACT_SETUP_GAP:
+            first = a - 1                       # keep the line that sets it up ("3, 2, 1")
+        else:
+            first = a
+        start, last, events, filled = segments[first]["start"], a, w[a], 0.0
+        k = a + 1
+        while k < len(segments):
+            gap = segments[k]["start"] - segments[k - 1]["end"]
+            if gap > REACT_LINK_GAP or segments[k]["end"] - start > hi:
+                break
+            if gap > 2.0 and (not stats or not _quiet(segments[k - 1]["end"], segments[k]["start"], loud)
+                              or _loud_has_sound(segments[k - 1]["end"], segments[k]["start"], loud, stats)):
+                filled += gap                    # a pause full of sound: chewing, gasping
+            if w[k]:
+                events += w[k]
+                last = k
+            elif k == last + 1 and len(segments[k]["text"].split()) <= 12:
+                last = k                         # the verdict right after the last reaction
+            k += 1
+        end = segments[last]["end"]
+        if events < REACT_MIN_EVENTS or end - start < lo * 0.6:
+            continue
+        score = events + 0.04 * filled
+        hook = segments[first]["text"].strip()
+        c = Clip(start_seconds=start, end_seconds=end, hook=hook, quote=hook, beat_type="reaction",
+                 score=min(9.0, 5.0 + 0.6 * events),
+                 why=f"Reaction beat: {events:g} reactions in {end - start:.0f}s")
+        c._source = "reaction"
+        found.append((score, c))
+    found.sort(key=lambda x: -x[0])
+    return _nonoverlap([c for _, c in found], max(2, int(cfg.get("count") or 0) // 2))
+
+
+def _loud_has_sound(a: float, b: float, loud: list[float] | None, stats: dict) -> bool:
+    """Not dead air: the pause stays within ~12 dB of the video's typical level."""
+    win = [x for x in (loud or [])[max(0, int(a)):max(int(a) + 1, int(b))] if x > -60.0]
+    return bool(win) and sorted(win)[len(win) // 2] > stats["p40"] - 12.0
+
+
 MIN_CLIPS = 4                                       # never hand back fewer than this (if the pool allows)
 
 
@@ -855,14 +1155,19 @@ def _finalize(clips: list[Clip], segments: list[dict], n: int, cfg: dict,
     n = max(int(n or 0), int(cfg.get("min_clips", MIN_CLIPS)))   # a user-chosen count lowers the floor
     keep_n = min(round(n * 1.6), n + 4)   # hand stage 2 a slightly fuller pool; it re-ranks to n
     stats = _loud_stats(loud or [])
+    clips = list(clips) + _reaction_candidates(segments, loud, cfg)
     good: list[Clip] = []
     spare: list[Clip] = []                          # passed length but failed the sparse test — fallback pool
     for c in clips:
         if c.end_seconds - c.start_seconds < 1.0:   # a degenerate pick (seen: start == end)
             continue
+        reaction = c._source == "reaction"
         _snap_clip(c, segments, cfg)
+        _trim_cta(c, segments, cfg)                 # "don't click away… subscribe" never opens a clip
+        _trim_weak_open(c, segments, cfg)           # nor does "okay so, um"
         _grow_to_payoff(c, segments, cfg)           # don't leave the punchline just past the end
-        _trim_to_dense_block(c, segments, cfg, loud)  # split off other moments across a quiet gap
+        if not reaction:                            # a reaction beat IS the pauses between words
+            _trim_to_dense_block(c, segments, cfg, loud)  # split off other moments across a quiet gap
         _trim_silence(c, segments, cfg)             # shave leading / trailing dead air
         _clamp_clip(c, dur, cfg, segments)
         _end_on_sentence(c, segments, cfg, dur)
@@ -882,12 +1187,21 @@ def _finalize(clips: list[Clip], segments: list[dict], n: int, cfg: dict,
                 c.score = max(1.0, min(10.0, c.score + boost))
                 c._energy = en
         sparse = words < cfg["min_words"] or words / length < 0.35
-        if sparse and c.score < 9.5:                # montage / dead-air / near-silent
+        if sparse and c.score < 9.5 and not reaction:   # montage / dead-air / near-silent
             spare.append(c)
             continue
         good.append(c)
     good.sort(key=lambda c: (-c.score, c.start_seconds))
-    kept = _nonoverlap(good, keep_n)
+    kept = _nonoverlap([c for c in good if c._source != "reaction"], keep_n)
+    # reaction beats get their own places: the picker's 1-10 scores run higher than theirs,
+    # and the judge - not this sort - should decide between a talky clip and a reaction.
+    # With the judge on they may overlap a picker clip (the judge's ranking removes overlaps
+    # afterwards); dropping them here lost the eating challenge to two weaker picker clips.
+    reactions = _nonoverlap([c for c in good if c._source == "reaction"], 3)
+    if cfg.get("coherence_check", True):
+        kept = kept + reactions
+    else:
+        kept = _nonoverlap(kept + reactions, len(kept) + 3)
     if len(kept) < MIN_CLIPS and spare:             # backfill from the near-misses to reach the floor
         spare.sort(key=lambda c: -c.score)
         kept = _nonoverlap(kept + spare, max(keep_n, MIN_CLIPS))
@@ -961,12 +1275,11 @@ def _scene_cuts(video: Path, start: float, dur: float) -> list[float]:
     160px copy through ffmpeg's scene score. [] on any failure - tracking then behaves
     as one continuous shot, as before."""
     try:
-        p = subprocess.run(
+        p = _exec(
             [FFMPEG, "-hide_banner", "-v", "info", *_thread_args(), "-ss", f"{start:.2f}",
              "-t", f"{dur:.2f}", "-i", str(video), "-vf",
              f"scale=160:-2,select='gt(scene,{SCENE_THRESHOLD})',metadata=print",
-             "-an", "-f", "null", "-"],
-            capture_output=True, text=True)
+             "-an", "-f", "null", "-"])
     except Exception:  # noqa: BLE001
         return []
     cuts: list[float] = []
@@ -1184,7 +1497,13 @@ def frame_on(face: dict, mode: str = "crop", zoom: float = 1.0) -> dict:
 
 # ---- readable score: 0-100 from parts you can see ---------------------------
 
-SCORE_WEIGHTS = {"hook": 25, "story": 25, "energy": 20, "clarity": 15, "pacing": 15}
+# "opening" = the first seconds as heard (speech starts at once, dense, loud) - where the
+# swipe-away decision is made; the judged "hook" reads the same moment from the words
+SCORE_WEIGHTS = {"hook": 25, "story": 25, "energy": 20, "opening": 10, "clarity": 10, "pacing": 10}
+OPEN_SECONDS = 3.0
+JUDGED_PARTS = ("hook", "story")   # from the verify model; the rest are measured from the audio
+GATE_MIN = 0.3                     # the audio parts' share left when the judge finds nothing
+GATE_FULL = 0.55                   # judged quality (0-1) from which the audio parts count fully
 
 
 def score_breakdown(c: "Clip", segments: list[dict], loud: list[float] | None,
@@ -1196,7 +1515,13 @@ def score_breakdown(c: "Clip", segments: list[dict], loud: list[float] | None,
     arc = c.arc or {}
     rated = bool(arc)                       # set by verify (zeros included); {} = no usable verdict
     hook = arc.get("hook", 0) / 3 if rated else s1
-    story = (arc.get("arc", 0) / 3 * 0.6 + (arc.get("standalone", 0) + arc.get("quote", 0)) / 4 * 0.4) if rated else s1
+    story = s1
+    if rated:
+        sq = (arc.get("standalone", 0) + arc.get("quote", 0)) / 4
+        if "arousal" in arc:     # high-arousal moments are the ones that get shared
+            story = arc.get("arc", 0) / 3 * 0.5 + sq * 0.3 + arc["arousal"] / 2 * 0.2
+        else:                    # a verdict from before arousal was rated
+            story = arc.get("arc", 0) / 3 * 0.6 + sq * 0.4
     if c._rank_pct is not None:
         # the forced ranking is the model's most reliable signal (comparing beats rating);
         # it also breaks the ties absolute scores leave
@@ -1220,13 +1545,45 @@ def score_breakdown(c: "Clip", segments: list[dict], loud: list[float] | None,
         clarity = max(0.0, min(1.0, (lp + 1.0) / 0.8))        # -1.0 mumbled … -0.2 crisp
     wps = sum(len(s["text"].split()) for s in hits) / length
     rate = 1.0 if 2.0 <= wps <= 3.6 else max(0.0, min(1.0, wps / 2.0)) if wps < 2.0 else max(0.5, 1 - (wps - 3.6) / 3)
+    if c._source == "reaction":
+        rate = max(rate, 0.75)              # words per second doesn't measure a reaction beat
     pacing = 0.6 * rate + 0.4 * max(0.0, min(1.0, talk / length))
 
-    parts = {"hook": hook, "story": story, "energy": energy, "clarity": clarity, "pacing": pacing}
+    # opening: does something happen in the first seconds? speech straight away (dead air
+    # reads as a frozen video), words per second, and loudness against the video's own range
+    a, b = c.start_seconds, c.start_seconds + OPEN_SECONDS
+    first = min((max(s["start"], a) for s in hits), default=c.end_seconds)
+    prompt = 1.0 if first - a <= 0.8 else max(0.0, 1 - (first - a - 0.8) / 2.2)    # 3 s of nothing -> 0
+    open_words = sum(len(s["text"].split()) * (min(s["end"], b) - max(s["start"], a)) / max(s["end"] - s["start"], 0.1)
+                     for s in hits if s["start"] < b and s["end"] > a)
+    density = max(0.0, min(1.0, open_words / OPEN_SECONDS / 2.0))
+    if c._source == "reaction":
+        density = max(density, 0.6)          # a reaction opens on a sound, not a sentence
+    open_loud = 0.5
+    if stats and loud:
+        win = [x for x in loud[int(a):int(b) + 1] if x > -60.0]
+        if win:
+            span = max(stats["p92"] - stats["p40"], 3.0)
+            open_loud = max(0.0, min(1.0, (sum(win) / len(win) - stats["p40"]) / span))
+    # a podcast's best opener is often quiet; the category's energy_weight damps loudness here too
+    open_loud = 0.5 + (open_loud - 0.5) * min(1.0, max(0.0, energy_weight))
+    opening = 0.45 * prompt + 0.25 * density + 0.30 * open_loud
+
+    parts = {"hook": hook, "story": story, "energy": energy, "opening": opening,
+             "clarity": clarity, "pacing": pacing}
     # the category's energy_weight rescales how much loudness counts (a podcast's best line
     # is often quiet); the weights are renormalised so the total stays out of 100
     w = dict(SCORE_WEIGHTS, energy=SCORE_WEIGHTS["energy"] * max(0.0, energy_weight))
-    total = sum(w[k] * parts[k] for k in parts) * 100 / sum(w.values())
+    judged = sum(w[k] * parts[k] for k in JUDGED_PARTS)
+    measured = sum(w[k] * parts[k] for k in parts if k not in JUDGED_PARTS)
+    if rated:
+        # Energy, clarity and pacing describe the audio, not the moment: clear loud talking
+        # scored ~50 on its own, so a clip the judge rated arc 0 / quote 0 still reached 56
+        # and the quality floor never bit. When the judge finds little, the audio parts count
+        # for less (down to GATE_MIN); a clip it rates decently (>= GATE_FULL) is untouched.
+        quality = (hook + story) / 2
+        measured *= GATE_MIN + (1 - GATE_MIN) * min(1.0, quality / GATE_FULL)
+    total = (judged + measured) * 100 / sum(w.values())
     return {"total": round(total), **{k: round(v, 2) for k, v in parts.items()}}
 
 
@@ -1238,7 +1595,7 @@ CATEGORY_FILE = HERE / "categories.toml"
 @functools.lru_cache(maxsize=1)
 def _profiles() -> dict[str, dict]:
     """categories.toml's [category.<name>] tables; {} when the file is missing or broken
-    (then everything behaves as before, from clipfinder.toml alone)."""
+    (then everything behaves as before, from kappacut.toml alone)."""
     try:
         import tomllib
         raw = tomllib.loads(CATEGORY_FILE.read_text(encoding="utf-8"))
@@ -1299,7 +1656,10 @@ def detect_category(segments: list[dict], cfg: dict) -> str:
                 seen.add(id(s))
                 sample.append(s)
         excerpt = as_timeline(sample)
-        prompt = f"{CATEGORIZE_BRIEF}\n\nTRANSCRIPT EXCERPT:\n{excerpt}"
+        # the title usually names the format outright ("Try Not To Laugh", "Podcast #41")
+        title = str(cfg.get("video_title") or "").strip()
+        head = f"VIDEO TITLE: {title}\n" if title else ""
+        prompt = f"{CATEGORIZE_BRIEF}\n\n{head}TRANSCRIPT EXCERPT:\n{excerpt}"
         resp = _groq_chat(groq.Groq(), cfg["groq_model"], prompt, 0.0)
         data = _loads_lenient(resp.choices[0].message.content)
         cat = str(data.get("category") or "").strip().lower()
@@ -1323,6 +1683,17 @@ def _steer_line(cfg: dict) -> str:
     if cfg.get("taste"):
         parts.append(f"Editor's taste to follow: {cfg['taste']}")
     return f"\n{' '.join(parts)}\n" if parts else ""
+
+
+def _length_rule(cfg: dict) -> str:
+    """The clip-length window both pickers are told, from the category profile (podcasts
+    run 20-60s, sports 10-35s). It was hardcoded 15-45s, so a podcast's picks came back
+    short and _clamp_clip padded them out with lead-in."""
+    lo, hi = float(cfg.get("min_seconds", 15)), float(cfg.get("max_seconds", 45))
+    a, b = round(lo + (hi - lo) / 6), round(hi - (hi - lo) / 3)
+    return (f"length {lo:g}-{hi:g}s, ideally {a}-{b}s: a clip under {lo:g}s is almost always "
+            f"missing its setup or its reaction, so widen it to the whole beat rather than "
+            f"return a fragment.")
 
 
 # ---- picker: Groq (free) ----------------------------------------------------
@@ -1398,6 +1769,9 @@ def _loads_lenient(raw: str) -> dict:
 # analyses against the shared free-tier TPM budget. Groq limits each model separately, so
 # the gate keeps one budget per model. Signature: (est_tokens: int, model: str) -> None.
 GROQ_GATE = None
+# Per-analysis hooks, set by pipeline.analyze on the thread it runs on (a worker can run
+# two analyses at once, so not a module global): on_wait() = "waiting for the rate limit".
+_THREAD = threading.local()
 
 # A per-minute limit clears within ~60s. A retry-after much longer than that is the daily
 # cap (TPD / audio-seconds-per-day): sleeping it out held the job "analyzing" for hours.
@@ -1412,6 +1786,19 @@ class GroqQuotaError(RuntimeError):
         super().__init__(f"Groq's free-tier daily limit for {model} is used up — "
                          f"try again in about {mins} min")
         self.model, self.wait = model, wait
+
+
+# Connection drops, timeouts and 5xx from the API are blips: wait and ask again instead of
+# failing the whole analysis (seen: "APIConnectionError: Connection error." mid-run).
+TRANSIENT_WAITS = (5, 15, 40)
+
+
+def _transient(e: BaseException) -> bool:
+    import groq
+
+    if isinstance(e, groq.APIConnectionError):          # includes APITimeoutError
+        return True
+    return isinstance(e, groq.APIStatusError) and (getattr(e, "status_code", 0) or 0) >= 500
 
 
 def _retry_wait(e, model: str) -> int:
@@ -1429,40 +1816,62 @@ def _retry_wait(e, model: str) -> int:
 def _groq_chat(client, model: str, prompt: str, temperature: float, effort: str = "low"):
     import groq
 
+    _check_cancelled()
+    settle = None
     if GROQ_GATE is not None:
         try:
-            GROQ_GATE(len(prompt) // 4 + GROQ_PICK_MAX_TOKENS, model)
+            settle = GROQ_GATE(len(prompt) // 4 + GROQ_RESERVE_REPLY_TOKENS, model,
+                               on_wait=getattr(_THREAD, "on_wait", None))
         except Exception:  # noqa: BLE001
             pass
+
+    def settled(resp):
+        # hand back the part of the reservation the reply didn't use (see app/groq_gate.py)
+        if callable(settle):
+            try:
+                settle(int(resp.usage.total_tokens))
+            except Exception:  # noqa: BLE001
+                pass
+        return resp
 
     # gpt-oss is a reasoning model: at the default effort its hidden thinking ate the whole
     # 5000-token budget, the JSON got cut off (finish_reason "length") and every analysis
     # paid for a retry. Picking and verifying need little deliberation, so keep it low.
     extra = {"reasoning_effort": effort} if "gpt-oss" in model else {}
-    for _ in range(4):
+    limited = hiccups = 0
+    while True:
         try:
-            return client.chat.completions.create(
+            return settled(client.chat.completions.create(
                 model=model, messages=[{"role": "user", "content": prompt}],
                 temperature=temperature, max_tokens=GROQ_PICK_MAX_TOKENS, **extra,
-            )
+            ))
         except groq.BadRequestError:
             raise
-        except (groq.RateLimitError, groq.APIStatusError) as e:
+        except (groq.APIConnectionError, groq.APIStatusError) as e:
+            if _transient(e) and hiccups < len(TRANSIENT_WAITS):
+                wait = TRANSIENT_WAITS[hiccups]
+                hiccups += 1
+                print(f"        Groq connection problem ({type(e).__name__}) - retrying in {wait}s ...", flush=True)
+                time.sleep(wait)
+                continue
             if getattr(e, "status_code", None) not in (429, 413):
                 raise
+            if limited >= 4:
+                raise RuntimeError("Groq rate limit did not clear after several waits") from e
+            limited += 1
             wait = _retry_wait(e, model)
             print(f"        rate limited (free tier) - waiting {wait}s ...", flush=True)
             time.sleep(wait)
-    raise RuntimeError("Groq rate limit did not clear after several waits")
 
 
 def _groq_pick_window(client, model: str, w: list[dict], ask: int, taste_line: str,
-                      temperature: float) -> list[Clip]:
+                      temperature: float, length_rule: str = "") -> list[Clip]:
     text = as_timeline(w)
+    length_rule = length_rule or _length_rule({})
     if len(text) > 9000 and len(w) > 8:
         mid = len(w) // 2
-        return (_groq_pick_window(client, model, w[:mid], max(2, ask // 2 + 1), taste_line, temperature)
-                + _groq_pick_window(client, model, w[mid:], max(2, ask // 2 + 1), taste_line, temperature))
+        return (_groq_pick_window(client, model, w[:mid], max(2, ask // 2 + 1), taste_line, temperature, length_rule)
+                + _groq_pick_window(client, model, w[mid:], max(2, ask // 2 + 1), taste_line, temperature, length_rule))
 
     # placeholders, not numbers: with 0.0 / 0.0 in the template the model sometimes handed
     # the template straight back - a single 0-second "clip", and 0 clips for the video
@@ -1474,10 +1883,10 @@ def _groq_pick_window(client, model: str, w: list[dict], ask: int, taste_line: s
         f"JSON object of this exact shape and nothing after it:\n{shape}\n\n"
         f"Give the {ask} best standalone clips in this section - never an empty list: return at "
         f"least 2 candidates even if the section is quiet; weak ones are filtered out afterwards. Rules:\n"
-        f"- start_seconds: the transcript timestamp of the SETUP line (the build-up), not the punchline.\n"
+        f"- start_seconds: the transcript timestamp of the first line that GRABS - the hook - not "
+        f"the punchline. Include one short setup line before it only if the clip is unclear without it.\n"
         f"- end_seconds: AFTER the payoff / punchline / final reaction - never end on the setup. "
-        f"length 15-45s, ideally 20-35s: a clip under 15s is almost always missing its setup or "
-        f"its reaction, so widen it to the whole beat rather than return a fragment.\n"
+        f"{length_rule}\n"
         f"- title: 2-5 punchy words naming the moment, like a Shorts title (never empty).\n"
         f"- hook: the exact first words of the clip, copied from the transcript (not a description).\n"
         f"- quote: the single funniest line, verbatim from the transcript.\n"
@@ -1526,7 +1935,10 @@ def _find_clips_groq(segments: list[dict], cfg: dict, loud: list[float] | None =
     import groq
 
     client = groq.Groq()
-    model = cfg["groq_model"]
+    # Groq limits each model separately, so spreading the windows over several models gives
+    # the picker each one's per-minute budget at once, and its daily cap on top of the others.
+    # Stage 2 re-scores every candidate with one judge, so mixed pickers still rank as one pool.
+    models = list(cfg.get("groq_pick_models") or []) or [cfg["groq_model"]]
     n = cfg["count"]
     wins = _windows(segments, PICKER_WINDOW_SEC) or [segments]
     taste_line = _steer_line(cfg)
@@ -1536,10 +1948,24 @@ def _find_clips_groq(segments: list[dict], cfg: dict, loud: list[float] | None =
     ask, keep = share + 4, share + 3
 
     pool: list[Clip] = []
+    progress = cfg.get("_progress")              # set by pipeline.analyze; absent in the CLI
     for wi, w in enumerate(wins, 1):
         if len(wins) > 1:
             print(f"        window {wi}/{len(wins)} ...", flush=True)
-        clips = _groq_pick_window(client, model, w, ask, taste_line, cfg["temperature"])
+            if progress:
+                # a long video spends minutes here; a bar frozen at 65% read as "stuck"
+                progress(65 + round(19 * (wi - 1) / len(wins)), f"Ranking the moments ({wi} of {len(wins)})")
+        while True:
+            model = models[(wi - 1) % len(models)]
+            try:
+                clips = _groq_pick_window(client, model, w, ask, taste_line, cfg["temperature"],
+                                          _length_rule(cfg))
+                break
+            except GroqQuotaError:
+                if len(models) == 1:
+                    raise
+                models.remove(model)              # its daily cap is spent: finish on the rest
+                print(f"        {model} daily limit spent - picking with {', '.join(models)}", flush=True)
         clips.sort(key=lambda c: -c.score)
         pool.extend(_nonoverlap(clips, keep))
 
@@ -1565,8 +1991,9 @@ def _find_clips_claude(segments: list[dict], cfg: dict, loud: list[float] | None
     user = (
         f"Full timestamped transcript of a {dur / 60:.0f}-minute video is below.\n\n"
         f"Pick the {cfg['count']} best standalone clips. Copy exact second values from the "
-        f"transcript into start_seconds / end_seconds: start on the SETUP line, end AFTER the "
-        f"payoff / punchline (never on the setup). length 10-45s. `hook` = the exact opening "
+        f"transcript into start_seconds / end_seconds: start on the first line that GRABS (the "
+        f"hook; one short setup line before it only if needed), end AFTER the payoff / "
+        f"punchline (never on the setup). {_length_rule(cfg)} `hook` = the exact opening "
         f"words verbatim, `quote` = the funniest line verbatim.{taste_line}\n"
         f"TRANSCRIPT:\n{as_timeline(segments)}"
     )
@@ -1637,11 +2064,13 @@ class _Verdict(BaseModel):
     hook_line: str = ""
     payoff_line: str = ""
     beat_type: str = "moment"
+    hook_type: str = ""
     hook: int = 0
     arc: int = 0
     quote: int = 0
     standalone: int = 0
     trend: int = 0
+    arousal: int = 0
     rank: int = 0                          # 1 = best clip in this batch; forced, no ties
 
 
@@ -1655,8 +2084,11 @@ _VERIFY_BRIEF = (
     "For EVERY clip do ALL THREE:\n"
     "1) SCORE it against these anchors. Use the whole range - most batches have at least one 0 "
     "or 1 and at most one top score per criterion; identical scores across clips are wrong.\n"
-    "   hook 0-3: 0 = opens mid-thought / filler, 1 = understandable but flat, 2 = a clear "
-    "question, claim or tension in the first line, 3 = you cannot scroll past it.\n"
+    "   hook 0-3 (the FIRST line only - it decides whether a viewer swipes away): 0 = opens "
+    "mid-thought, on filler or a greeting, 1 = understandable but flat, 2 = a clear question, "
+    "claim or tension in the first line, 3 = you cannot scroll past it.\n"
+    "   arousal 0-2: 0 = calm or sad, 1 = lively, 2 = high-arousal - hilarious, shocking, "
+    "awe, outrage, tension.\n"
     "   arc 0-3: 0 = no payoff inside the IN lines, 1 = payoff implied or cut off, 2 = setup and "
     "payoff both present, 3 = tight setup -> escalation -> payoff/reaction.\n"
     "   quote 0-2: 0 = nothing repeatable, 1 = a decent line, 2 = a line people would comment back.\n"
@@ -1664,18 +2096,26 @@ _VERIFY_BRIEF = (
     "   trend 0-2: 0 = slow or talky, 1 = fine, 2 = quick punchline, loop/rewatch potential.\n"
     "2) RANK it - `rank` orders ALL clips from best (1) to worst (N) as a short-form editor "
     "would post them. Every clip gets a different rank; no ties.\n"
-    "3) TIGHTEN it - start_seconds = the first line a viewer needs (use a [ctx] line when the setup "
-    "is there), end_seconds = just after the payoff / final reaction. Use the exact Ns timestamps "
-    "shown. Copy hook_line and payoff_line verbatim. Label beat_type: reaction | fail | bit | story "
-    "| quote | wholesome | moment.\n"
+    "3) TIGHTEN it - start_seconds = the first line that grabs: drop leading filler, greetings and "
+    "slow build-up; pull in a [ctx] line only when the clip is unclear without it. end_seconds = "
+    "just after the payoff / final reaction. Use the exact Ns timestamps shown. Copy hook_line and "
+    "payoff_line verbatim. Label beat_type: reaction | fail | bit | story | quote | hot_take | "
+    "argument | reveal | wholesome | moment. Label hook_type - what the first line does: claim | "
+    "question | conflict | reveal | reaction | confession | story | none.\n"
+    "Some clips are REACTION beats (eating, playing, watching): few words, long pauses, short "
+    "lines like \"Oh!\" or \"Dang.\" There the reaction itself is the payoff - score arc and trend on "
+    "the build-up and the reaction, not on how much is said. A call to action (subscribe, like, "
+    "thanks for watching, a sponsor) is never the hook or the payoff.\n"
     "Set keep=false ONLY when the clip is genuinely broken - garbled speech-to-text word-salad, OR "
     "it ends before any payoff, OR it staples two unrelated moments together - and give a one-line "
     "`reason`. If you cannot name a concrete flaw, keep=true. Most clips are keep=true.\n\n"
     # The worked example shows only how to TIGHTEN and copy lines. It used to carry scores
     # (2/3/2/2/2) and both gpt-oss models echoed them onto every clip - the "identical
     # verdicts" that flattened the ranking. Scores come from the anchors above, not an example.
+    # "CLIP X", not a number: labelled "CLIP 9" the judge once returned this example verbatim
+    # as its verdict for the real clip 9 (its lines, "fail", the lot)
     "EXAMPLE (bounds and lines only)\n"
-    "### CLIP 9\n"
+    "### CLIP X\n"
     "  [ctx 01:10|70.0s] anyway so my chair broke yesterday\n"
     "  [IN  01:14|74.0s] and I'm sitting here streaming right\n"
     "  [IN  01:16|76.0s] and it just SNAPS, I hit the floor\n"
@@ -1683,13 +2123,40 @@ _VERIFY_BRIEF = (
     "  [ctx 01:22|82.0s] okay let me get up\n"
     '-> start_seconds 70.0 (the setup is in the ctx line), end_seconds 81.0, '
     'hook_line "anyway so my chair broke yesterday", payoff_line "chat is DYING I can\'t breathe", '
-    'beat_type "fail"'
+    'beat_type "fail", hook_type "story"'
 )
 
+# placeholders, not "": with empty strings in the template the judge sometimes copied them
+# back for every clip, and with no payoff line named, _reach_payoff had nothing to reach for
 _VERIFY_SHAPE = ('{"verdicts":[{"index":<int>,"keep":<bool>,"start_seconds":<s>,"end_seconds":<s>,'
-                 '"hook_line":"","payoff_line":"","beat_type":"",'
-                 '"hook":<0-3>,"arc":<0-3>,"quote":<0-2>,"standalone":<0-2>,"trend":<0-2>,'
+                 '"hook_line":"<first line, verbatim>","payoff_line":"<payoff line, verbatim>",'
+                 '"beat_type":"<reaction|fail|bit|story|quote|hot_take|argument|reveal|wholesome|moment>",'
+                 '"hook_type":"<claim|question|conflict|reveal|reaction|confession|story|none>",'
+                 '"hook":<0-3>,"arc":<0-3>,"quote":<0-2>,"standalone":<0-2>,"trend":<0-2>,"arousal":<0-2>,'
                  '"rank":<1-N>,"reason":""}]}')
+
+
+_EXAMPLE_LINES = ("anyway so my chair broke yesterday", "chat is DYING I can't breathe")
+JUDGE_MAX_REJECT = 0.6   # rejecting more of the batch than this reads as a broken reply, not taste
+
+
+def _echoes_example(v: dict) -> bool:
+    """The verdict copied the brief's worked example instead of reading its clip."""
+    ex = {_norm_line(x) for x in _EXAMPLE_LINES}
+    return any(_norm_line(str(v.get(k) or "")) in ex for k in ("hook_line", "payoff_line"))
+
+
+def _judge_reply_broken(verdicts: dict[int, dict], n: int) -> bool:
+    if not verdicts:
+        return True
+    vs = list(verdicts.values())
+    echoed = sum(_echoes_example(v) for v in vs)
+    rejected = sum(v.get("keep") is False for v in vs)
+    return echoed * 2 >= len(vs) or (n >= 4 and rejected > JUDGE_MAX_REJECT * n)
+
+
+SOFT_MIN = 3          # aim for at least this many clips (when you asked for that many)
+SOFT_MARGIN = 12      # ... taking clips up to this far under the quality floor to get there
 
 
 def _rank_key(c: Clip, segments: list[dict], loud: list[float] | None, energy_weight: float = 1.0) -> float:
@@ -1742,9 +2209,10 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
             client, prompt = groq.Groq(), (
                 body + f"\n\nReply with ONLY this JSON object and nothing after it:\n{_VERIFY_SHAPE}")
             judge = cfg.get("groq_verify_model") or cfg["groq_model"]
+            effort = cfg.get("groq_verify_effort") or "low"
             for attempt in range(2):
                 try:
-                    resp = _groq_chat(client, judge, prompt, 0.0)
+                    resp = _groq_chat(client, judge, prompt, 0.0, effort)
                 except GroqQuotaError:
                     # the judge model's daily cap is separate from the picker's: a weaker
                     # judge still beats skipping the flow check entirely
@@ -1752,14 +2220,20 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
                         raise
                     judge = cfg["groq_model"]
                     print(f"        flow check: judge quota spent, using {judge}", flush=True)
-                    resp = _groq_chat(client, judge, prompt, 0.0)
+                    resp = _groq_chat(client, judge, prompt, 0.0, effort)
+                got: dict[int, dict] = {}
                 for v in _loads_lenient(resp.choices[0].message.content).get("verdicts", []):
                     try:
-                        verdicts[int(v["index"])] = v
+                        got[int(v["index"])] = v
                     except (KeyError, ValueError, TypeError):
                         pass
-                if verdicts:
+                if got:
+                    verdicts = got
+                if verdicts and not _judge_reply_broken(verdicts, len(clips)):
                     break
+                if verdicts and attempt == 0:
+                    # seen: the example pasted back as a verdict, and 12 of 13 clips rejected
+                    print("        flow check: judge reply looks broken - asking once more", flush=True)
     except Exception as e:  # noqa: BLE001 - never let the flow check break analysis
         print(f"        flow check skipped: {e}")
         return shortlist(clips)
@@ -1767,15 +2241,35 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
         print("        flow check: no usable verdicts - keeping stage-1 picks")
         return shortlist(clips)
 
+    # judged before the scrub below: once the copied lines are blanked, a reply that was
+    # broken *because* it echoed the example would no longer look it
+    if _judge_reply_broken(verdicts, len(clips)):
+        # Broken twice: its scores are no more trustworthy than its rejections. Ignoring only
+        # the rejections kept numbers that sank 5 of 6 good clips under the floor (6 -> 1).
+        print("        flow check: judge reply still looks broken - keeping stage-1 picks",
+              flush=True)
+        return shortlist(clips)
+    # A verdict that copied the example's lines carries the example's labels too ("fail",
+    # "story"): keep its numbers, drop the lines and labels it never read off its own clip.
+    for v in verdicts.values():
+        if _echoes_example(v):
+            for k in ("hook_line", "payoff_line", "beat_type", "hook_type"):
+                v[k] = ""
+
     def ci(x, hi):
-        return max(0, min(hi, int(x or 0)))
+        # the reply is model output: "high", "2/3" or NaN read as 0. This runs outside the
+        # try above, so one stray string used to fail the whole analysis.
+        try:
+            return max(0, min(hi, int(float(x or 0))))
+        except (TypeError, ValueError, OverflowError):
+            return 0
 
     def _sum(v):
         return sum(ci(v.get(k), 3 if k in ("hook", "arc") else 2)
                    for k in ("hook", "arc", "quote", "standalone", "trend"))
     # a weak free model sometimes rejects (or zero-scores) everything - then its keep flags are
     # noise; fall back to trusting stage 1, only using whatever bounds/scores it did give.
-    any_signal = any(_sum(v) > 0 or (v.get("reason") or "").strip() for v in verdicts.values())
+    any_signal = any(_sum(v) > 0 or str(v.get("reason") or "").strip() for v in verdicts.values())
     trust_drops = any_signal and not all(v.get("keep") is False for v in verdicts.values())
     if not any_signal:
         print("        flow check: model gave no signal - keeping stage-1 picks")
@@ -1806,7 +2300,7 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
             firm.append(c)                                    # model skipped this one - trust stage 1
             continue
         h, a, q, sd = ci(v.get("hook"), 3), ci(v.get("arc"), 3), ci(v.get("quote"), 2), ci(v.get("standalone"), 2)
-        t = ci(v.get("trend"), 2)
+        t, ar = ci(v.get("trend"), 2), ci(v.get("arousal"), 2)
         # any_signal holds here, so even an all-zero verdict is a real judgement ("opens
         # mid-thought, no payoff") - it used to read as "unrated" and fall back to stage 1,
         # which scored a clip the judge rated 0/0/0/0/0 at 61/100
@@ -1828,12 +2322,20 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
             _snap_to_lines(c, segments)
         if rank_ok and ranks.get(i, 0) > 0:
             c._rank_pct = round(1 - (ranks[i] - lo_r) / max(hi_r - lo_r, 1), 3)
-        c.beat_type = str(v.get("beat_type") or "moment")
-        c.hook_line = str(v.get("hook_line") or "")
-        c.payoff_line = str(v.get("payoff_line") or "")
+        line = lambda k: "" if str(v.get(k) or "").lstrip().startswith("<") else str(v.get(k) or "")  # noqa: E731 - an echoed placeholder
+        c.beat_type = line("beat_type").strip().lower() or "moment"
+        c.hook_type = line("hook_type").strip().lower()
+        c.hook_line = line("hook_line")
+        c.payoff_line = line("payoff_line")
+        if _norm_line(c.payoff_line) == _norm_line(c.hook_line):
+            c.payoff_line = ""                     # the judge repeated the hook: no payoff named
+        _trim_cta(c, segments, cfg)                # the judge's [ctx] lines can pull one back in
+        _trim_weak_open(c, segments, cfg)          # ... and filler ("okay so", "um") as the first line
+        _reach_payoff(c, segments, cfg, dur)       # it named the payoff - make sure it's inside
         # flat verdicts carry no information - leave arc empty so the readable score's
         # hook/story parts fall back to the stage-1 score instead of the same 1/2/1/1/1
-        c.arc = {} if flat else {"hook": h, "arc": a, "quote": q, "standalone": sd, "trend": t}
+        c.arc = {} if flat else {"hook": h, "arc": a, "quote": q, "standalone": sd, "trend": t,
+                                 "arousal": ar}
         if scored:
             # blend, don't replace: stage 1 (1-10) already holds the loudness boost; stage 2
             # (0-12, rescaled to 10) adds the structure read. Replacing threw the energy away.
@@ -1843,7 +2345,9 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
         _grow_to_payoff(c, segments, cfg)
         _clamp_clip(c, dur, cfg, segments)
         _end_on_sentence(c, segments, cfg, dur)
-        rejected = trust_drops and v.get("keep") is False
+        # a rejection has to name its flaw (the brief asks for one): gpt-oss-120b was seen
+        # setting keep=false on clips it ranked #1 and #2, with an empty reason
+        rejected = trust_drops and v.get("keep") is False and bool(str(v.get("reason") or "").strip())
         if rejected:
             rejected_ids.add(id(c))
         (weak if (rejected or (scored and a < 2)) else firm).append(c)
@@ -1853,11 +2357,27 @@ def _verify_and_refine(clips: list[Clip], segments: list[dict], cfg: dict,
     # padding to the number (the review screen says "3 strong moments - you asked for 5").
     rank = {id(c): _rank_key(c, segments, loud, ew) for c in firm + weak}
     by_rank = lambda pool: sorted(pool, key=lambda x: -rank[id(x)])  # noqa: E731
-    kept = [c for c in by_rank(firm) if rank[id(c)] >= floor]
-    if len(kept) < want:
-        kept += [c for c in by_rank(weak)
-                 if id(c) not in rejected_ids and rank[id(c)] >= floor][:want - len(kept)]
-    kept = _nonoverlap(by_rank(kept), want)
+    usable = [c for c in by_rank(weak) if id(c) not in rejected_ids]
+
+    def fill(kept: list[Clip], pool: list[Clip], min_score: float, upto: int) -> list[Clip]:
+        # one at a time, skipping overlaps: taking a slice first and de-overlapping after
+        # (the old way) dropped a clip and never replaced it
+        for c in pool:
+            if len(kept) >= upto:
+                break
+            if c not in kept and rank[id(c)] >= min_score and not any(
+                    c.start_seconds < x.end_seconds and c.end_seconds > x.start_seconds for x in kept):
+                kept.append(c)
+        return kept
+
+    kept = fill([], by_rank(firm), floor, want)
+    kept = fill(kept, usable, floor, want)
+    # A harsh judge run can leave two clips from a 20-minute video (seen: the same video
+    # gave 5 in one run, 2 in the next). Below SOFT_MIN, top up with the next best clips
+    # the judge did not reject, as long as they come within SOFT_MARGIN of the floor.
+    soft = min(want, SOFT_MIN)
+    if len(kept) < soft:
+        kept = fill(kept, by_rank(firm) + usable, floor - SOFT_MARGIN, soft)
     kept.sort(key=lambda x: x.start_seconds)
     return kept or shortlist(clips)   # nothing cleared the floor: still hand back the best one
 
@@ -1904,21 +2424,31 @@ def vision_check(video: Path, clips: list[Clip], workdir: Path, model: str,
 # ------------------------------------------------------------------ per-video driver
 
 def slugify(text: str, limit: int = 48) -> str:
-    text = re.sub(r"[^\w\s-]", "", text).strip().lower()
-    return re.sub(r"[\s_-]+", "-", text)[:limit] or "clip"
+    # ASCII only: the slug names a bucket object, and app/storage.py's key segments are
+    # [A-Za-z0-9._-]. A Unicode \w let "Pokémon" through, and the clip failed at upload,
+    # after its whole render. Accents fold to their letter; other scripts drop out.
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.ASCII).strip().lower()
+    return re.sub(r"[\s_-]+", "-", text).strip("-")[:limit].rstrip("-") or "clip"
 
 
 def process_video(video: Path, cfg: dict) -> dict:
     print(f"\n=== {video.name} ===", flush=True)
+    cfg = dict(cfg)              # apply_profile rewrites length / taste: keep each video's own
+    cfg.setdefault("video_title", video.stem)
     budget_reset(cfg)
     out_dir = (Path(cfg["out"]) if cfg["out"] else video.parent / "clips") / video.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="clipfinder_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kappacut_") as tmp:
         workdir = Path(tmp)
 
         print("  [1/4] extracting audio ...", flush=True)
         mp3 = extract_audio(video, workdir)
+        # the same signals the web app (pipeline._analyze) decides with: without the loudness
+        # track there is no energy boost, energy reads a flat 0.5 and the reaction finder
+        # can't tell a pause full of chewing from dead air
+        loud = loudness_track(mp3)
 
         print("  [2/4] transcribing (Groq) ...", flush=True)
         t0 = time.time()
@@ -1928,12 +2458,18 @@ def process_video(video: Path, cfg: dict) -> dict:
             return {"video": video.name, "clips": []}
         print(f"        {len(segments)} segments, {time.time() - t0:.0f}s", flush=True)
 
+        cfg["category"] = cfg.get("category_override") or detect_category(segments, cfg)
+        apply_profile(cfg)
+        print(f"        category: {cfg['category']} "
+              f"({cfg['min_seconds']:g}-{cfg['max_seconds']:g}s, energy x{cfg.get('energy_weight', 1.0):g})",
+              flush=True)
+
         label = cfg["claude_model"] if cfg["backend"] == "claude" else cfg["groq_model"]
         print(f"  [3/4] picking {cfg['count']} clips ({cfg['backend']}: {label}) ...", flush=True)
-        clips, usage = find_clips(segments, cfg)
+        clips, usage = find_clips(segments, cfg, loud)
         if cfg.get("coherence_check", True) and clips:
             before = len(clips)
-            clips = _verify_and_refine(clips, segments, cfg)
+            clips = _verify_and_refine(clips, segments, cfg, loud)
             if len(clips) < before:
                 print(f"        flow check tightened / dropped {before - len(clips)} clip(s)", flush=True)
         if usage is not None:
@@ -1964,6 +2500,10 @@ def process_video(video: Path, cfg: dict) -> dict:
         for i, c in enumerate(clips):
             rec = c.model_dump()
             rec["duration"] = round(c.end_seconds - c.start_seconds, 1)
+            rec["source"] = c._source
+            sb = score_breakdown(c, segments, loud, float(cfg.get("energy_weight", 1.0)))
+            rec["virality"] = sb.pop("total")            # the 0-100 the shortlist was ranked by
+            rec["breakdown"] = sb
             if i in visuals:
                 rec["visual_score"] = visuals[i].visual_score
                 rec["visual_note"] = visuals[i].note
@@ -1973,11 +2513,12 @@ def process_video(video: Path, cfg: dict) -> dict:
         for i, r in enumerate(records):
             vs = f" v{r['visual_score']}" if "visual_score" in r else ""
             print(f"   {i+1:2d}. [{r['start_seconds']:7.1f}-{r['end_seconds']:7.1f}s "
-                  f"{r['duration']:4.1f}s] s{r['score']:.0f}{vs}  {r['title']}")
+                  f"{r['duration']:4.1f}s] {r['virality']:3d}/100 s{r['score']:.0f}{vs}  {r['title']}")
             print(f"       hook: {r['hook']}")
 
         (out_dir / "clips.json").write_text(
             json.dumps({"video": str(video), "backend": cfg["backend"], "model": label,
+                        "category": cfg.get("category") or "general",
                         "transcript_segments": len(segments), "clips": records},
                        indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -2002,9 +2543,11 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(description="Find short-form clips in long videos.")
     ap.add_argument("path", help="a video file, or a folder of videos")
-    ap.add_argument("--config", default=None, help="path to a clipfinder.toml (default: next to script)")
+    ap.add_argument("--config", default=None, help="path to a kappacut.toml (default: next to script)")
     ap.add_argument("--n", type=int, default=None, help="clips per video")
     ap.add_argument("--taste", default=None, help="free-text editing preferences")
+    ap.add_argument("--category", choices=sorted(CATEGORIES), default=None,
+                    help="skip genre detection and use this categories.toml profile")
     ap.add_argument("--picker", choices=["groq", "claude"], default=None)
     ap.add_argument("--model", default=None, help="LLM model id for the chosen picker")
     ap.add_argument("--verify-model", default=None, help="Claude model for the stage-2 flow check (default: same as --model)")
@@ -2014,7 +2557,7 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--lead", type=float, default=None, help="seconds of pad before each clip")
     ap.add_argument("--tail", type=float, default=None, help="seconds of pad after each clip")
-    ap.add_argument("--vertical", action="store_true", default=None, help="also crop to 1080x1920")
+    ap.add_argument("--vertical", action="store_true", default=None, help="also crop to 9:16 (1080x1920, or 720x1280 for sub-1080p sources)")
     ap.add_argument("--no-loudnorm", dest="loudnorm", action="store_false", default=None,
                     help="skip -14 LUFS loudness normalization")
     ap.add_argument("--vision", action="store_true", default=None, help="Claude scores one frame per clip")
@@ -2022,7 +2565,7 @@ def main() -> int:
     ap.add_argument("--out", default="", help="output root (default: <video dir>/clips)")
     args = ap.parse_args()
 
-    cfg = load_config(Path(args.config) if args.config else HERE / "clipfinder.toml")
+    cfg = load_config(Path(args.config) if args.config else HERE / "kappacut.toml")
     for key, val in {"count": args.n, "taste": args.taste, "backend": args.picker,
                      "temperature": args.temperature, "lead_seconds": args.lead,
                      "tail_seconds": args.tail, "vertical": args.vertical,
@@ -2033,6 +2576,15 @@ def main() -> int:
             cfg[key] = val
     if args.model:
         cfg["claude_model" if cfg["backend"] == "claude" else "groq_model"] = args.model
+        cfg["groq_pick_models"] = []              # an explicit --model picks every window
+    # as the web app's New-project options (app/jobs._apply_options): a chosen count is the
+    # maximum, a typed taste beats the genre's default, a chosen type skips detection
+    if args.n is not None:
+        cfg["min_clips"] = args.n
+    if args.taste:
+        cfg["taste_from_user"] = True
+    if args.category:
+        cfg["category_override"] = args.category
     cfg["dry_run"] = args.dry_run
     cfg["out"] = args.out
 
@@ -2075,4 +2627,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             

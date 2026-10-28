@@ -2,7 +2,7 @@
 #
 #   moment         what a great clip is in this genre - goes into the picker + judge prompts
 #   prefer_beats   beat types to favour (reaction | fail | bit | story | quote | wholesome)
-#   min_seconds / max_seconds   clip length window (overrides clipfinder.toml)
+#   min_seconds / max_seconds   clip length window (overrides kappacut.toml)
 #   energy_weight  how much loudness counts: 1.0 = as configured, 0.3 = barely, 1.4 = a lot
 #   hot_threshold  loudness spike needed for the punchy auto edit (lower = more clips "hot")
 #   default_taste  steering used when the user picked no options

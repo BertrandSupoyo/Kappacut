@@ -34,7 +34,7 @@ import functools
 import re
 import uuid
 from pathlib import Path
-from typing import Iterator
+from typing import Iterable, Iterator
 
 import boto3
 from botocore.client import Config
@@ -42,7 +42,7 @@ from botocore.client import Config
 from app.config import settings
 
 # Deliberately a whitelist. Everything that reaches a key is either a UUID, a slug from
-# `clipfinder.slugify` ([\w-]), an integer, or a fixed literal — all of which fit. The
+# `kappacut.slugify` ([\w-]), an integer, or a fixed literal — all of which fit. The
 # first character may not be `.` or `-`, which is what rejects `.`, `..` and dotfiles;
 # `_` is allowed there because the shared `_builtin` prefix uses it and an underscore
 # carries no traversal meaning.
@@ -228,12 +228,11 @@ def delete_key(key: str) -> None:
     client().delete_object(Bucket=_bucket(), Key=key)
 
 
-def delete_prefix(prefix: str) -> int:
-    """Delete everything under `prefix`. Used for project deletion and retention GC."""
+def _delete_keys(keys: Iterable[str]) -> int:
     bucket, n = _bucket(), 0
     batch: list[dict] = []
-    for obj in list_prefix(prefix):
-        batch.append({"Key": obj["Key"]})
+    for key in keys:
+        batch.append({"Key": key})
         if len(batch) == 1000:                      # the API's per-call maximum
             client().delete_objects(Bucket=bucket, Delete={"Objects": batch})
             n += len(batch)
@@ -242,6 +241,11 @@ def delete_prefix(prefix: str) -> int:
         client().delete_objects(Bucket=bucket, Delete={"Objects": batch})
         n += len(batch)
     return n
+
+
+def delete_prefix(prefix: str) -> int:
+    """Delete everything under `prefix`. Used for project deletion and retention GC."""
+    return _delete_keys(obj["Key"] for obj in list_prefix(prefix))
 
 
 def presign_get(key: str, *, ttl: int | None = None, filename: str | None = None) -> str:
@@ -255,6 +259,15 @@ def presign_get(key: str, *, ttl: int | None = None, filename: str | None = None
     )
 
 
+def presign_internal(key: str, ttl: int = 3600) -> str:
+    """A URL for the worker's own ffmpeg, signed for the internal endpoint (not the public
+    one presign_get uses). ffmpeg seeks it with range requests, so a per-clip render reads
+    only the part of the source it cuts instead of downloading all of it."""
+    return client().generate_presigned_url(
+        "get_object", Params={"Bucket": _bucket(), "Key": key}, ExpiresIn=ttl
+    )
+
+
 # --------------------------------------------------------------- project helpers
 
 def find_source(user_id: uuid.UUID, project_id: uuid.UUID) -> str | None:
@@ -265,6 +278,21 @@ def find_source(user_id: uuid.UUID, project_id: uuid.UUID) -> str | None:
         if "/" not in name and name.startswith("source."):
             return obj["Key"]
     return None
+
+
+def clear_stale_media(user_id: uuid.UUID, project_id: uuid.UUID, keep_source: str) -> int:
+    """After a new source lands on a project that already had one: drop any other
+    `source.<ext>` (find_source could otherwise pick the old file) and what was derived
+    from the old video - the waveform and frames, which are only built when missing, so
+    they would have shown the old video forever. Rendered clips and thumbnails stay."""
+    prefix = project_prefix(user_id, project_id)
+    stale = []
+    for obj in list_prefix(prefix):
+        key, name = obj["Key"], obj["Key"][len(prefix):]
+        if key != keep_source and (("/" not in name and name.startswith("source."))
+                                   or name == "waveform.png" or name.startswith("frames/")):
+            stale.append(key)
+    return _delete_keys(stale)
 
 
 def delete_project_media(user_id: uuid.UUID, project_id: uuid.UUID) -> int:

@@ -1,4 +1,4 @@
-# PLAN-boost.md — clipfinder feature roadmap
+# PLAN-boost.md — Kappacut feature roadmap
 
 Source of record for the "boost the product" feature set discussed and scoped in
 conversation (taste-builder, auto-render agent mode, category detection, trend-aware
@@ -6,7 +6,7 @@ scoring, credit ledger, AI thumbnails). Each phase is independently shippable.
 Follows the same phase-log convention as `PLAN-multiuser.md` — mark ✅ DONE with
 deviations/verification results as each phase completes.
 
-**Locked constraint (do not violate):** clipfinder is free, open-signup, one shared
+**Locked constraint (do not violate):** Kappacut is free, open-signup, one shared
 server-side Groq key protecting a shared budget (`app/quota.py`, `app/ratelimit.py`,
 `app/groq_gate.py`). Any feature with real per-call cost beyond Groq's free-tier
 text/audio (i.e. any generative image/video call) MUST be gated behind the Phase E
@@ -27,7 +27,7 @@ All line numbers below were read directly from current files — do not trust an
 older numbers from `PLAN-multiuser.md` or `PLAN-moment-flow.md`, they are stale.
 Re-verify again at implementation time if more than a few days have passed.
 
-**`clipfinder.py`:**
+**`kappacut.py`:**
 - `PICKER_BRIEF`: lines 519-541. `_VERIFY_BRIEF` / `_VERIFY_SHAPE`: lines 1038-1067.
   `_verify_and_refine(clips, segments, cfg) -> list[Clip]`: lines 1070-1164, called
   only from `pipeline.py:64`, gated on `cfg.get("coherence_check", True) and clips`.
@@ -198,7 +198,7 @@ Postgres directly — `projects.taste` and the analyze `jobs.payload` both
 contained the exact composed string
 `"Prioritize beat_type: fail. Target length under 15s. 3 clips. Avoid:
 awkward silence."`. The subsequent analyze run failed at the transcription
-step (`clipfinder.py:418`, Groq 401 `expired_api_key`) — this is the
+step (`kappacut.py:418`, Groq 401 `expired_api_key`) — this is the
 pre-existing dev-environment key expiry noted earlier this session, not a
 Phase A regression; it occurs well downstream of the `cfg["taste"]`
 injection point, which was reached without error.
@@ -220,7 +220,7 @@ exist first).
    auto-render path, rather than duplicating the logic.
 4. In `run_analyze`, after clips are finalized, if `project.auto_render`:
    apply the existing `_auto_edit` heuristic per clip (re-verify its current
-   signature in `clipfinder.py` before use — not re-confirmed this round) and
+   signature in `kappacut.py` before use — not re-confirmed this round) and
    enqueue a `render_task` using the shared helper from step 3, instead of
    waiting for the user to open the Editor.
 
@@ -241,7 +241,7 @@ request body (the frontend's `keptRanges()` in `editor/store.ts` builds them
 client-side). So there was no server-side helper to extract; instead a new
 `_clip_to_range(c: dict) -> dict` was added to `app/jobs.py`, a Python
 port of `keptRanges()` + `applyAuto()`'s merge logic, driven off each clip's
-already-attached `auto` suggestion (`clipfinder.py`'s `attach_auto()` /
+already-attached `auto` suggestion (`kappacut.py`'s `attach_auto()` /
 `_auto_edit()`, confirmed to run unconditionally inside every
 `pipeline.analyze()` call at `pipeline.py:66` — so no second call to
 `_auto_edit` was needed, it's already computed). A `_try_auto_render()`
@@ -266,7 +266,7 @@ path can't fire end-to-end here), `_clip_to_range`/`_try_auto_render` were
 exercised directly against the real DB with synthetic clip data (matching
 `_auto_edit`'s real output shape) — confirmed a render `Job` was created,
 enqueued via arq, and the worker picked it up and **actually completed a
-real ffmpeg render** (`clipfinder.jobs: render ... done — 1 clip(s)`),
+real ffmpeg render** (`kappacut.jobs: render ... done — 1 clip(s)`),
 proving the full chain works; this will run through the real transcription
 path automatically once the Groq key is refreshed.
 
@@ -277,7 +277,7 @@ path automatically once the Groq key is refreshed.
 **What to implement:**
 1. New system prompt (`CATEGORIZE_BRIEF`) + a small Pydantic output model
    (category + confidence), following the existing `ClipSet`/`_VerifySet`
-   pattern in `clipfinder.py`.
+   pattern in `kappacut.py`.
 2. One new lightweight call, run once per video using a short transcript
    excerpt (first window's segments are enough) **before** Stage 1 begins —
    this is a genuinely new LLM call, budget it explicitly.
@@ -301,7 +301,7 @@ call count once shipped.
 **Deviations / verification results:** implemented as `CATEGORIES` (a fixed
 9-way tuple: gaming/podcast/vlog/interview/tutorial/comedy/sports/reaction/
 other) + `CATEGORIZE_BRIEF` + `detect_category(segments, cfg)` in
-`clipfinder.py`, inserted right before the "picker: Groq" section (after
+`kappacut.py`, inserted right before the "picker: Groq" section (after
 `_auto_edit`). Reuses the existing `_groq_chat`/`_loads_lenient`/`as_timeline`
 helpers exactly like the picker does, so it automatically participates in the
 shared `GROQ_GATE` token-bucket — no separate rate-limit plumbing needed.
@@ -338,7 +338,7 @@ behavior, not just accepts the parameter.
 ## Phase D — Trend-aware scoring dimension (Stage 2 only) ✅ DONE (2026-09-12)
 
 **What to implement:**
-1. Add a `trend: int = 0` field (0-2 scale) to `_Verdict` (`clipfinder.py`
+1. Add a `trend: int = 0` field (0-2 scale) to `_Verdict` (`kappacut.py`
    around lines 1020-1032).
 2. Extend `_VERIFY_BRIEF` (1038-1063) with rubric text scoring "matches
    patterns that currently perform well in short-form video — strong hook in

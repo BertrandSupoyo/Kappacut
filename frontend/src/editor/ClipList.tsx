@@ -75,17 +75,23 @@ export function StageHeader() {
         <div className="muted" style={{ fontSize: "var(--fs-xs)", marginTop: 2 }}>
           {fmtDuration(e.start)} – {fmtDuration(e.end)} · {fmtDuration(e.end - e.start)}
           {c.virality === undefined && ` · score ${c.score.toFixed(1)}`}
-          {c.beat_type ? ` · ${c.beat_type}` : ""}
+          {c.beat_type ? ` · ${c.beat_type.replace("_", " ")}` : ""}
+          {c.hook_type && c.hook_type !== "none" ? ` · ${c.hook_type} hook` : ""}
         </div>
         {c.why && <p className="muted" style={{ fontSize: "var(--fs-xs)", margin: "var(--sp-2) 0 0" }}>{c.why}</p>}
         {c.breakdown && (
           <div className="score-row" aria-label={`Score ${c.virality} out of 100`}>
-            {(["hook", "story", "energy", "clarity", "pacing"] as const).map((k) => (
-              <div key={k} className="score-part" title={`${k}: ${Math.round(c.breakdown![k] * 100)}/100`}>
-                <span style={{ textTransform: "capitalize" }}>{k}</span>
-                <div className="score-bar"><i style={{ width: `${Math.round(c.breakdown![k] * 100)}%` }} /></div>
-              </div>
-            ))}
+            {(["hook", "opening", "story", "energy", "clarity", "pacing"] as const)
+              .filter((k) => c.breakdown![k] !== undefined)
+              .map((k) => {
+                const v = Math.round((c.breakdown![k] ?? 0) * 100);
+                return (
+                  <div key={k} className="score-part" title={`${k}: ${v}/100`}>
+                    <span style={{ textTransform: "capitalize" }}>{k}</span>
+                    <div className="score-bar"><i style={{ width: `${v}%` }} /></div>
+                  </div>
+                );
+              })}
           </div>
         )}
       </div>

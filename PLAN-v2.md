@@ -1,4 +1,4 @@
-# PLAN-v2.md — clipfinder: object storage + scene-aware cuts
+# PLAN-v2.md — Kappacut: object storage + scene-aware cuts
 
 Third roadmap, after `PLAN-multiuser.md` (local → multi-user, 8 phases, all shipped) and
 `PLAN-boost.md` (taste plumbing → AI thumbnails, phases A–F, all shipped). Two phases of
@@ -12,7 +12,7 @@ each phase as it completes, the same way `PLAN-boost.md` logs them.
 
 ## Locked constraints (do not violate)
 
-**1. clipfinder stays free, open-signup.** Reaffirmed 2026-09-24 against a full cost model
+**1. Kappacut stays free, open-signup.** Reaffirmed 2026-09-24 against a full cost model
 (below). One shared server-side Groq key, protected by `app/quota.py`, `app/ratelimit.py`
 and `app/groq_gate.py`. No billing, no paid tiers, no per-user keys. The consequence, which
 this plan accepts rather than works around: **anything with a real per-call cost stays
@@ -137,7 +137,7 @@ expect to tune toward 0.3 for talking-head and streamer footage where cuts are s
 
 **The cost, which must not be glossed over:** analyze currently never decodes video.
 `extract_audio` passes `-vn` and `loudness_track` works on the extracted mp3, so
-`clipfinder.py` touches video frames only in `grab_frame` and `cut_clip`. Scene detection
+`kappacut.py` touches video frames only in `grab_frame` and `cut_clip`. Scene detection
 adds a **new full-video decode pass** — order of 1–3 CPU-min for a 60-min 1080p source,
 against a current analyze cost of ~2–3 CPU-min total. That is a material increase to
 per-video CPU and it must be measured, not assumed. Mitigations to try in this order:
@@ -168,7 +168,7 @@ plus `app/sfx.py` `media_sfx` :101.
 `sfx_stage` :286, `_stageable_sfx` :60, `_fail` :44. `RenderOutput.bytes` is read from
 `.stat().st_size` inside `run_render`'s drain — becomes the upload response size.
 
-**Snapping (Phase B)**: `clipfinder.py` `_boundaries()` :613 returns
+**Snapping (Phase B)**: `kappacut.py` `_boundaries()` :613 returns
 `(starts, ends, pauses)`; `_snap()` :625 is a generic nearest-point helper, reusable
 unchanged; `_snap_clip()` :630 applies it per edge; `loudness_track()` :563 is the model for
 what a `scene_track()` should look like. `snap_max_shift` default 4.0s at :64.
@@ -316,12 +316,12 @@ constraints — ffmpeg's scene score is a frame-difference metric, not a model.
 
 ### What to implement
 
-1. **`scene_track(video, cfg) -> list[float]`** in `clipfinder.py`, next to
+1. **`scene_track(video, cfg) -> list[float]`** in `kappacut.py`, next to
    `loudness_track()` :563 and following its shape (blocking, returns a plain list, no
    engine state). Use the `metadata=print` form from Phase 0, parse `pts_time`, apply the
    downscale mitigation from the start rather than as a follow-up optimisation.
 
-2. **`clipfinder.toml`** — `scene_threshold = 0.4` and `scene_detect = true` under
+2. **`kappacut.toml`** — `scene_threshold = 0.4` and `scene_detect = true` under
    `[clips]`, plumbed through `DEFAULTS` (:48) like every other knob. `scene_detect = false`
    must skip the decode pass entirely, so the added CPU is opt-out.
 

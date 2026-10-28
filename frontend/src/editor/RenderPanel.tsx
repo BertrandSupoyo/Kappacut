@@ -32,6 +32,8 @@ export function RenderSync() {
       qc.invalidateQueries({ queryKey: ["outputs", projectId] });
       qc.invalidateQueries({ queryKey: ["projects"] });
       if (sse.status === "error") toast(sse.error || "Render failed.", "error");
+      // clips render independently now: the job finishes even when a few of them failed
+      else if (sse.error) toast(sse.error, "error");
     }
   }, [sse, rendering, projectId, qc, toast, setRender]);
 
@@ -120,7 +122,7 @@ export function RenderOutputs() {
             <video src={o.url} controls preload="metadata" style={{ width: "100%", borderRadius: "var(--r-xs)", maxHeight: 280, background: "#000" }} />
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginTop: 6 }}>
               <span className="muted" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.file}</span>
-              <a href={o.url} download style={{ whiteSpace: "nowrap" }}>{fmtDuration(o.duration)} ↓</a>
+              <a href={`${o.url}?download=1`} download style={{ whiteSpace: "nowrap" }}>{fmtDuration(o.duration)} ↓</a>
             </div>
           </div>
         ))}

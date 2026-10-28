@@ -1,4 +1,4 @@
-# clipfinder — web + worker share this image.
+# Kappacut — web + worker share this image.
 
 # --- frontend build ---------------------------------------------------------
 FROM node:22-slim AS frontend
@@ -28,11 +28,17 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY app ./app
 COPY alembic ./alembic
 COPY alembic.ini ./
-COPY clipfinder.py pipeline.py clipfinder.toml categories.toml ./
+COPY kappacut.py pipeline.py kappacut.toml categories.toml ./
 # the colour presets are shared with the editor; one file, read by both
 COPY frontend/src/editor/colorPresets.json ./color_presets.json
 COPY models ./models
 COPY --from=frontend /fe/dist ./web
+
+# Web and worker both run ffmpeg on files strangers upload; a parser bug there should land
+# in an unprivileged account, not root. Nothing writes under /srv at runtime - scratch
+# space is the temp dir - so the code stays root-owned and read-only to this user.
+RUN useradd --system --create-home --uid 10001 kappacut
+USER kappacut
 
 EXPOSE 8000
 

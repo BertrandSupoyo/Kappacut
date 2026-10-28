@@ -1,9 +1,9 @@
-"""Web-facing wrapper around clipfinder.py.
+"""Web-facing wrapper around kappacut.py.
 
 `analyze()`  — transcribe + rank highlights, NO cutting.
-`render()`   — cut a list of ranges (AI-accepted or hand-drawn) with clipfinder's cut_clip.
+`render_one()` — cut one range (AI-accepted or hand-drawn) with kappacut.cut_clip.
 
-Everything heavy is delegated to clipfinder.py; this file is orchestration only.
+Everything heavy is delegated to kappacut.py; this file is orchestration only.
 """
 from __future__ import annotations
 
@@ -11,17 +11,17 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-import clipfinder as cf
+import kappacut as cf
 
 HERE = Path(__file__).resolve().parent
 
 
 def get_cfg() -> dict:
-    """Engine tuning for the web app. clipfinder.toml holds the knobs; API keys and any
+    """Engine tuning for the web app. kappacut.toml holds the knobs; API keys and any
     overrides come from the process environment (the container / .env). The old
     web_data/_settings.json overlay went away with the Settings page in Phase 3."""
     cf.load_dotenv(HERE / ".env")          # no-op in the container; loads keys in local dev
-    cfg = cf.load_config(HERE / "clipfinder.toml")
+    cfg = cf.load_config(HERE / "kappacut.toml")
     cfg["dry_run"] = False
     cfg["out"] = ""
     cfg["word_timestamps"] = True          # web app always wants per-word times (karaoke + snapping)
@@ -37,12 +37,27 @@ def analyze(video_path: Path, cfg: dict, on_progress: ProgressCB = lambda p, m: 
     Returns {duration, segments, clips} where each clip is Clip.model_dump() plus
     `duration` and (when vision is on) `visual_score` / `visual_note`.
     """
+    last = [0, ""]
+
+    def tracked(pct: int, msg: str) -> None:       # remembers where we are, for the note below
+        last[:] = [pct, msg]
+        on_progress(pct, msg)
+
+    # a free-tier rate-limit wait can last a minute: say so instead of looking stuck
+    cf._THREAD.on_wait = lambda: on_progress(last[0], f"{last[1]} - waiting for Groq's free-tier limit")
+    try:
+        return _analyze(video_path, cfg, tracked)
+    finally:
+        cf._THREAD.on_wait = None                  # the thread goes back to a shared pool
+
+
+def _analyze(video_path: Path, cfg: dict, on_progress: ProgressCB) -> dict:
     video_path = Path(video_path)
     cf.budget_reset(cfg)
     on_progress(5, "Reading the video")
     duration = cf.probe_duration(video_path)
 
-    with tempfile.TemporaryDirectory(prefix="clipfinder_web_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kappacut_web_") as tmp:
         workdir = Path(tmp)
 
         on_progress(12, "Pulling the audio")
@@ -287,11 +302,11 @@ def build_ass(lines: list[dict], style: str, position: str, size: float,
 
 # ---------------------------------------------------------------- render
 
-def render(video_path: Path, ranges: list[dict], cfg: dict, out_dir: Path,
-           segments: list[dict] | None = None, sfx_dir: Path | None = None,
-           on_clip: Callable[[dict], None] | None = None,
-           on_stage: Callable[[str], None] | None = None) -> list[dict]:
-    """Cut each range to its own mp4 in out_dir. `ranges` items:
+def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
+               segments: list[dict] | None = None, sfx_dir: Path | None = None,
+               dur: float | None = None) -> dict | None:
+    """Cut range `r` as clip number `i` (1-based, it names the file) into out_dir. One call
+    per clip: app.jobs runs each as its own queue task. `r`:
     {"start", "end", "vertical", "label", "crop": {"mode","px","py","zoom","blur"}|null,
      "captions": {"style","position","size","anim","lines":[{start,end,text}]}|null,
      "sfx": [{"file","at","gain"}]|null,
@@ -300,55 +315,50 @@ def render(video_path: Path, ranges: list[dict], cfg: dict, out_dir: Path,
     `sfx` is mixed in a second pass (video copied) when `sfx_dir` is given.
     `crop` (only when vertical): mode "crop" -> px/py 0..1 pan + zoom 1..4 punch-in;
     mode "fill" -> full video centred, blurred copy (sigma `blur`) fills the top/bottom bars.
+
+    `video` may be a local path or an http(s) URL — ffmpeg seeks a URL with range
+    requests, so a per-clip worker needn't download the whole source. Returns the clip
+    record, or None when the range is under a second once clamped to the video.
     """
-    video_path, out_dir = Path(video_path), Path(out_dir)
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    dur = cf.probe_duration(video_path)
+    if dur is None:
+        dur = cf.probe_duration(video)
+    start = max(0.0, float(r["start"]))
+    end = min(dur, float(r["end"]))
+    if end - start < 1.0:
+        return None
+    vertical = bool(r.get("vertical"))
+    crop = r.get("crop") if vertical else None
+    _cm = crop.get("mode") if isinstance(crop, dict) else None
+    vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
+            else "_vertical" if vertical else "")
+    stem = f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}"
+    name = f"{stem}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
 
-    out = []
-    total = len(ranges)
-    for i, r in enumerate(ranges, 1):
-        start = max(0.0, float(r["start"]))
-        end = min(dur, float(r["end"]))
-        if end - start < 1.0:
-            continue
-        if on_stage:
-            on_stage(f"Rendering clip {i} of {total}")
-        vertical = bool(r.get("vertical"))
-        crop = r.get("crop") if vertical else None
-        _cm = crop.get("mode") if isinstance(crop, dict) else None
-        vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
-                else "_vertical" if vertical else "")
-        stem = f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}"
-        name = f"{stem}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
+    subs = None
+    cap = r.get("captions")
+    if cap:
+        lines = cap.get("lines") or caption_lines(segments, start, end)
+        if lines:
+            subs = build_ass(lines, cap.get("style", "clean"),
+                             cap.get("position", "bottom"), cap.get("size", 1.0),
+                             vertical, out_dir / f"{stem}.ass",
+                             karaoke=bool(cap.get("karaoke")), pos=cap.get("pos"),
+                             anim=cap.get("anim", "none"))
 
-        subs = None
-        cap = r.get("captions")
-        if cap:
-            lines = cap.get("lines") or caption_lines(segments, start, end)
-            if lines:
-                subs = build_ass(lines, cap.get("style", "clean"),
-                                 cap.get("position", "bottom"), cap.get("size", 1.0),
-                                 vertical, out_dir / f"{stem}.ass",
-                                 karaoke=bool(cap.get("karaoke")), pos=cap.get("pos"),
-                                 anim=cap.get("anim", "none"))
+    cf.cut_clip(video, start, end, out_dir / name, vertical, subs=subs, crop=crop,
+                loudnorm=cfg.get("loudnorm", True), color=r.get("color"))
 
-        cf.cut_clip(video_path, start, end, out_dir / name, vertical, subs=subs, crop=crop,
-                    loudnorm=cfg.get("loudnorm", True), color=r.get("color"))
+    sfx = [s for s in (r.get("sfx") or []) if isinstance(s, dict) and s.get("file")]
+    if sfx and sfx_dir is not None:
+        mixed = out_dir / f"_sfxmix{name}"
+        try:
+            if cf.mix_sfx(out_dir / name, sfx, Path(sfx_dir), mixed):
+                mixed.replace(out_dir / name)
+        finally:
+            mixed.unlink(missing_ok=True)
 
-        sfx = [s for s in (r.get("sfx") or []) if isinstance(s, dict) and s.get("file")]
-        if sfx and sfx_dir is not None:
-            mixed = out_dir / f"_sfxmix{name}"
-            try:
-                if cf.mix_sfx(out_dir / name, sfx, Path(sfx_dir), mixed):
-                    mixed.replace(out_dir / name)
-            finally:
-                mixed.unlink(missing_ok=True)
-
-        rec = {"file": name, "start": round(start, 2), "end": round(end, 2),
-               "duration": round(end - start, 1), "vertical": vertical,
-               "captions": bool(subs), "sfx": len(sfx)}
-        out.append(rec)
-        if on_clip:
-            on_clip(rec)
-    return out
+    return {"file": name, "start": round(start, 2), "end": round(end, 2),
+            "duration": round(end - start, 1), "vertical": vertical,
+            "captions": bool(subs), "sfx": len(sfx)}

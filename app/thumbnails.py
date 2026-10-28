@@ -2,7 +2,7 @@
 rather than a single hardcoded choice.
 
 Groq has no image-generation capability (verified against its own API docs), so this is a
-new class of external call for clipfinder: real per-image spend, gated behind
+new class of external call for Kappacut: real per-image spend, gated behind
 app/credits.py's check_credits() (Phase E), not the free-tier Groq quotas.
 
 Each provider is a plain async `generate(prompt) -> bytes` function behind a common
@@ -28,7 +28,7 @@ import redis.asyncio as aioredis
 
 from app.config import settings
 
-log = logging.getLogger("clipfinder.thumbnails")
+log = logging.getLogger("kappacut.thumbnails")
 _r = aioredis.from_url(settings.redis_url, decode_responses=True)
 
 _STATS_TTL_S = 30 * 24 * 3600   # a month of rolling history is plenty to judge "current" performance
@@ -119,7 +119,10 @@ async def rank_providers() -> list[str]:
     configured = [p for p in PROVIDERS if getattr(settings, _KEY_SETTING[p])]
     scored = []
     for p in configured:
-        raw = await _r.hgetall(_stats_key(p))
+        try:
+            raw = await _r.hgetall(_stats_key(p))
+        except Exception:  # noqa: BLE001 — stats are advisory: no Redis = untested, not an error
+            raw = {}
         success, fail = int(raw.get("success", 0)), int(raw.get("fail", 0))
         latency = float(raw["latency_ema_ms"]) if raw.get("latency_ema_ms") else 5000.0
         scored.append((p, _score(success, fail, latency)))

@@ -18,7 +18,7 @@ from app.models.job import Job
 from app.models.project import Project
 from app.models.user import User
 
-log = logging.getLogger("clipfinder.retention")
+log = logging.getLogger("kappacut.retention")
 
 
 # Abandoned tusd partials used to be swept from the local staging dir here. tusd writes

@@ -32,8 +32,11 @@ async def _create_superuser(email: str, password: str) -> None:
             existing.is_superuser = True
             existing.is_verified = True
             existing.is_active = True
+            # --password is required, so honour it: silently keeping the old one left the
+            # operator locked out with a password they believed they had just set
+            existing.hashed_password = manager.password_helper.hash(password)
             await session.commit()
-            print(f"promoted existing user {email} to verified superuser")
+            print(f"promoted existing user {email} to verified superuser (password updated)")
             return
         user = await manager.create(
             UserCreate(email=email, password=password, is_superuser=True, is_verified=True),

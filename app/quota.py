@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.models.job import RenderOutput
 from app.models.project import Project
+from app.models.sfx import SfxAsset
 from app.models.usage import UsageEvent
 from app.models.user import User
 
@@ -98,7 +99,10 @@ async def storage_bytes(session: AsyncSession, user_id) -> int:
         .join(Project, Project.id == RenderOutput.project_id)
         .where(Project.user_id == user_id)
     )
-    return int(src or 0) + int(rendered or 0)
+    sfx = await session.scalar(
+        select(func.coalesce(func.sum(SfxAsset.bytes), 0)).where(SfxAsset.user_id == user_id)
+    )
+    return int(src or 0) + int(rendered or 0) + int(sfx or 0)
 
 
 async def renders_today(session: AsyncSession, user_id) -> int:

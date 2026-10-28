@@ -40,11 +40,11 @@ from app.models.job import Job
 from app.models.project import Project
 from app.models.usage import UsageEvent
 from app.models.user import User
-from app.projects import VIDEO_EXTS, analyze_payload
+from app.projects import VIDEO_EXTS, analyze_payload, clear_stale_source
 from app.queue import enqueue_analyze
 from app.quota import QuotaError, check_quota
 
-log = logging.getLogger("clipfinder.uploads")
+log = logging.getLogger("kappacut.uploads")
 router = APIRouter(tags=["uploads"])
 
 _ACK = JSONResponse({})  # 200 + empty body = "proceed"
@@ -128,8 +128,9 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
     headers = (event.get("HTTPRequest") or {}).get("Header") or {}
     cookie_header = (headers.get("Cookie") or [""])[0] or request.headers.get("cookie", "")
 
+    # read_token doesn't check these; current_verified_user (every other route) does
     user = await _user_from_cookie(cookie_header, session)
-    if user is None or not user.is_verified:
+    if user is None or not user.is_active or not user.is_verified:
         return _reject(401, "Sign in to upload.")
 
     raw_pid = meta.get("projectId") or meta.get("projectid") or ""
@@ -173,7 +174,9 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
         size = await run_in_threadpool(storage.size_of, staged)
         if not size:
             log.error("post-finish: upload object %s is missing or empty", staged)
-            return _ACK
+            # say so on the project, rather than leave it on "uploading" forever
+            return await _abandon(session, project, staged,
+                                  "The upload didn't arrive in one piece - try again.")
 
         # pre-create checked these, but that call can simply be skipped — re-check here,
         # where the worker time and the Groq budget actually get spent.
@@ -194,6 +197,7 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
         source = storage.source_key(user.id, project.id, ext)
         await run_in_threadpool(storage.copy, staged, source)
         await _discard(staged)
+        await clear_stale_source(user.id, project.id, source)
 
         project.source_ext = ext
         project.source_bytes = size

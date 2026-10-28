@@ -1,4 +1,4 @@
-"""clipfinder multi-user backend.
+"""Kappacut multi-user backend.
 
 Package layout (built phase by phase — see PLAN-multiuser.md):
   config.py   Settings (env) — infra + limits

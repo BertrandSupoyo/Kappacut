@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
+import math
 import re
 import tempfile
 import uuid
@@ -12,7 +14,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import storage
@@ -28,6 +30,7 @@ from app.queue import enqueue_analyze, enqueue_render
 from app.quota import check_quota
 from app.thumbnails import ProviderError, generate_thumbnail
 
+log = logging.getLogger("kappacut.projects")
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 media_router = APIRouter(prefix="/media", tags=["media"])
 
@@ -40,6 +43,16 @@ MAX_RANGES_PER_JOB = 100
 # Ceiling on /frame.jpg?t= when the project's duration isn't known yet — one ffmpeg run
 # and one stored object per distinct second, so this can't be left open.
 MAX_FRAME_SECOND = 6 * 3600
+# render payload bounds: what the editor can produce, plus headroom
+MAX_SFX_PER_CLIP = 32
+MAX_CAPTION_LINES = 400
+MAX_TRACK_POINTS = 240                    # kappacut keeps at most TRACK_MAX_POINTS * 2
+# the values pipeline.build_ass / kappacut.cut_clip understand
+_CROP_MODES = {"crop", "fill", "cropfill"}
+_CAPTION_STYLES = {"clean", "bold", "box", "pop"}
+_CAPTION_POSITIONS = {"bottom", "center", "top"}
+_CAPTION_ANIMS = {"none", "pop", "fade", "slide", "bounce"}
+_ASPECT_RE = re.compile(r"\d{1,3}(\.\d{1,3})?[/:]\d{1,3}(\.\d{1,3})?")
 
 
 # a categories.toml table name; anything unknown there falls back to [category.general]
@@ -58,11 +71,31 @@ def analyze_payload(p: Project) -> dict | None:
     return out or None
 
 
+async def clear_stale_source(user_id: uuid.UUID, project_id: uuid.UUID, source: str) -> None:
+    """A replaced source leaves its old file and derived frames behind; tidy up, but never
+    let that block the analysis the new upload is for. Used by both upload paths."""
+    try:
+        await run_in_threadpool(storage.clear_stale_media, user_id, project_id, source)
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't clear stale media for %s", project_id, exc_info=True)
+
+
 async def _owned(project_id: uuid.UUID, user: User, session: AsyncSession) -> Project:
     p = await session.get(Project, project_id)
     if p is None or p.user_id != user.id:
         raise HTTPException(404, "project not found")
     return p
+
+
+async def _release(session: AsyncSession) -> None:
+    """Hand the request's DB connection back before a long-lived response.
+
+    A `yield` dependency is closed only once the response has finished sending, so an
+    event stream would otherwise hold its session - and a pooled connection - for up to an
+    hour: ~15 open editors exhausted the pool and every other request timed out. The
+    streams poll with their own short sessions instead.
+    """
+    await session.close()
 
 
 async def _latest_job(session: AsyncSession, project_id: uuid.UUID, kind: str) -> Job | None:
@@ -76,12 +109,109 @@ async def _latest_job(session: AsyncSession, project_id: uuid.UUID, kind: str) -
     ).scalar_one_or_none()
 
 
+def _num(v: object, lo: float, hi: float, default: float) -> float:
+    """A finite number clamped to [lo, hi]; anything else (a string, NaN, Infinity) is `default`."""
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, f)) if math.isfinite(f) else default
+
+
+def _text(v: object, limit: int) -> str:
+    return "" if v is None else str(v)[:limit]
+
+
+def _clean_lines(lines: list, length: float) -> list[dict]:
+    out = []
+    for ln in lines[:MAX_CAPTION_LINES]:
+        if not isinstance(ln, dict):
+            continue
+        words = ln.get("words") if isinstance(ln.get("words"), list) else []
+        out.append({
+            "start": _num(ln.get("start"), 0, length, 0), "end": _num(ln.get("end"), 0, length, 0),
+            "text": _text(ln.get("text"), 500),
+            "words": [{"w": _text(w.get("w"), 64), "start": _num(w.get("start"), 0, length, 0),
+                       "end": _num(w.get("end"), 0, length, 0)}
+                      for w in words[:200] if isinstance(w, dict)],
+        })
+    return out
+
+
+def _clean_range(i: int, r: object) -> dict:
+    """One range, rebuilt from the fields the renderer reads, every number clamped to the
+    range the editor offers. The raw dict used to go to the worker as sent: a caption size
+    of 100 (the slider stops at 1.6) made libass ~50x slower, and a clip could span the
+    whole video."""
+    if not isinstance(r, dict):
+        raise HTTPException(400, f"range {i}: expected an object")
+    try:
+        start, end = float(r["start"]), float(r["end"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, f"range {i}: start and end must be numbers")
+    if not (math.isfinite(start) and math.isfinite(end) and 0 <= start < end):
+        raise HTTPException(400, f"range {i}: needs 0 <= start < end")
+    length = end - start
+    if length > settings.render_max_clip_seconds:
+        raise HTTPException(400, f"clip {i + 1} is {length / 60:.1f} min long - one clip can be "
+                                 f"at most {settings.render_max_clip_seconds / 60:g} min")
+    vertical = bool(r.get("vertical"))
+    out: dict = {"start": start, "end": end, "vertical": vertical,
+                 "label": _text(r.get("label") or "clip", 200)}
+
+    crop = r.get("crop")
+    out["crop"] = None
+    if vertical and isinstance(crop, dict):
+        c = {"mode": crop.get("mode") if crop.get("mode") in _CROP_MODES else "crop",
+             "px": _num(crop.get("px"), 0, 1, 0.5), "py": _num(crop.get("py"), 0, 1, 0.5),
+             "zoom": _num(crop.get("zoom"), 1, 4, 1), "blur": _num(crop.get("blur"), 2, 80, 24)}
+        if isinstance(crop.get("aspect"), str) and _ASPECT_RE.fullmatch(crop["aspect"]):
+            c["aspect"] = crop["aspect"]
+        if isinstance(crop.get("track"), list):
+            track = [[_num(p[0], 0, 1e7, 0), _num(p[1], 0, 1, 0.5), _num(p[2], 0, 1, 0.5)]
+                     for p in crop["track"][:MAX_TRACK_POINTS]
+                     if isinstance(p, (list, tuple)) and len(p) >= 3]
+            if track:
+                c["track"] = track
+        out["crop"] = c
+
+    cap = r.get("captions")
+    out["captions"] = None
+    if isinstance(cap, dict) and cap:
+        k: dict = {
+            "style": cap.get("style") if cap.get("style") in _CAPTION_STYLES else "clean",
+            "position": cap.get("position") if cap.get("position") in _CAPTION_POSITIONS else "bottom",
+            "size": _num(cap.get("size"), 0.5, 2.5, 1.0),
+            "anim": cap.get("anim") if cap.get("anim") in _CAPTION_ANIMS else "none",
+            "karaoke": bool(cap.get("karaoke")),
+        }
+        pos = cap.get("pos")
+        if isinstance(pos, dict) and pos.get("x") is not None and pos.get("y") is not None:
+            k["pos"] = {"x": _num(pos["x"], 0, 1, 0.5), "y": _num(pos["y"], 0, 1, 0.5)}
+        if isinstance(cap.get("lines"), list) and cap["lines"]:
+            k["lines"] = _clean_lines(cap["lines"], length)
+        out["captions"] = k
+
+    color = r.get("color")
+    out["color"] = ({"preset": _text(color.get("preset") or "none", 32),
+                     "b": _num(color.get("b"), -0.4, 0.4, 0), "c": _num(color.get("c"), 0.5, 1.8, 1),
+                     "s": _num(color.get("s"), 0, 2, 1)}
+                    if isinstance(color, dict) else None)
+
+    sfx = r.get("sfx") if isinstance(r.get("sfx"), list) else []
+    out["sfx"] = [{"file": s["file"][:255], "at": _num(s.get("at"), 0, length, 0),
+                   "gain": _num(s.get("gain"), -60, 12, 0)}
+                  for s in sfx[:MAX_SFX_PER_CLIP]
+                  if isinstance(s, dict) and isinstance(s.get("file"), str) and s["file"]]
+    return out
+
+
 def _validate_ranges(raw: object) -> list[dict]:
-    """Shape-check the render payload before it reaches the queue.
+    """Shape-check the render payload before it reaches the queue, and rebuild it.
 
     The worker runs one ffmpeg process per range, minutes after the request that caused
     them has already returned 200 — so junk numbers surface as a failed job nobody can
-    trace, and an over-long list as CPU nobody authorised.
+    trace, and an over-long list or clip as CPU nobody authorised.
     """
     if not isinstance(raw, list) or not raw:
         raise HTTPException(400, "no ranges")
@@ -89,16 +219,7 @@ def _validate_ranges(raw: object) -> list[dict]:
         raise HTTPException(
             400, f"too many clips in one render ({len(raw)}; max {MAX_RANGES_PER_JOB})"
         )
-    for i, r in enumerate(raw):
-        if not isinstance(r, dict):
-            raise HTTPException(400, f"range {i}: expected an object")
-        try:
-            start, end = float(r["start"]), float(r["end"])
-        except (KeyError, TypeError, ValueError):
-            raise HTTPException(400, f"range {i}: start and end must be numbers")
-        if not 0 <= start < end:
-            raise HTTPException(400, f"range {i}: needs 0 <= start < end")
-    return raw
+    return [_clean_range(i, r) for i, r in enumerate(raw)]
 
 
 async def _guard_enqueue(session: AsyncSession, user: User) -> None:
@@ -166,33 +287,29 @@ async def list_projects(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    projects = (
-        await session.execute(
-            select(Project).where(Project.user_id == user.id).order_by(Project.created_at.desc())
-        )
-    ).scalars().all()
+    # One query. It was three per project, and each loaded the whole analysis - transcript
+    # included - only to count its clips.
+    clips = (select(func.jsonb_array_length(Analysis.clips))
+             .where(Analysis.project_id == Project.id).scalar_subquery())
+    rendered = (select(func.count()).select_from(RenderOutput)
+                .where(RenderOutput.project_id == Project.id).scalar_subquery())
+    has_edits = select(ProjectEdit.project_id).where(ProjectEdit.project_id == Project.id).exists()
+    rows = (await session.execute(
+        select(Project, clips, rendered, has_edits)
+        .where(Project.user_id == user.id).order_by(Project.created_at.desc())
+    )).all()
 
-    out = []
-    for p in projects:
-        analysis = (
-            await session.execute(select(Analysis).where(Analysis.project_id == p.id))
-        ).scalar_one_or_none()
-        rendered = await session.scalar(
-            select(func.count()).select_from(RenderOutput).where(RenderOutput.project_id == p.id)
-        )
-        edit = await session.get(ProjectEdit, p.id)
-        out.append({
-            "id": str(p.id),
-            "name": p.name,
-            "status": p.status,
-            "duration": p.duration_seconds or 0,
-            "clips": len(analysis.clips) if analysis else 0,
-            "rendered": rendered or 0,
-            "has_edits": edit is not None,
-            "created_at": p.created_at.isoformat(),
-            "last_opened_at": p.last_opened_at.isoformat() if p.last_opened_at else None,
-        })
-    return {"projects": out}
+    return {"projects": [{
+        "id": str(p.id),
+        "name": p.name,
+        "status": p.status,
+        "duration": p.duration_seconds or 0,
+        "clips": n_clips or 0,
+        "rendered": n_rendered or 0,
+        "has_edits": bool(edited),
+        "created_at": p.created_at.isoformat(),
+        "last_opened_at": p.last_opened_at.isoformat() if p.last_opened_at else None,
+    } for p, n_clips, n_rendered, edited in rows]}
 
 
 @router.get("/{project_id}")
@@ -203,6 +320,9 @@ async def get_project(
 ) -> dict:
     p = await _owned(project_id, user, session)
     p.last_opened_at = _now()
+    # opened = no longer idle: the next idle stretch earns a fresh warning (retention.py
+    # only warns projects that were never warned, so a reopened one went without it)
+    p.retention_warned_at = None
     await session.commit()
     # `p` was loaded before this commit and (expire_on_commit=False) won't auto-refresh;
     # a worker can flip status/job in the gap between this request's queries, so re-read
@@ -265,7 +385,7 @@ async def upload_source(
     # never creates an object. The write itself goes through the threadpool so a 2 GB
     # upload can't stall the event loop for every other request.
     size = 0
-    with tempfile.TemporaryDirectory(prefix="clipfinder_upload_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kappacut_upload_") as tmp:
         staged = Path(tmp) / f"source{ext}"
         with staged.open("wb") as fh:
             while chunk := await file.read(1 << 20):
@@ -274,9 +394,9 @@ async def upload_source(
                     raise HTTPException(413, "file exceeds the size limit")
                 await run_in_threadpool(fh.write, chunk)
         await check_quota(session, user, "upload", extra_bytes=size)
-        await run_in_threadpool(
-            storage.put_file, storage.source_key(user.id, p.id, ext), staged
-        )
+        source = storage.source_key(user.id, p.id, ext)
+        await run_in_threadpool(storage.put_file, source, staged)
+    await clear_stale_source(user.id, p.id, source)
 
     p.source_ext = ext
     p.source_bytes = size
@@ -301,6 +421,7 @@ async def analyze_events(
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     await _owned(project_id, user, session)
+    await _release(session)
 
     async def gen():
         last = None
@@ -380,6 +501,8 @@ async def save_edit(
     state = (body or {}).get("state")
     if not isinstance(state, dict):
         raise HTTPException(400, "bad state")
+    if len(json.dumps(state)) > settings.edit_state_max_bytes:
+        raise HTTPException(413, "editor state too large")
     edit = await session.get(ProjectEdit, project_id)
     if edit:
         edit.state = state
@@ -444,18 +567,29 @@ async def generate_clip_thumbnail(
     if not analysis or not (0 <= clip_index < len(analysis.clips)):
         raise HTTPException(404, "no such clip")
 
+    prompt = _thumbnail_prompt(analysis.clips[clip_index])
+
+    # Book the credit before the paid call, under a per-user lock. Checking first and
+    # recording after let parallel requests all pass the check before any was counted.
+    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                          {"k": f"credits:{user.id}"})
     await check_credits(session, user, "thumbnail")
+    hold = UsageEvent(user_id=user.id, project_id=p.id, kind="credit_thumbnail", quantity=1)
+    session.add(hold)
+    await session.commit()                      # also releases the lock
 
     try:
-        img = await generate_thumbnail(_thumbnail_prompt(analysis.clips[clip_index]))
-    except ProviderError as e:
-        raise HTTPException(502, f"thumbnail generation failed: {e}")
+        img = await generate_thumbnail(prompt)
+    except Exception as e:
+        await session.delete(hold)              # nothing was bought: give the credit back
+        await session.commit()
+        if isinstance(e, ProviderError):
+            raise HTTPException(502, f"thumbnail generation failed: {e}")
+        raise
 
     await run_in_threadpool(
         storage.put_bytes, storage.thumbnail_key(p.user_id, p.id, clip_index), img, "image/png"
     )
-    session.add(UsageEvent(user_id=user.id, project_id=p.id, kind="credit_thumbnail", quantity=1))
-    await session.commit()
     return {"url": f"/media/{project_id}/thumbnails/{clip_index}.png"}
 
 
@@ -466,6 +600,7 @@ async def render_events(
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
     await _owned(project_id, user, session)
+    await _release(session)
 
     async def gen():
         last = None
@@ -528,32 +663,38 @@ async def list_outputs(
 # through this process — `_owned()` is the entire access control, so it must run first
 # and a signed URL must never be built from anything the caller supplied.
 
-def _redirect(key: str) -> RedirectResponse:
-    return RedirectResponse(storage.presign_get(key), status_code=302)
+def _redirect(key: str, *, filename: str | None = None, video: bool = False) -> RedirectResponse:
+    # A <video> keeps using the URL it was redirected to for every later range request, so
+    # a video link signed for 5 minutes broke seeking mid-edit; videos get the longer TTL.
+    ttl = settings.presign_video_ttl_seconds if video else None
+    return RedirectResponse(storage.presign_get(key, ttl=ttl, filename=filename), status_code=302)
 
 
 async def _derive(key: str, src_key: str, build: list, what: str) -> None:
     """Generate a derived asset (waveform, frame) with ffmpeg and store it.
 
-    `build` is the ffmpeg argv with `{src}` and `{out}` placeholders — the source comes
-    down to a temp dir, ffmpeg runs against local files, the result goes up, and the temp
-    dir goes away. This is the only place the web process still runs ffmpeg; PLAN-v2.md
-    Phase B ("editor proxy") is where it stops doing even this.
+    `build` is the ffmpeg argv with `{src}` and `{out}` placeholders. ffmpeg reads the
+    source straight from the bucket through a signed internal URL - with `-ss` before `-i`
+    one frame costs a few range requests. It used to download the whole source first: up
+    to 2 GB through this process's disk per frame, and the review grid asks for several at
+    once. Only the small output touches a temp dir. This is the only place the web process
+    still runs ffmpeg; PLAN-v2.md Phase B ("editor proxy") is where it stops doing even this.
     """
-    import clipfinder as cf
+    import kappacut as cf
 
     def work() -> None:
-        with tempfile.TemporaryDirectory(prefix="clipfinder_derive_") as tmp:
-            root = Path(tmp)
-            src = storage.download(src_key, root / Path(src_key).name)
-            out = root / Path(key).name
-            cf.run([a.format(src=str(src), out=str(out)) for a in build])
+        with tempfile.TemporaryDirectory(prefix="kappacut_derive_") as tmp:
+            out = Path(tmp) / Path(key).name
+            src = storage.presign_internal(src_key, ttl=600)
+            cf.run([a.format(src=src, out=str(out)) for a in build])
             storage.put_file(key, out)
 
     try:
         await run_in_threadpool(work)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"{what} failed: {e}")
+    except Exception:  # noqa: BLE001
+        # logged, not returned: ffmpeg's error text can carry the signed source URL
+        log.exception("%s failed for %s", what, src_key)
+        raise HTTPException(500, f"couldn't make the {what}")
 
 
 @media_router.get("/{project_id}/source")
@@ -566,7 +707,7 @@ async def media_source(
     src = await run_in_threadpool(storage.find_source, p.user_id, p.id)
     if not src:
         raise HTTPException(404, "no source")
-    return _redirect(src)
+    return _redirect(src, video=True)
 
 
 @media_router.get("/{project_id}/waveform.png")
@@ -575,7 +716,7 @@ async def media_waveform(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ):
-    import clipfinder as cf
+    import kappacut as cf
 
     p = await _owned(project_id, user, session)
     key = storage.waveform_key(p.user_id, p.id)
@@ -598,13 +739,13 @@ async def media_frame(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ):
-    import clipfinder as cf
+    import kappacut as cf
 
     p = await _owned(project_id, user, session)
     # clamp to the known duration: `t` is caller-supplied and every miss costs an ffmpeg
     # run plus a stored object, so an unbounded value is an unbounded bill
     limit = int(p.duration_seconds or 0) or MAX_FRAME_SECOND
-    sec = max(0, min(int(t), limit))
+    sec = max(0, min(int(t), limit)) if math.isfinite(t) else 0   # int(nan) raised: a 500
     key = storage.frame_key(p.user_id, p.id, sec)
     if not await run_in_threadpool(storage.exists, key):
         src = await run_in_threadpool(storage.find_source, p.user_id, p.id)
@@ -635,6 +776,7 @@ async def media_thumbnail(
 async def media_clip(
     project_id: uuid.UUID,
     name: str,
+    download: bool = False,
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ):
@@ -645,4 +787,6 @@ async def media_clip(
         raise HTTPException(400, "bad name")
     if not await run_in_threadpool(storage.exists, key):
         raise HTTPException(404, "no clip")
-    return _redirect(key)
+    # <a download> is ignored once the redirect leaves this origin, so the "↓" link opened
+    # the video instead of saving it; the bucket's Content-Disposition makes it a download
+    return _redirect(key, filename=name if download else None, video=True)

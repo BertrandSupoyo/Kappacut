@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ.setdefault("S3_ENDPOINT_URL", "http://minio:9000")
-os.environ.setdefault("S3_BUCKET", "clipfinder-test")
+os.environ.setdefault("S3_BUCKET", "kappacut-test")
 os.environ.setdefault("S3_ACCESS_KEY_ID", "testkey")
 os.environ.setdefault("S3_SECRET_ACCESS_KEY", "testsecret")
 os.environ.setdefault("S3_REGION", "auto")
@@ -130,6 +130,21 @@ def test_presigned_url_never_contains_the_secret_key():
 def test_download_filename_is_validated_not_interpolated():
     # would otherwise break out of the Content-Disposition header
     _rejects(storage.presign_get, storage.clip_key(U, P, "x.mp4"), filename='"; rm -rf /')
+
+
+def test_a_new_source_clears_the_old_one_and_its_frames_but_not_the_clips():
+    pre = storage.project_prefix(U, P)
+    listing = [pre + n for n in ("source.mkv", "source.mp4", "waveform.png", "frames/12.jpg",
+                                 "clips/01_a.mp4", "thumbnails/0.png")]
+    deleted: list[str] = []
+    real = storage.list_prefix, storage._delete_keys
+    storage.list_prefix = lambda prefix: [{"Key": k} for k in listing if k.startswith(prefix)]
+    storage._delete_keys = lambda keys: deleted.extend(keys) or len(deleted)
+    try:
+        storage.clear_stale_media(U, P, keep_source=pre + "source.mp4")
+    finally:
+        storage.list_prefix, storage._delete_keys = real
+    assert sorted(deleted) == sorted(pre + n for n in ("source.mkv", "waveform.png", "frames/12.jpg"))
 
 
 if __name__ == "__main__":

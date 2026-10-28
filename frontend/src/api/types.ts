@@ -39,11 +39,13 @@ export interface Clip {
   quote: string;
   score: number;
   beat_type?: string;
+  /** what the opening line does: claim | question | conflict | reveal | reaction | confession | story | none */
+  hook_type?: string;
   hook_line?: string;
   payoff_line?: string;
   duration?: number;
   auto?: Record<string, unknown>;
-  /** 0-100, built from `breakdown` (see clipfinder.score_breakdown) */
+  /** 0-100, built from `breakdown` (see kappacut.score_breakdown) */
   virality?: number;
   breakdown?: ScoreBreakdown;
   /** median face centre (0-1 of the frame) when one shows in most sampled frames */
@@ -55,6 +57,8 @@ export interface ScoreBreakdown {
   hook: number;
   story: number;
   energy: number;
+  /** the first seconds as heard; absent on analyses made before it existed */
+  opening?: number;
   clarity: number;
   pacing: number;
 }

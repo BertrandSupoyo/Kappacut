@@ -6,7 +6,7 @@ import type { ProjectDetail, SfxItem } from "@/api/types";
 import { useToast } from "@/components/Toast";
 import { useSSE } from "@/lib/sse";
 import { fmtDuration } from "@/lib/format";
-import { useEditor } from "@/editor/store";
+import { flushSave, useEditor } from "@/editor/store";
 import { Player } from "@/editor/Player";
 import { Timeline } from "@/editor/Timeline";
 import { ClipRail, StageHeader } from "@/editor/ClipList";
@@ -43,7 +43,12 @@ export function Editor() {
     queryKey: ["edit", id],
     queryFn: () => jget<{ state: unknown }>(`/api/projects/${id}/edit`),
     enabled: project?.status === "ready",
+    // never re-open the editor from a cached copy: it predates whatever was saved since,
+    // and the next autosave would write that older state back over the newer one
+    gcTime: 0,
   });
+  // a save still waiting on its debounce goes out before the editor leaves this project
+  useEffect(() => () => flushSave(), [id]);
   const { data: sfxData } = useQuery({
     queryKey: ["sfx"],
     queryFn: () => jget<{ sfx: SfxItem[] }>("/api/sfx"),
@@ -77,6 +82,11 @@ export function Editor() {
 
   const analyzing = project ? ["queued", "analyzing", "uploading"].includes(project.status) : false;
   const analyzeSSE = useSSE<{ pct: number; msg: string }>(`/api/projects/${id}/analyze/events`, analyzing);
+  // the project query polls every 2.5s while analyzing; use its job as a floor so the bar
+  // still moves if the event stream is down
+  const liveJob = project?.job?.status === "queued" || project?.job?.status === "running" ? project.job : null;
+  const analyzePct = Math.max(analyzeSSE?.pct ?? 0, liveJob?.pct ?? 0);
+  const analyzeMsg = (analyzeSSE?.pct ?? 0) >= (liveJob?.pct ?? 0) ? analyzeSSE?.msg : liveJob?.msg;
 
   const initEditor = useEditor((s) => s.init);
   const ready = project?.status === "ready" && project.analysis && edit !== undefined;
@@ -147,11 +157,11 @@ export function Editor() {
       {analyzing && (
         <div className="glass" style={{ padding: "var(--sp-5)" }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: "var(--fs-sm)", marginBottom: 10 }}>
-            <span>{analyzeSSE?.msg || "Getting started…"}</span>
-            <span className="muted">{analyzeSSE?.pct ?? 0}%</span>
+            <span>{analyzeMsg || "Getting started…"}</span>
+            <span className="muted">{analyzePct}%</span>
           </div>
           <div style={{ height: 5, background: "var(--sub-bg)", borderRadius: 99, overflow: "hidden" }}>
-            <div style={{ width: `${analyzeSSE?.pct ?? 0}%`, height: "100%", background: "var(--accent)", transition: "width .3s" }} />
+            <div style={{ width: `${analyzePct}%`, height: "100%", background: "var(--accent)", transition: "width .3s" }} />
           </div>
         </div>
       )}

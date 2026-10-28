@@ -1,4 +1,4 @@
-# clipfinder
+# Kappacut
 
 Find short-form clips in long videos — transcribe with Groq Whisper, pick the best
 moments with an LLM (Groq free tier by default, Claude optionally), then reframe,
@@ -8,16 +8,40 @@ caption, color-grade and render them. Self-hosted, multi-user, open signup.
 
 FastAPI (`app/`) + async SQLAlchemy + Postgres + Redis + an `arq` worker + a React/Vite
 frontend (`frontend/`), served behind Caddy with resumable uploads via `tusd`. Everything
-runs as one Docker Compose stack (`compose.yaml`). The core engine (`clipfinder.py`,
-wrapped by `pipeline.py`) is unchanged from clipfinder's original single-user design —
+runs as one Docker Compose stack (`compose.yaml`). The core engine (`kappacut.py`,
+wrapped by `pipeline.py`) is unchanged from Kappacut's original single-user design —
 the app around it handles accounts, quotas, job queuing and multi-tenant storage.
 
-- `clipfinder.py` — transcribe, pick clips (Groq or Claude), verify/refine, cut, caption
+- `kappacut.py` — transcribe, pick clips (Groq or Claude), verify/refine, cut, caption
 - `pipeline.py` — thin `analyze()`/`render()` wrapper the web app calls
 - `app/` — FastAPI app: auth (cookie-based, fastapi-users), projects/jobs/editor routes,
   quotas, the credit ledger, AI thumbnails, the arq worker
 - `frontend/` — the SPA: project list, upload, the clip editor, render panel
 - `alembic/` — DB migrations
+
+## The clip-picking model
+
+The default since 2026-10-25, set in `kappacut.toml` `[picker]` and mirrored in
+`kappacut.py` `DEFAULTS`:
+
+| Step | Model | Why |
+|---|---|---|
+| Genre detection | `openai/gpt-oss-20b` | one small classification call |
+| Picking (one call per ~4-min transcript window) | `gpt-oss-20b` and `gpt-oss-120b`, alternating | Groq limits each model separately, so picking gets both models' per-minute and daily budgets; if one model's daily cap is spent, the rest of the video finishes on the other |
+| Judging + ranking | `openai/gpt-oss-120b`, `reasoning_effort = "low"` | one call that re-scores every candidate together, so mixed pickers still rank as one pool; falls back to 20b if 120b's daily cap is spent |
+
+Measured on the dev stack (paid Groq key, two stored videos, 25 calls, $0.058 total):
+
+- **Speed:** an 8-min video analyses in 22.8 s end to end (was ~2.9 min on the free key with a
+  20b-only picker). Picking a 19-min video takes ~12 s; the judge call 5–8 s.
+- **Cost:** ~$0.055 per hour of video — ~$0.04 Whisper + ~$0.015 picking and judging.
+- **Judge effort:** low beat medium. Medium used ~3× the output tokens, took 2–4× longer, broke
+  more often (2 of 6 runs vs 1 of 6) and agreed with low on 67–83% of clips, so it bought no
+  visible difference.
+
+Before changing models, prompts or effort, re-run the same test — `tests/model_bench.py`, on
+stored transcripts, so no Whisper cost; about $0.03 per video, hard spend cap — and keep the
+change only if it wins. The run command is in the file's docstring.
 
 ## Running it
 
@@ -50,10 +74,10 @@ ffmpeg  -> cut each clip
 ```
 
 ```powershell
-python clipfinder.py path\to\video.mp4
-python clipfinder.py path\to\folder --n 8
-python clipfinder.py video.mp4 --taste "chaotic reactions, quotable lines; skip slow talking" --vertical --picker claude
-python clipfinder.py video.mp4 --dry-run   # just see the picks, don't cut
+python kappacut.py path\to\video.mp4
+python kappacut.py path\to\folder --n 8
+python kappacut.py video.mp4 --taste "chaotic reactions, quotable lines; skip slow talking" --vertical --picker claude
+python kappacut.py video.mp4 --dry-run   # just see the picks, don't cut
 ```
 
 | flag | effect |

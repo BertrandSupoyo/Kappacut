@@ -1,7 +1,7 @@
-name: clipfinder
+name: kappacut
 
 x-app-env: &app-env
-  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-clipfinder}:${POSTGRES_PASSWORD:-clipfinder}@postgres:5432/${POSTGRES_DB:-clipfinder}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kappacut}:${POSTGRES_PASSWORD:-kappacut}@postgres:5432/${POSTGRES_DB:-kappacut}
   REDIS_URL: redis://redis:6379/0
   WEB_DIR: /srv/web
   # All media lives in the bucket (PLAN-v2.md Phase A). MEDIA_ROOT survives only for the
@@ -33,14 +33,14 @@ services:
   postgres:
     image: postgres:18-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-clipfinder}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clipfinder}
-      POSTGRES_DB: ${POSTGRES_DB:-clipfinder}
+      POSTGRES_USER: ${POSTGRES_USER:-kappacut}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kappacut}
+      POSTGRES_DB: ${POSTGRES_DB:-kappacut}
     volumes:
       # Postgres 18+ images want the mount one level up (data goes in a version subdir).
       - pgdata:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clipfinder} -d ${POSTGRES_DB:-clipfinder}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kappacut} -d ${POSTGRES_DB:-kappacut}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -127,21 +127,30 @@ services:
   backup:
     image: postgres:18-alpine
     environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-clipfinder}
-      PGUSER: ${POSTGRES_USER:-clipfinder}
-      PGDATABASE: ${POSTGRES_DB:-clipfinder}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-kappacut}
+      PGUSER: ${POSTGRES_USER:-kappacut}
+      PGDATABASE: ${POSTGRES_DB:-kappacut}
       PGHOST: postgres
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
     entrypoint:
       - sh
       - -c
+      # pipefail: without it the pipeline's status is gzip's, so a failed pg_dump still left
+      # a small valid .gz, never said "dump failed", and the rotation below deleted a good
+      # backup for it - a week of failures and none were left. A dump only counts (and only
+      # rotates the old ones out) once it has fully succeeded.
       - |
-        set -e
+        set -eo pipefail
         while true; do
-          f="/backups/clipfinder-$$(date -u +%Y%m%d-%H%M%S).sql.gz"
+          f="/backups/kappacut-$$(date -u +%Y%m%d-%H%M%S).sql.gz"
           echo "dumping -> $$f"
-          pg_dump --no-owner --no-privileges | gzip -6 > "$$f" || echo "dump failed"
-          ls -1t /backups/clipfinder-*.sql.gz 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+          if pg_dump --no-owner --no-privileges | gzip -6 > "$$f.partial"; then
+            mv "$$f.partial" "$$f"
+            ls -1t /backups/kappacut-*.sql.gz 2>/dev/null | tail -n +$$((BACKUP_KEEP+1)) | xargs -r rm -f
+          else
+            echo "dump failed - keeping the existing backups"
+            rm -f "$$f.partial"
+          fi
           sleep 86400
         done
     volumes:
@@ -167,7 +176,10 @@ services:
       - -s3-endpoint=${S3_ENDPOINT_URL}
       - -s3-object-prefix=uploads/
       - -s3-part-size=52428800
-      - -max-size=2147483648
+      # the same variable app/config.py's quota_max_upload_bytes reads, so raising the limit
+      # in .env raises it here too (Caddyfile's request_body cap is per request, i.e. per
+      # 8 MB tus chunk, so it doesn't bound the file)
+      - -max-size=${QUOTA_MAX_UPLOAD_BYTES:-2147483648}
       - -hooks-http=http://web:8000/api/upload/hooks
       - -hooks-http-forward-headers=Cookie,Authorization
       - -hooks-enabled-events=pre-create,post-finish,post-terminate

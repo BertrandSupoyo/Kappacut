@@ -1,4 +1,4 @@
-"""User model — fastapi-users' UUID base table plus clipfinder columns."""
+"""User model — fastapi-users' UUID base table plus Kappacut columns."""
 from __future__ import annotations
 
 import datetime as dt

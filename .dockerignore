@@ -9,8 +9,8 @@ __pycache__/
 .claude/
 *.dc.html
 canvas.json
-clipfinder-web-app.html
-clipfinder-editor-v2/
+kappacut-web-app.html
+kappacut-editor-v2/
 PLAN*.md
 DEPLOY.md
 README.md

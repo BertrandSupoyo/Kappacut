@@ -32,7 +32,7 @@ from app.uploads import router as uploads_router
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    import clipfinder as cf
+    import kappacut as cf
 
     settings.check_production_ready()   # dev secrets / insecure cookies never reach a public deploy
     # No media staging dir any more: tusd writes straight to the bucket and this process

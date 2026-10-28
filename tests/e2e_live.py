@@ -7,7 +7,7 @@ projects named pathcheck-* / and deletes them at the end, success or not.
 Run it inside the web container, pointing it at any READY project whose video it may cut a
 60-second test clip from (that project itself is only read, never changed):
 
-    docker exec -i -e E2E_SOURCE_PROJECT=<project uuid> clipfinder-web-1 \
+    docker exec -i -e E2E_SOURCE_PROJECT=<project uuid> kappacut-web-1 \
         python - < tests/e2e_live.py
 
 Exit code 0 = every check passed.
@@ -90,7 +90,8 @@ try:
 
     # upload -> hook -> analyze -> auto render
     r = c.post("/api/projects", json={"filename": "pathcheck-auto.mp4", "taste": "3 clips.", "auto_render": True})
-    pid = r.json()["id"]; created.append(pid)
+    pid = r.json()["id"]
+    created.append(pid)
     ok("create project (status uploading)", c.get(f"/api/projects/{pid}").json()["status"] == "uploading")
     code, n = tus_upload(pid, "/tmp/e2e.mp4", "pathcheck-auto.mp4")
     ok("tus upload via Caddy -> tusd", code == 204, f"{n} bytes")
@@ -117,7 +118,8 @@ try:
            "color": {"preset": "punchy", "b": -0.2, "c": 1, "s": 1}, "sfx": [{"file": "whoosh.m4a", "at": 0, "gain": -3}]}
     ok("manual render accepted", c.post(f"/api/projects/{pid}/render", json={"ranges": [rng]}).status_code == 200)
     ok("second job refused while one runs (429)", c.post(f"/api/projects/{pid}/render", json={"ranges": [rng]}).status_code == 429)
-    bid = c.post("/api/projects", json={"filename": "pathcheck-busy.mp4"}).json()["id"]; created.append(bid)
+    bid = c.post("/api/projects", json={"filename": "pathcheck-busy.mp4"}).json()["id"]
+    created.append(bid)
     code, _ = tus_upload(bid, "/tmp/e2e.mp4", "pathcheck-busy.mp4")
     ok("upload refused at pre-create while busy", code != 204, f"HTTP {code}")
     rl = (sse(f"/api/projects/{pid}/render/events") or [{}])[-1]

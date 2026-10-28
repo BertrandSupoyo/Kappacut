@@ -20,11 +20,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("GROQ_API_KEY", "test-not-used")           # groq.Groq() needs one to construct
-for k, v in {"S3_ENDPOINT_URL": "http://minio:9000", "S3_BUCKET": "clipfinder-test",
+for k, v in {"S3_ENDPOINT_URL": "http://minio:9000", "S3_BUCKET": "kappacut-test",
              "S3_ACCESS_KEY_ID": "testkey", "S3_SECRET_ACCESS_KEY": "testsecret"}.items():
     os.environ.setdefault(k, v)
 
-import clipfinder as cf  # noqa: E402
+import kappacut as cf  # noqa: E402
 import pipeline  # noqa: E402
 
 
@@ -249,7 +249,144 @@ def test_score_is_0_to_100_and_rank_moves_it():
     best._rank_pct, worst._rank_pct = 1.0, 0.0
     b, w = cf.score_breakdown(best, segs, None), cf.score_breakdown(worst, segs, None)
     assert 0 <= w["total"] < b["total"] <= 100
-    assert set(b) == {"total", "hook", "story", "energy", "clarity", "pacing"}
+    assert set(b) == {"total", "hook", "story", "energy", "opening", "clarity", "pacing"}
+
+
+# --------------------------------------------------------------- the opening (hook-first)
+
+def test_filler_first_lines_are_cut_from_the_start():
+    segs = [_seg(0, 1.5, "Okay so."), _seg(1.6, 2.4, "Um, alright."),
+            _seg(2.5, 9, "This is the worst burger I have ever eaten"), _seg(9, 25, "words " * 30)]
+    c = _clip(0, 25)
+    cf._trim_weak_open(c, segs, _cfg())
+    assert abs(c.start_seconds - (2.5 - 0.4)) < 1e-6, c.start_seconds
+
+
+def test_a_real_first_line_and_a_reaction_are_left_alone():
+    for first in ("So I quit my job yesterday", "Oh!", "Ohhh no"):
+        segs = [_seg(0, 2, first), _seg(2, 20, "words " * 30)]
+        c = _clip(0, 20)
+        cf._trim_weak_open(c, segs, _cfg())
+        assert c.start_seconds == 0, (first, c.start_seconds)
+
+
+def test_filler_is_never_trimmed_down_to_nothing():
+    segs = [_seg(0, 1, "Okay."), _seg(1, 2, "Yeah.")]
+    c = _clip(0, 2)
+    cf._trim_weak_open(c, segs, _cfg())
+    assert c.start_seconds < 1.0                       # the last spoken line always stays
+
+
+def test_dead_air_at_the_start_scores_a_weaker_opening():
+    talk = " ".join(["word"] * 60)
+    prompt_clip, slow_clip = _clip(0, 20), _clip(0, 20)
+    prompt_segs = [_seg(0, 20, talk)]
+    slow_segs = [_seg(3.5, 20, talk)]                  # 3.5 s before anyone speaks
+    fast = cf.score_breakdown(prompt_clip, prompt_segs, None)
+    slow = cf.score_breakdown(slow_clip, slow_segs, None)
+    assert fast["opening"] > slow["opening"] + 0.3, (fast, slow)
+    assert fast["total"] > slow["total"]
+
+
+def test_a_loud_opening_beats_a_quiet_one_but_less_for_podcasts():
+    segs = [_seg(0, 20, " ".join(["word"] * 60))]
+    loud = [-40.0] * 60
+    quiet_start, loud_start = list(loud), list(loud)
+    for i in range(0, 4):
+        loud_start[i] = -18.0
+    c = _clip(0, 20)
+    hi, lo = cf.score_breakdown(c, segs, loud_start), cf.score_breakdown(c, segs, quiet_start)
+    assert hi["opening"] > lo["opening"]
+    hi_p, lo_p = (cf.score_breakdown(c, segs, x, energy_weight=0.3) for x in (loud_start, quiet_start))
+    assert hi_p["opening"] - lo_p["opening"] < hi["opening"] - lo["opening"]
+
+
+def test_arousal_raises_story_when_the_judge_rates_it():
+    segs = [_seg(0, 20, " ".join(["word"] * 50))]
+    calm, hot = _clip(0, 20), _clip(0, 20)
+    base = {"hook": 2, "arc": 2, "quote": 1, "standalone": 1, "trend": 1}
+    calm.arc, hot.arc = dict(base, arousal=0), dict(base, arousal=2)
+    assert cf.score_breakdown(hot, segs, None)["story"] > cf.score_breakdown(calm, segs, None)["story"]
+
+
+def _good_verdicts(n=6):
+    return [{"index": i, "keep": True, "hook": 3 - i % 3, "arc": 2, "quote": 1, "standalone": 2,
+             "trend": 1, "arousal": 1, "rank": i + 1, "beat_type": "quote", "hook_type": "claim",
+             "hook_line": f"line {i} of the clip", "payoff_line": f"payoff {i} of the clip"} for i in range(n)]
+
+
+def test_a_verdict_copied_from_the_example_loses_its_lines_and_labels():
+    vs = _good_verdicts()
+    vs[3].update(hook_line="anyway so my chair broke yesterday",
+                 payoff_line="chat is DYING I can't breathe", beat_type="fail", hook_type="story")
+    out = _verify(vs, count=6)
+    assert not any("chair broke" in c.hook_line or c.beat_type == "fail" for c in out), \
+        [(c.hook_line, c.beat_type) for c in out]
+
+
+def test_a_reply_rejecting_almost_everything_is_retried_then_not_trusted():
+    calls = []
+    broken = [dict(v, keep=(i == 0), reason="no payoff" if i else "") for i, v in enumerate(_good_verdicts())]
+
+    def judge(*a, **k):
+        calls.append(1)
+        return _scripted(broken)()
+    out = _verify(judge, count=4)
+    assert len(calls) == 2, calls                       # asked once more
+    assert len(out) >= 3, len(out)                      # mass rejections didn't empty the list
+
+
+def test_a_broken_first_reply_is_replaced_by_a_good_second_one():
+    replies = [_scripted([dict(v, keep=False, reason="x") for v in _good_verdicts()]),
+               _scripted(_good_verdicts())]
+    out = _verify(lambda *a, **k: replies.pop(0)(), count=4)
+    assert not replies and len(out) == 4, len(out)
+
+
+def test_a_reply_that_echoes_the_example_everywhere_is_not_trusted_to_reject():
+    calls = []
+    echo = [dict(v, hook_line="anyway so my chair broke yesterday", keep=(i % 2 == 0),
+                 reason="" if i % 2 == 0 else "weak") for i, v in enumerate(_good_verdicts())]
+
+    def judge(*a, **k):
+        calls.append(1)
+        return _scripted(echo)()
+    out = _verify(judge, count=6)
+    assert len(calls) == 2                              # retried
+    assert len(out) == 6, len(out)                      # its rejections were ignored
+
+
+def test_a_reply_still_broken_after_the_retry_is_not_trusted_for_scores_either():
+    # seen live: 5 of 6 rejected with zero scores, twice; keeping its numbers sank good clips
+    # under the floor and a 19-minute video came back with 1 clip
+    broken = [dict(v, keep=(i == 0), hook=0, arc=0, quote=0, standalone=0, trend=0,
+                   reason="" if i == 0 else "no payoff") for i, v in enumerate(_good_verdicts())]
+    out = _verify(broken, count=6)
+    assert len(out) == 6, len(out)
+    assert all(c.arc == {} for c in out)               # stage-1 ranking: none of its scores used
+
+
+def test_a_placeholder_beat_type_is_not_shown():
+    vs = _good_verdicts()
+    for v in vs:
+        v["beat_type"] = "<reaction|fail|bit|story|quote|hot_take|argument|reveal|wholesome|moment>"
+    out = _verify(vs, count=6)
+    assert all(c.beat_type == "moment" for c in out), [c.beat_type for c in out]
+
+
+def test_subscription_talk_is_not_a_call_to_action():
+    assert not cf._is_cta("They charged my subscription twice")
+    assert cf._is_cta("Don't forget to subscribe")
+    assert cf._is_cta("thanks to everyone who subscribed")
+
+
+def test_verify_keeps_hook_type_and_arousal():
+    verdicts = [{"index": i, "keep": True, "hook": 3 - i % 3, "arc": 2, "quote": 1, "standalone": 2,
+                 "trend": 1, "arousal": i % 3, "rank": i + 1, "hook_type": "Question",
+                 "beat_type": "hot_take"} for i in range(6)]
+    out = _verify(verdicts)
+    assert out and all(c.hook_type == "question" for c in out), [c.hook_type for c in out]
+    assert all("arousal" in c.arc for c in out)
 
 
 # --------------------------------------------------------------- verify step (scripted model)
@@ -693,6 +830,31 @@ def test_judge_quota_spent_falls_back_to_the_picker_model():
     assert all(c._rank_pct is not None for c in out)              # verdicts were applied
 
 
+def test_pick_windows_rotate_and_drop_a_spent_model():
+    pick = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(
+        {"clips": [{"start_seconds": 10, "end_seconds": 30, "title": "t", "score": 7}]})),
+        finish_reason="stop")])
+    used, spent = [], {"openai/gpt-oss-120b": 1}     # 120b answers once, then its daily cap is gone
+
+    def chat(client, model, prompt, temp, effort="low"):
+        used.append(model)
+        if model in spent:
+            spent[model] -= 1
+            if spent[model] < 0:
+                raise cf.GroqQuotaError(model, 3600)
+        return pick
+    segs = [_seg(i * 20, i * 20 + 18, " ".join(["word"] * 30)) for i in range(50)]   # ~4 windows
+    pool = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    real, cf._groq_chat = cf._groq_chat, chat
+    try:
+        cf._find_clips_groq(segs, _cfg(groq_pick_models=pool), None)
+    finally:
+        cf._groq_chat = real
+    assert used[:2] == pool                                        # windows alternate
+    assert used[2:4] == ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+    assert set(used[4:]) == {"openai/gpt-oss-20b"}                 # spent 120b dropped, never re-tried
+
+
 def test_groq_budget_is_kept_per_model():
     from app import groq_gate
     seen = []
@@ -705,6 +867,58 @@ def test_groq_budget_is_kept_per_model():
     finally:
         groq_gate._r = real
     assert seen[0] != seen[1] and "gpt-oss-20b" in seen[0] and "gpt-oss-120b" in seen[1]
+
+
+def test_slugs_are_ascii_so_they_can_name_a_bucket_object():
+    import uuid
+    from app import storage
+    assert cf.slugify("Pokémon rage quit") == "pokemon-rage-quit"
+    assert cf.slugify("Zoë loses it") == "zoe-loses-it"
+    assert cf.slugify("日本語 moment") == "moment"
+    for label in ("Pokémon rage quit", "日本語", "_whoosh", "--- !!! ---", "", "a" * 80 + " b"):
+        slug = cf.slugify(label)
+        storage.clip_key(uuid.uuid4(), uuid.uuid4(), f"01_{slug}_cc.mp4")   # raises if unsafe
+        storage.user_sfx_key(uuid.uuid4(), f"{slug}.mp3")                    # sfx: slug comes first
+
+
+def test_a_non_numeric_judge_score_does_not_fail_the_analysis():
+    verdicts = [{"index": i, "keep": True, "hook": "high" if i == 0 else 2, "arc": "2/3" if i == 1 else 2,
+                 "quote": None, "standalone": float("nan") if i == 2 else 1, "trend": 1,
+                 "rank": i + 1, "reason": 5} for i in range(6)]
+    out = _verify(verdicts)
+    assert out                                          # it used to raise ValueError: 'high'
+
+
+def test_a_cancelled_job_stops_its_running_processes():
+    import threading
+    import time
+    seen = {}
+
+    def work():
+        with cf.proc_scope("test-cancel"):
+            try:
+                cf.run([sys.executable, "-c", "import time; time.sleep(60)"])
+            except cf.Cancelled:
+                seen["cancelled"] = True
+            try:                                        # and nothing new starts after it
+                cf.run([sys.executable, "-c", "pass"])
+            except cf.Cancelled:
+                seen["refused"] = True
+
+    t0 = time.monotonic()
+    t = threading.Thread(target=work)
+    t.start()
+    for _ in range(200):                                # wait for the process to register
+        if cf._PROCS.get("test-cancel"):
+            break
+        time.sleep(0.05)
+    cf.cancel_scope("test-cancel")
+    t.join(20)
+    assert not t.is_alive() and time.monotonic() - t0 < 20
+    assert seen == {"cancelled": True, "refused": True}, seen
+    assert "test-cancel" not in cf._CANCELLED and "test-cancel" not in cf._ACTIVE_SCOPES
+    cf.cancel_scope("test-cancel")                      # after the scope ended: a no-op
+    assert "test-cancel" not in cf._CANCELLED
 
 
 if __name__ == "__main__":

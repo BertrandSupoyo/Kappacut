@@ -27,13 +27,13 @@ BUILTIN_NAMES = tuple(_SYNTH)
 def synth_builtins() -> None:
     """Idempotent: anything already in the bucket is left alone, so this stays cheap to
     call on every worker start."""
-    import clipfinder as cf
+    import kappacut as cf
 
     missing = {n: a for n, a in _SYNTH.items()
                if not storage.exists(storage.builtin_sfx_key(f"{n}.m4a"))}
     if not missing:
         return
-    with tempfile.TemporaryDirectory(prefix="clipfinder_sfx_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="kappacut_sfx_") as tmp:
         for name, args in missing.items():
             f = Path(tmp) / f"{name}.m4a"
             try:

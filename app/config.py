@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # --- core infra -------------------------------------------------------
-    database_url: str = "postgresql+asyncpg://clipfinder:clipfinder@localhost:5432/clipfinder"
+    database_url: str = "postgresql+asyncpg://kappacut:kappacut@localhost:5432/kappacut"
     redis_url: str = "redis://localhost:6379/0"
 
     # --- object storage (Phase A) ---------------------------------------
@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     s3_public_endpoint_url: str = ""
     # how long a presigned media URL stays valid; short, because it is handed to a browser
     presign_ttl_seconds: int = 300
+    # ...except for video (the source and rendered clips): a <video> element keeps seeking
+    # with the URL it was first redirected to, so it has to outlast an editing session
+    presign_video_ttl_seconds: int = 6 * 3600
 
     # Only still used by the one-shot volume->bucket migration in app/cli.py, and as the
     # disk-space check's mount point. No media is read from or written to it at runtime.
@@ -65,9 +68,9 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from: str = "Kappacut <no-reply@localhost>"
-    smtp_tls: bool = False
+    smtp_tls: bool = False          # implicit TLS (465); otherwise STARTTLS when offered (587)
 
-    # --- engine keys (already read by clipfinder.py via os.environ) -----
+    # --- engine keys (already read by kappacut.py via os.environ) -----
     groq_api_key: str = ""
     anthropic_api_key: str = ""
 
@@ -84,6 +87,8 @@ class Settings(BaseSettings):
     quota_renders_per_day: int = 40
     quota_concurrent_jobs: int = 1
     quota_projects: int = 25
+    quota_sfx_files: int = 50                 # uploaded sound effects per user (bytes count as storage)
+    edit_state_max_bytes: int = 2 * 1024**2   # one project's saved editor state, as JSON
     global_rate_limit_per_min: int = 120
 
     # --- generic credit ledger (app/credits.py) — gates any FUTURE paid-API generative
@@ -100,6 +105,16 @@ class Settings(BaseSettings):
     # each other for it — set this so worker_concurrency * ffmpeg_threads ~= vCPU count and
     # every concurrent render gets an equal, predictable share instead of degrading under load.
     ffmpeg_threads: int = 0
+    # A render is split into one queue task per clip so several workers can cut it at once.
+    # This caps how many of ONE render's clips are in flight, so a 50-clip render can't
+    # take every worker slot and stall everyone else's analyses behind it.
+    render_parallel: int = 3
+    # Longest single clip a render may cut. The editor's trim handles can stretch a clip to
+    # the whole video; without a cap one "clip" could be an hours-long encode.
+    render_max_clip_seconds: int = 600
+    # Sources up to this size are downloaded whole by each clip task; bigger ones are read
+    # by ffmpeg straight from the bucket with range requests (only the cut part travels).
+    render_local_source_max_bytes: int = 256 * 1024**2
     max_global_queue: int = 40
     job_timeout_seconds: int = 3600
     groq_tokens_per_minute: int = 8000       # shared-key TPM budget (free tier)

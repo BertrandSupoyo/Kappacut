@@ -4,7 +4,8 @@ from __future__ import annotations
 import datetime as dt
 import uuid
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String,
+                        Text, UniqueConstraint, func)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -35,6 +36,9 @@ class Job(Base):
     stage: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     arq_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # which worker process took it (app.worker heartbeat key); lets a starting worker tell
+    # its dead predecessor's jobs from ones a live sibling is still running
+    worker_id: Mapped[str | None] = mapped_column(String(96), nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(
@@ -46,6 +50,11 @@ class Job(Base):
 
 class RenderOutput(Base):
     __tablename__ = "render_outputs"
+    # One row per stored file. A re-render writes the same object key again, and a second
+    # row for it counted its bytes against the storage quota twice.
+    __table_args__ = (
+        UniqueConstraint("project_id", "filename", name="uq_render_outputs_project_filename"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id: Mapped[uuid.UUID] = mapped_column(

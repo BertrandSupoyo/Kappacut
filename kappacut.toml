@@ -1,9 +1,13 @@
-# clipfinder configuration.  CLI flags override anything set here.
+# Kappacut engine configuration.  CLI flags override anything set here.
 
 [picker]
+# The clip-picking model, 2026-10-25 (README "The clip-picking model"): 20b/120b alternate on
+# picking, one 120b judge at low effort re-ranks. Re-run the model test before changing it.
 backend      = "groq"                    # "groq" (free) | "claude" (better, needs ANTHROPIC_API_KEY)
-groq_model   = "openai/gpt-oss-20b"      # picks the moments: fast; 120b gave no better clip lengths
+groq_model   = "openai/gpt-oss-20b"      # genre detection, and the fallback when a pick pool is spent
+groq_pick_models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]  # windows alternate: two TPM + daily budgets
 groq_verify_model = "openai/gpt-oss-120b" # judges + ranks them: one call, and 120b's scores were stable run-to-run
+groq_verify_effort = "low"               # judge reasoning: "low" | "medium" (test before switching)
 claude_model = "claude-opus-5"           # or "claude-sonnet-5" / "claude-haiku-4-5"
 temperature  = 0.3                       # 0 = most consistent between runs, higher = more variety
 
@@ -29,8 +33,3 @@ coherence_check       = true            # 1 extra LLM call: drop clips whose tra
 vertical = false                        # true = also render a 1080x1920 centre crop
 loudnorm = true                         # normalize every rendered clip to -14 LUFS (the socials target)
 vision   = false                        # true = Claude scores one frame per clip (needs ANTHROPIC_API_KEY)
-
-[source]
-# extra folders the web app's "pick from this machine" browser scans
-# (Downloads / Videos / Movies / Desktop are always included)
-folders = ['C:\Users\leosa\Downloads\Video\streamer']

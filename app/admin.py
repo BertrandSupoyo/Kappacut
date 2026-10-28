@@ -65,6 +65,19 @@ async def list_jobs(limit: int = 50, session: AsyncSession = Depends(get_session
     } for j, email, name in rows]}
 
 
+def _override(value: object, field: str) -> int | None:
+    """A quota override from the admin form: empty / 0 = back to the plan default."""
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        n = int(str(value).strip())
+    except ValueError:
+        raise HTTPException(400, f"{field} must be a whole number")
+    if not 0 < n <= 2**31 - 1:                  # the column is a 32-bit integer
+        raise HTTPException(400, f"{field} must be a positive number")
+    return n
+
+
 @router.post("/users/{user_id}/quota")
 async def set_quota(
     user_id: uuid.UUID, body: dict, session: AsyncSession = Depends(get_session)
@@ -73,9 +86,9 @@ async def set_quota(
     if u is None:
         raise HTTPException(404, "no such user")
     if "minutes" in body:
-        u.quota_minutes_override = int(body["minutes"]) if body["minutes"] else None
+        u.quota_minutes_override = _override(body["minutes"], "minutes")
     if "storage_mb" in body:
-        u.quota_storage_mb_override = int(body["storage_mb"]) if body["storage_mb"] else None
+        u.quota_storage_mb_override = _override(body["storage_mb"], "storage_mb")
     await session.commit()
     return {"ok": True, "minutes_override": u.quota_minutes_override,
             "storage_mb_override": u.quota_storage_mb_override}

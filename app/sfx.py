@@ -7,14 +7,16 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import storage
 from app.auth import current_verified_user
+from app.config import settings
 from app.db import get_session
 from app.models.sfx import SfxAsset
 from app.models.user import User
+from app.quota import QuotaError, check_quota, is_unlimited
 from app.sfx_synth import BUILTIN_NAMES, synth_builtins
 
 router = APIRouter(tags=["sfx"])
@@ -67,7 +69,7 @@ async def sfx_upload(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    import clipfinder as cf
+    import kappacut as cf
     ext = Path(file.filename or "sfx.mp3").suffix.lower() or ".mp3"
     if ext not in SFX_EXTS:
         raise HTTPException(400, f"audio only ({', '.join(sorted(SFX_EXTS))})")
@@ -83,6 +85,13 @@ async def sfx_upload(
         chunks.append(chunk)
     if not size:
         raise HTTPException(400, "empty file")
+    # uploads count against the storage cap like videos do, and the number of files is capped
+    if not is_unlimited(user):
+        n = await session.scalar(
+            select(func.count()).select_from(SfxAsset).where(SfxAsset.user_id == user.id))
+        if (n or 0) >= settings.quota_sfx_files:
+            raise QuotaError("sound effects", n, settings.quota_sfx_files)
+    await check_quota(session, user, "upload", extra_bytes=size)
 
     filename = f"{stem}{ext}"
     n = 1

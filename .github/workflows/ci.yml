@@ -12,18 +12,18 @@ jobs:
       postgres:
         image: postgres:18-alpine
         env:
-          POSTGRES_USER: clipfinder
-          POSTGRES_PASSWORD: clipfinder
-          POSTGRES_DB: clipfinder
+          POSTGRES_USER: kappacut
+          POSTGRES_PASSWORD: kappacut
+          POSTGRES_DB: kappacut
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U clipfinder" --health-interval 5s
+          --health-cmd "pg_isready -U kappacut" --health-interval 5s
           --health-timeout 3s --health-retries 20
       redis:
         image: redis:7-alpine
         ports: ["6379:6379"]
     env:
-      DATABASE_URL: postgresql+asyncpg://clipfinder:clipfinder@localhost:5432/clipfinder
+      DATABASE_URL: postgresql+asyncpg://kappacut:kappacut@localhost:5432/kappacut
       REDIS_URL: redis://localhost:6379/0
       JWT_SECRET: ci
       VERIFICATION_TOKEN_SECRET: ci2
@@ -41,7 +41,7 @@ jobs:
       - run: alembic upgrade head
       - run: alembic revision --autogenerate -m ci-drift && test -z "$(grep -E 'op\.(create|drop|add|alter)' alembic/versions/*ci-drift*)"
         # autogenerate against the freshly-migrated DB must be empty (schema == models)
-      - run: python -c "import app.main, app.worker, app.cli, clipfinder, pipeline"
+      - run: python -c "import app.main, app.worker, app.cli, kappacut, pipeline"
       # Key building, guards and presigning are pure-local — no bucket or network needed.
       # Runs under plain python today; `pytest tests/` collects the same file unchanged.
       - run: python tests/test_storage_keys.py
@@ -50,6 +50,7 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends ffmpeg
       - run: python tests/test_clip_brain.py
       - run: python tests/test_evaluate.py
+      - run: python tests/test_request_checks.py
 
   frontend:
     runs-on: ubuntu-latest

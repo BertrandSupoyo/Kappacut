@@ -5,6 +5,7 @@ at a provider (Resend / Postmark / Brevo / SES). No provider SDK — SMTP keeps 
 """
 from __future__ import annotations
 
+import html
 import logging
 from email.message import EmailMessage
 
@@ -12,14 +13,14 @@ import aiosmtplib
 
 from app.config import settings
 
-log = logging.getLogger("clipfinder.email")
+log = logging.getLogger("kappacut.email")
 
 _SHELL = """\
 <div style="font-family:ui-sans-serif,system-ui,sans-serif;max-width:520px;margin:0 auto;
             color:#1b1922;line-height:1.6">
   <div style="font-weight:700;font-size:18px;letter-spacing:-.02em;
               background:linear-gradient(96deg,#5f4ee0,#0c8b99);-webkit-background-clip:text;
-              background-clip:text;color:transparent">clipfinder</div>
+              background-clip:text;color:transparent">Kappacut</div>
   <div style="margin-top:16px">{body}</div>
   <p style="margin-top:28px;font-size:12px;color:#8b8797">
     If you didn't request this, you can ignore this email.</p>
@@ -49,8 +50,11 @@ async def send_email(to: str, subject: str, html_body: str) -> None:
         port=settings.smtp_port,
         username=settings.smtp_user or None,
         password=settings.smtp_password or None,
+        # SMTP_TLS=true: implicit TLS (port 465). Otherwise STARTTLS whenever the server offers
+        # it (port 587) - forcing start_tls=False here meant a 587 provider got the password
+        # in plain text or refused AUTH, and every verification email was lost.
         use_tls=settings.smtp_tls,
-        start_tls=False if not settings.smtp_tls else None,
+        start_tls=None,
     )
 
 
@@ -79,13 +83,15 @@ async def send_reset_email(to: str, token: str) -> None:
 
 
 async def send_retention_warning(to: str, project_name: str, days_left: int) -> None:
+    # the name is whatever the user typed: escaped, it can't put links or markup in our mail
     body = (
-        f"<p>Your project <b>{project_name}</b> has been inactive for a while. "
+        f"<p>Your project <b>{html.escape(project_name)}</b> has been inactive for a while. "
         f"It and its clips will be deleted in about <b>{days_left} day(s)</b> to free up space.</p>"
         f"<p>Open it in Kappacut to keep it.</p>"
         + _button(settings.public_base_url.rstrip('/') + "/app", "Open Kappacut")
     )
     try:
-        await send_email(to, f"Kappacut: “{project_name}” expires soon", body)
+        subject_name = " ".join(project_name.split())   # no line breaks in a mail header
+        await send_email(to, f"Kappacut: “{subject_name}” expires soon", body)
     except Exception as e:  # noqa: BLE001
         log.warning("retention warning to %s failed: %s", to, e)

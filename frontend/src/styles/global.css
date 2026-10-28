@@ -141,7 +141,8 @@ fieldset.dim-when-disabled:disabled { opacity: .4; pointer-events: none; }
 .framer img { position: absolute; inset: 0; width: 100%; height: 100%; max-width: none; object-fit: cover; }
 .framer-window { position: absolute; border: 2px solid var(--accent); border-radius: 3px; box-shadow: 0 0 0 9999px rgba(0,0,0,.6); cursor: move; touch-action: none; }
 .framer-face { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--signal); box-shadow: 0 0 0 3px rgba(0,0,0,.45); pointer-events: none; z-index: 1; }
-.score-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--sp-2); margin-top: var(--sp-2); }
+/* one equal column per part: 6 on new analyses, 5 on ones made before "opening" existed */
+.score-row { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: var(--sp-2); margin-top: var(--sp-2); }
 .score-part { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .score-part span { font-size: var(--fs-2xs); color: var(--text-mut); }
 .score-bar { height: 4px; border-radius: 99px; background: var(--sub-bg); overflow: hidden; }

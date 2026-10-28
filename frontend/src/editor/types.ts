@@ -17,7 +17,7 @@ export function faceAt(face: ClipFace, t: number): ClipFace {
   return { ...face, x: last[1], y: last[2] };
 }
 
-/** px/py that centre the render's crop window on a face — mirrors clipfinder.frame_on. */
+/** px/py that centre the render's crop window on a face — mirrors kappacut.frame_on. */
 export function faceFrame(face: ClipFace | undefined, mode: CropMode, zoom: number): { px: number; py: number } {
   if (!face) return { px: 0.5, py: 0.5 };
   const ar = face.ar || 16 / 9;

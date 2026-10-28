@@ -56,21 +56,33 @@ interface EditorState {
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingSave: (() => void) | null = null;
 
 function scheduleSave(get: () => EditorState, set: (p: Partial<EditorState>) => void) {
   const { projectId } = get();
   if (!projectId) return;
   set({ saveStatus: "saving" });
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
+  const save = () => {
+    saveTimer = null;
+    pendingSave = null;
+    // The edits belong to `projectId`. The timer used to read whatever project was loaded
+    // when it fired, so opening another project within the delay saved that one's edits
+    // over this one's; init() and the editor's unmount flush before the store moves on.
+    if (get().projectId !== projectId) return;
     const { activeIdx, edits } = get();
-    try {
-      await jpost(`/api/projects/${projectId}/edit`, { state: { v: 2, activeIdx, edits } satisfies SavedState });
-      set({ saveStatus: "saved" });
-    } catch {
-      set({ saveStatus: "error" });
-    }
-  }, 900);
+    jpost(`/api/projects/${projectId}/edit`, { state: { v: 2, activeIdx, edits } satisfies SavedState })
+      .then(() => get().projectId === projectId && set({ saveStatus: "saved" }))
+      .catch(() => get().projectId === projectId && set({ saveStatus: "error" }));
+  };
+  pendingSave = save;
+  saveTimer = setTimeout(save, 900);
+}
+
+/** Send a debounced save now, while the store still holds that project's edits. */
+export function flushSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  pendingSave?.();
 }
 
 export const useEditor = create<EditorState>((set, get) => ({
@@ -89,6 +101,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   setRender: (p) => set(p),
 
   init: ({ projectId, clips, segments, duration, saved }) => {
+    flushSave();
     const snaps = [...new Set(segments.flatMap((s) => [+s.start, +s.end]))]
       .filter((t) => t >= 0)
       .sort((a, b) => a - b);

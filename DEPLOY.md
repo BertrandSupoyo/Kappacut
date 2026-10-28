@@ -1,4 +1,4 @@
-# Deploying clipfinder
+# Deploying Kappacut
 
 Single VPS, Docker Compose. Services: `caddy` (TLS + reverse proxy + built SPA), `web`
 (FastAPI), `worker` (arq), `tusd` (resumable upload), `postgres`, `redis`.
@@ -13,7 +13,7 @@ Single VPS, Docker Compose. Services: `caddy` (TLS + reverse proxy + built SPA),
 ## 2. Configure
 
 ```bash
-git clone <repo> clipfinder && cd clipfinder
+git clone <repo> kappacut && cd kappacut
 cp .env.example .env
 chmod 600 .env
 ```
@@ -89,19 +89,19 @@ docker compose -f compose.yaml exec backup ls -lh /backups
 **Ship it offsite** — the volume lives on the same disk. Cron on the host, e.g.:
 
 ```bash
-0 5 * * *  docker run --rm -v clipfinder_backups:/b -v /root/.config/rclone:/c \
-  rclone/rclone sync /b remote:clipfinder-backups
+0 5 * * *  docker run --rm -v kappacut_backups:/b -v /root/.config/rclone:/c \
+  rclone/rclone sync /b remote:kappacut-backups
 ```
 
-Media (`clipfinder_media`) is large; either `restic`/`rclone` it weekly the same way, or
+Media (`kappacut_media`) is large; either `restic`/`rclone` it weekly the same way, or
 accept that a disk loss means users re-upload (the DB rows survive, sources don't).
 
 ### Restore Postgres
 
 ```bash
 docker compose -f compose.yaml stop web worker
-gunzip -c /path/to/clipfinder-YYYYMMDD-HHMMSS.sql.gz \
-  | docker compose -f compose.yaml exec -T postgres psql -U clipfinder -d clipfinder
+gunzip -c /path/to/kappacut-YYYYMMDD-HHMMSS.sql.gz \
+  | docker compose -f compose.yaml exec -T postgres psql -U kappacut -d kappacut
 docker compose -f compose.yaml up -d
 ```
 

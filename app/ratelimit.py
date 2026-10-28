@@ -31,21 +31,28 @@ def client_ip(request: Request) -> str:
     return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
 
 
+async def _hit(key: str, window: int) -> int:
+    """Count one request against `key`. The increment and the expiry run as one transaction
+    (EXPIRE NX: Redis 7+): as two calls, a crash between them left a counter with no TTL -
+    a lockout for that IP that never ended."""
+    async with _redis.pipeline(transaction=True) as pipe:
+        n, _ = await pipe.incr(key).expire(key, window, nx=True).execute()
+    return int(n)
+
+
 def rate_limit(bucket: str, limit: int, window_seconds: int) -> Callable:
     async def dependency(request: Request) -> None:
         ip = client_ip(request)
         key = f"rl:{bucket}:{ip}"
         try:
-            n = await _redis.incr(key)
-            if n == 1:
-                await _redis.expire(key, window_seconds)
+            n = await _hit(key, window_seconds)
+            wait = await _redis.ttl(key) if n > limit else 0
         except Exception:  # noqa: BLE001 — Redis down must not lock everyone out
             return
         if n > limit:
-            ttl = await _redis.ttl(key)
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=f"Too many attempts. Try again in {max(ttl, 1)}s.",
+                detail=f"Too many attempts. Try again in {max(wait, 1)}s.",
             )
 
     return dependency
@@ -70,9 +77,7 @@ class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
             ip = client_ip(request)
             key = f"rl:global:{ip}"
             try:
-                n = await _redis.incr(key)
-                if n == 1:
-                    await _redis.expire(key, self.window)
+                n = await _hit(key, self.window)
                 if n > self.limit:
                     return JSONResponse(
                         {"detail": "Slow down — too many requests."}, status_code=429

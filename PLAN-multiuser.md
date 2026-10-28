@@ -1,22 +1,22 @@
-# clipfinder — local → multi-user migration
+# Kappacut — local → multi-user migration
 
-Turn clipfinder from a single-user localhost tool into a **self-hosted, open-signup, free**
+Turn Kappacut from a single-user localhost tool into a **self-hosted, open-signup, free**
 web app on **one VPS via Docker Compose**, on a **shared server-side Groq key** (owner pays,
 per-user quotas protect the bill), with a **React + Vite + TypeScript** frontend.
 
-> **Capacity fix — 2026-09-11: `FFMPEG_THREADS`.** Every `ffmpeg` call in `clipfinder.py`
+> **Capacity fix — 2026-09-11: `FFMPEG_THREADS`.** Every `ffmpeg` call in `kappacut.py`
 > auto-detected and grabbed every core by default; under `WORKER_CONCURRENCY > 1` this meant
 > concurrent jobs fought over the same cores and render time became a function of how many
 > other users happened to be active — inconsistent per-user experience, not a capacity number
 > anyone could reason about. Fixed with the same module-level-hook pattern as `GROQ_GATE`:
-> `clipfinder.FFMPEG_THREADS` (default `0` = unchanged single-instance/CLI behaviour) is read
+> `kappacut.FFMPEG_THREADS` (default `0` = unchanged single-instance/CLI behaviour) is read
 > from `Settings.ffmpeg_threads` and set once in `app/worker.py` `on_startup` and
 > `app/main.py`'s lifespan; `_thread_args()` is spliced into every real ffmpeg invocation
 > (`extract_audio`, `cut_clip`, `mix_sfx`, `grab_frame`, `loudness_track`, and the web-side
 > waveform/frame endpoints in `app/projects.py`). Operators size
 > `WORKER_CONCURRENCY × FFMPEG_THREADS ≈ vCPU count − 1` (worked examples in `DEPLOY.md`
 > §7); a commented `deploy.resources.limits.cpus` guard was added on `worker` in
-> `compose.yaml` as a hard backstop. Verified: `on_startup` sets `clipfinder.FFMPEG_THREADS`
+> `compose.yaml` as a hard backstop. Verified: `on_startup` sets `kappacut.FFMPEG_THREADS`
 > correctly end-to-end; a full render (including the most complex `cut_clip` path — 9:16
 > `cropfill` with a blurred backdrop + subject crop + overlay filter-graph) completed cleanly
 > with `-threads 2` active and downloaded successfully. Also removed the stale pre-migration
@@ -62,7 +62,7 @@ earlier remains admin-configurable via env, unused by default.
 
 ## What survives essentially unchanged
 
-- **`clipfinder.py`** — the engine. ffmpeg helpers, `transcribe()`, `find_clips()` /
+- **`kappacut.py`** — the engine. ffmpeg helpers, `transcribe()`, `find_clips()` /
   `_find_clips_groq` / `_verify_and_refine`, `_finalize`, `loudness_track`, `_auto_edit`,
   `cut_clip`, `mix_sfx`, ASS/caption logic, `slugify`. No changes except: `load_dotenv` /
   `DEFAULTS` sourcing moves to env (Phase 1), and paths it's handed are per-user (Phase 3).
@@ -79,7 +79,7 @@ earlier remains admin-configurable via env, unused by default.
 
 - `GET /api/browse` + `POST /api/add` — scanning the server's local filesystem for videos makes
   no sense multi-user. Upload only.
-- `_source_dirs()`, `BROWSE_SKIP_DIRS`, `clipfinder.toml [source]`.
+- `_source_dirs()`, `BROWSE_SKIP_DIRS`, `kappacut.toml [source]`.
 - The **Settings page** (`/api/settings`, `_write_env`, `_mask_key`, `_load_settings`,
   `_settings.json`) — no user-editable keys or models. A stripped admin-only config may return
   later; not in this plan.
@@ -367,7 +367,7 @@ pub/sub is a later optimization; polling one indexed row is fine at this scale.)
   format and the `{status,pct,msg,error}` / `{status,done,total,current,error,clips}` payloads
   so the SPA's `EventSource` code ports 1:1.
 - `pipeline.get_cfg()` (`pipeline.py:19`) — same return dict, but built from `Settings` env
-  defaults instead of `clipfinder.toml` + `_settings.json`.
+  defaults instead of `kappacut.toml` + `_settings.json`.
 - Clip/edit JSON shapes: `analysis.json` = `{duration, segments, clips}`;
   `project.json` = the `projectState()` object in `web/app.js`. These become the `analyses`
   and `project_edits` JSONB columns unchanged.
@@ -388,7 +388,7 @@ with Alembic migrations and env config. **No auth, no behavior change yet.**
 > `GUID`), `Dockerfile`, `compose.yaml` + `compose.override.yaml` (dev: bind-mount + reload +
 > Mailpit), `Caddyfile`, `.env.example`, `.dockerignore`.
 > Deviations from the plan text below: (a) kept `pipeline.get_cfg()` reading
-> `clipfinder.toml` + `_settings.json` unchanged — "no behavior change" beats moving engine
+> `kappacut.toml` + `_settings.json` unchanged — "no behavior change" beats moving engine
 > config to env now; that happens with the Settings-page removal in Phase 3. (b) `server.py`
 > became `app/legacy.py` as an `APIRouter` (not deleted) — every old route still served.
 > (c) Postgres 18 image needs the volume at `/var/lib/postgresql` (not `/data`). (d) Mailpit,
@@ -419,11 +419,11 @@ with Alembic migrations and env config. **No auth, no behavior change yet.**
 6. Move `server.py` into `app/` as `app/main.py`; keep every existing route working
    (still filesystem `web_data/`, still `JOBS` dict, still `BackgroundTasks`). Add
    `GET /api/health` → `{ok, db, redis}` (pings both).
-7. `pipeline.get_cfg()` → build from `Settings` (bake `clipfinder.toml`'s current values as
-   the defaults). Delete the `_settings.json` overlay. `clipfinder.load_dotenv` call removed
+7. `pipeline.get_cfg()` → build from `Settings` (bake `kappacut.toml`'s current values as
+   the defaults). Delete the `_settings.json` overlay. `kappacut.load_dotenv` call removed
    (env comes from the container).
 8. `Dockerfile` — python:3.12-slim, install ffmpeg (`apt-get install -y ffmpeg`), pip install,
-   copy `app/ clipfinder.py pipeline.py`. `Dockerfile.web` also copies the built SPA later.
+   copy `app/ kappacut.py pipeline.py`. `Dockerfile.web` also copies the built SPA later.
 9. `compose.yaml` — `postgres:18`, `redis:7-alpine`, `web` (uvicorn, `depends_on` db+redis
    healthchecks), `caddy:2.11-alpine` (reverse-proxy `/api/*` → web, serve `web/` static for
    now). `compose.override.yaml` (dev): bind-mount source, `--reload`, MailHog, expose ports.
@@ -438,7 +438,7 @@ with Alembic migrations and env config. **No auth, no behavior change yet.**
   (metadata matches DB).
 - The current flow still works through the container: open `:80`, upload a short video,
   analyze completes, edit + render a clip, download it.
-- `docker compose exec web python -c "import clipfinder, pipeline"` — no import errors.
+- `docker compose exec web python -c "import kappacut, pipeline"` — no import errors.
 
 ### Anti-pattern guards
 - No `declarative_base()`, no sync `Session` in async paths.
@@ -616,8 +616,8 @@ state is 100% in Postgres; a worker crash can't lose a job.
 > `job_timeout=3600`), `app/queue.py` (`enqueue_analyze` / `enqueue_render` via
 > `arq.create_pool`, set `jobs.arq_job_id`; `abort_job`), `app/groq_gate.py` (sync Redis
 > per-minute token bucket sized to `groq_tokens_per_minute=8000`, fail-open, installed as
-> `clipfinder.GROQ_GATE`), `app/sfx_synth.py` (builtin synth extracted so the worker doesn't
-> import `app/sfx.py`'s auth deps). `clipfinder.py`: `GROQ_GATE` hook in `_groq_chat` +
+> `kappacut.GROQ_GATE`), `app/sfx_synth.py` (builtin synth extracted so the worker doesn't
+> import `app/sfx.py`'s auth deps). `kappacut.py`: `GROQ_GATE` hook in `_groq_chat` +
 > a 429/`retry-after` retry loop added to `transcribe` (Whisper). `app/projects.py`: dropped
 > `BackgroundTasks`, calls `enqueue_*`, `_guard_enqueue` = **1 active job / user** (`429`) +
 > **global analyze-queue depth** ≥ `max_global_queue` (`503`). `compose.yaml`: `x-app-env`
@@ -663,7 +663,7 @@ state is 100% in Postgres; a worker crash can't lose a job.
 5. **Global backpressure**: `enqueue_analyze` checks `await pool.queued_jobs()` (or a Redis
    counter); over `settings.max_global_queue` → route returns `503`.
 6. **Groq token-bucket**: `app/ratelimit.py` — Redis `INCRBY` on a per-minute key +
-   `pexpire`; `clipfinder._groq_chat` / `transcribe` gains an optional
+   `pexpire`; `kappacut._groq_chat` / `transcribe` gains an optional
    `before_call: Callable` hook (passed via `cfg`) that blocks until budget. Keep
    `retry-after` handling.
 7. SSE endpoints (`/analyze/events`, `/render/events`) already read the `jobs` row (Phase 3);
@@ -687,7 +687,7 @@ state is 100% in Postgres; a worker crash can't lose a job.
 
 ### Anti-pattern guards
 - The worker must not import `app.main` (no FastAPI app in the worker) — share `models`,
-  `db`, `pipeline`, `clipfinder`, `storage` only.
+  `db`, `pipeline`, `kappacut`, `storage` only.
 - Don't hold one DB transaction for the whole job — commit progress in small transactions.
 - Don't `run_in_threadpool` (that's Starlette's, tied to the web process) — use arq's loop +
   `run_in_executor`.
@@ -1092,4 +1092,4 @@ Components, each owning the slice of `S` it needs (Zustand store mirrors today's
 - Caddy v2 + Docker Compose auto-HTTPS (pin versions, persist /data):
   oneuptime.com/blog/post/2026-01-16-docker-caddy-automatic-https/view ·
   nerdleveltech.com/caddy-reverse-proxy-docker-compose-production-https-tutorial
-- Current repo: `server.py`, `pipeline.py`, `clipfinder.py`, `web/app.js`, `clipfinder.toml`.
+- Current repo: `server.py`, `pipeline.py`, `kappacut.py`, `web/app.js`, `kappacut.toml`.
