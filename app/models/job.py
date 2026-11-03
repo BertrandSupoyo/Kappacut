@@ -69,6 +69,9 @@ class RenderOutput(Base):
     captions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sfx_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # app.jobs.clip_fingerprint of what produced this file: a later render of the same range
+    # with the same settings reuses it instead of cutting it again. NULL for older rows.
+    fingerprint: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

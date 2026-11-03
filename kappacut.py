@@ -311,6 +311,50 @@ def probe_height(path: Path) -> int:
         return 0
 
 
+def _rate(rate: str) -> float:
+    """ffprobe's "60000/1001" (or "30") as a number; 0 for "0/0", "" or junk."""
+    num, _, den = (rate or "").partition("/")
+    try:
+        n, d = float(num), float(den or 1)
+    except ValueError:
+        return 0.0
+    return n / d if n > 0 and d > 0 else 0.0
+
+
+def probe_video(path: Path | str) -> dict:
+    """Duration, first video stream height and frame rate ("60000/1001") in one ffprobe -
+    a render probes its source once instead of twice per clip. Unknown values come back as
+    0 / "" so callers keep their old fallbacks."""
+    p = run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "format=duration:stream=height,avg_frame_rate,r_frame_rate", "-of", "json", str(path)])
+    try:
+        data = json.loads(p.stdout or "{}")
+    except ValueError:
+        data = {}
+    st = (data.get("streams") or [{}])[0]
+    # avg_frame_rate is what a variable-rate phone video actually plays at; r_frame_rate
+    # is only the container's guess, kept for streams that report no average
+    rate = next((r for r in (st.get("avg_frame_rate"), st.get("r_frame_rate")) if _rate(r) > 0), "")
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0.0)
+    except ValueError:
+        duration = 0.0
+    return {"duration": duration, "height": int(st.get("height") or 0), "fps": rate}
+
+
+def fps_cap_filter(src_rate: str, max_fps: int) -> str:
+    """`fps=` filter that brings a fast source under `max_fps` by a whole divisor - 60 -> 30,
+    59.94 -> 29.97, 50 -> 25, 120 -> 30 - so every kept frame is evenly spaced. '' when
+    there's no cap, the rate is unknown, or the source is under 1.5x the cap (a 40 fps
+    source halved to 20 would look worse than the encode time it saves)."""
+    r = _rate(src_rate)
+    if max_fps <= 0 or r < 1.5 * max_fps:
+        return ""
+    k = int(-(-r // max_fps))                     # ceil: the smallest divisor that fits the cap
+    num, _, den = src_rate.partition("/")
+    return f"fps={int(float(num))}/{int(float(den or 1)) * k}"
+
+
 def vertical_size(src_height: int) -> tuple[int, int]:
     """Vertical output frame for a source: full 1080x1920 only when the source has the
     detail for it. A 720p source's 9:16 crop is ~405x720 pixels, so 1080x1920 just upscales
@@ -443,7 +487,17 @@ def _color_chain(color: dict | None, cube: Path | None = None) -> str:
 
 def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
              subs: Path | None = None, crop: dict | float | None = None,
-             loudnorm: bool = False, color: dict | None = None) -> None:
+             loudnorm: bool = False, color: dict | None = None, *,
+             src_height: int | None = None, src_fps: str | None = None, max_fps: int = 0) -> None:
+    """`src_height` / `src_fps` (from probe_video) skip the probe when the caller already
+    has them. `max_fps` > 0 drops a fast source's frames before any other filter, so crop,
+    scale, captions and x264 all work on half of a 60 fps source's frames."""
+    if (vertical and src_height is None) or (max_fps > 0 and src_fps is None):
+        info = probe_video(video)
+        src_height = info["height"] if src_height is None else src_height
+        src_fps = info["fps"] if src_fps is None else src_fps
+    pre = fps_cap_filter(src_fps or "", max_fps)
+    pre = f"{pre}," if pre else ""
     if isinstance(crop, (int, float)):
         crop = {"px": float(crop)}
     crop = crop or {}
@@ -455,9 +509,9 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
     col_vf = f",{col}" if col else ""                 # colour grade goes before subtitles, never on the text
 
     fc = None                                     # -filter_complex string (fill mode only)
-    ow, oh = vertical_size(probe_height(video)) if vertical else (0, 0)
+    ow, oh = vertical_size(src_height or 0) if vertical else (0, 0)
     if not vertical:
-        vf = r"scale=-2:min(1080\,ih)" + col_vf + sub_chain   # only downscale, never upscale
+        vf = pre + r"scale=-2:min(1080\,ih)" + col_vf + sub_chain   # only downscale, never upscale
     elif mode in ("fill", "cropfill"):            # blurred copy fills the bars; foreground = whole frame or a crop
         blur = max(2.0, min(80.0, float(crop.get("blur", 24))))
         sub_fc = f";[v]subtitles={subs.name}[vout]" if subs is not None else ""
@@ -484,7 +538,7 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
                   f"scale={ow}:-2:flags=lanczos{col_fg}[fg]")
         else:
             fg = f"[a]scale={ow}:-2:flags=lanczos{col_fg}[fg]"
-        fc = f"[0:v]split=2[a][b];{bg};{fg};[bg][fg]overlay=(W-w)/2:(H-h)/2[v]" + sub_fc
+        fc = f"[0:v]{pre}split=2[a][b];{bg};{fg};[bg][fg]overlay=(W-w)/2:(H-h)/2[v]" + sub_fc
         vf = None
     else:                                         # crop / manual reframe (px/py travel, zoom punch-in)
         z = max(1.0, min(4.0, float(crop.get("zoom", 1.0))))
@@ -493,7 +547,7 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
         bw = f"ih*9/(16*{z:.4f})"
         bh = f"ih/{z:.4f}"
         cx, cy = _follow_xy(crop, start, px, py)
-        vf = (f"crop=w={bw}:h={bh}:x={cx}:y={cy},"
+        vf = (f"{pre}crop=w={bw}:h={bh}:x={cx}:y={cy},"
               f"scale={ow}:{oh}:flags=lanczos" + col_vf + sub_chain)
 
     cmd = [FFMPEG, "-y", *_thread_args(), *_filter_thread_args(fc is not None),

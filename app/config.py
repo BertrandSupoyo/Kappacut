@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,6 +20,9 @@ _DEV_SECRETS = {
     "verification_token_secret": "dev-insecure-change-me-2",
     "reset_password_token_secret": "dev-insecure-change-me-3",
 }
+# Hosts that only exist on a dev machine or inside the dev compose network
+# (compose.override.yaml's S3 mock is the `minio` service, its Mailpit the `mailhog` one).
+_DEV_HOSTS = {"", "localhost", "127.0.0.1", "::1", "minio", "mailhog", "mailpit"}
 
 
 class Settings(BaseSettings):
@@ -112,6 +116,10 @@ class Settings(BaseSettings):
     # Longest single clip a render may cut. The editor's trim handles can stretch a clip to
     # the whole video; without a cap one "clip" could be an hours-long encode.
     render_max_clip_seconds: int = 600
+    # Output frame-rate cap. A 60 fps source (most game streams) is cut at 30: crop, scale,
+    # captions and x264 then handle half the frames, roughly a third less CPU per clip.
+    # 0 keeps every source at its own rate.
+    render_max_fps: int = 30
     # Sources up to this size are downloaded whole by each clip task; bigger ones are read
     # by ffmpeg straight from the bucket with range requests (only the cut part travels).
     render_local_source_max_bytes: int = 256 * 1024**2
@@ -173,6 +181,25 @@ class Settings(BaseSettings):
         for field in ("s3_bucket", "s3_endpoint_url", "s3_access_key_id", "s3_secret_access_key"):
             if not getattr(self, field):
                 problems.append(f"{field.upper()} is unset — media has nowhere to live")
+        # .env.example's dev block points S3_* at the compose S3 mock, which only exists in
+        # compose.override.yaml: copied to a server unchanged, every upload fails
+        if urlsplit(self.s3_endpoint_url).hostname in _DEV_HOSTS:
+            problems.append(
+                f"S3_ENDPOINT_URL is {self.s3_endpoint_url!r}, the dev S3 mock — point it at "
+                "R2 (https://<account-id>.r2.cloudflarestorage.com)"
+            )
+        # Mail to localhost / Mailpit is accepted and dropped, so signup "works" and nobody
+        # ever receives the verification link. Nothing else would surface that.
+        if (self.smtp_host or "").lower() in _DEV_HOSTS:
+            problems.append(
+                f"SMTP_HOST is {self.smtp_host!r} — verification and reset emails would never "
+                "arrive; set your provider's host (e.g. smtp.resend.com) and SMTP_USER/PASSWORD"
+            )
+        if "@localhost" in self.smtp_from.lower():
+            problems.append("SMTP_FROM still sends from @localhost — use an address on your domain")
+        # every analysis transcribes through Groq, with or without the Anthropic picker
+        if not self.groq_api_key:
+            problems.append("GROQ_API_KEY is unset — every analysis would fail at transcription")
 
         if problems:
             raise RuntimeError(

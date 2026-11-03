@@ -39,8 +39,11 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
       - run: alembic upgrade head
-      - run: alembic revision --autogenerate -m ci-drift && test -z "$(grep -E 'op\.(create|drop|add|alter)' alembic/versions/*ci-drift*)"
-        # autogenerate against the freshly-migrated DB must be empty (schema == models)
+      - run: alembic revision --autogenerate -m ci-drift && ls alembic/versions/*ci_drift* && test -z "$(grep -E 'op\.(create|drop|add|alter)' alembic/versions/*ci_drift*)"
+        # autogenerate against the freshly-migrated DB must be empty (schema == models).
+        # The file is named <rev>_ci_drift.py: a `*ci-drift*` glob matched nothing, grep
+        # printed nothing, and this step passed whatever the models said. `ls` fails the
+        # step if the file ever goes missing again.
       - run: python -c "import app.main, app.worker, app.cli, kappacut, pipeline"
       # Key building, guards and presigning are pure-local — no bucket or network needed.
       # Runs under plain python today; `pytest tests/` collects the same file unchanged.

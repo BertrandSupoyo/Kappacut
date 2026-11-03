@@ -5,7 +5,11 @@ Single VPS, Docker Compose. Services: `caddy` (TLS + reverse proxy + built SPA),
 
 ## 1. Provision the box
 
-- 2+ vCPU, 4+ GB RAM, 40+ GB disk (media grows fast — see retention below).
+- 4+ dedicated cores, 8+ GB RAM, 40+ GB disk. Media lives in R2 (step 2), so the disk only
+  holds Docker images, Postgres and the worker's scratch copies of sources. See
+  "Capacity notes" for why dedicated cores matter more than the vCPU count.
+- Pick the location nearest your users (Singapore for Indonesia / SEA): every 1–2 GB source
+  upload travels that link.
 - Install Docker Engine + the compose plugin.
 - Point an `A` (and `AAAA`) DNS record for your domain at the box.
 - Open ports 80 and 443.
@@ -29,7 +33,36 @@ openssl rand -hex 32   # -> RESET_PASSWORD_TOKEN_SECRET
 ```
 
 Set `DOMAIN`, `ACME_EMAIL`, `PUBLIC_BASE_URL=https://<domain>`, `COOKIE_SECURE=true`,
-`ENVIRONMENT=prod`, `GROQ_API_KEY`, and the `SMTP_*` block for your email provider.
+`ENVIRONMENT=prod`, `GROQ_API_KEY`, and:
+
+- `HTTP_PORT=80` and `HTTPS_PORT=443`. Left at the dev defaults (8000/8443), Let's Encrypt
+  can't reach Caddy and the site never gets a certificate.
+- The `S3_*` block, pointed at R2 (below). The dev values point at the compose S3 mock,
+  which doesn't exist in prod.
+- The `SMTP_*` block for a real provider. Resend's free plan (3,000 emails/month, 100/day)
+  is enough to start: `SMTP_HOST=smtp.resend.com`, `SMTP_PORT=465`, `SMTP_TLS=true`,
+  `SMTP_USER=resend`, `SMTP_PASSWORD=<API key>`, `SMTP_FROM` on your verified domain.
+- A paid (Developer) Groq key. It has no monthly fee, but the free tier stops at 8 hours of
+  audio and ~200K picker tokens per model per day — roughly 3–4 hours of video a day.
+
+Once the deploy looks public, web and worker refuse to boot while any of these is still a
+dev value (dev secrets, the S3 mock, localhost/Mailpit SMTP, no Groq key) and print which.
+
+### R2 bucket
+
+1. Cloudflare dashboard → R2 → Create bucket. Location hint: the region nearest your users
+   (Asia-Pacific for Indonesia).
+2. R2 → Manage API tokens → Create token with **Object Read & Write**, scoped to this bucket.
+   Put its Access Key ID / Secret in `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`, and
+   `https://<account-id>.r2.cloudflarestorage.com` in `S3_ENDPOINT_URL` (`S3_REGION=auto`).
+   Keep that endpoint: presigned URLs only work on it, not on a custom domain.
+3. Bucket → Settings → Object lifecycle rules:
+   - prefix `uploads/`: delete objects after 1 day (tusd's staging area; the app copies a
+     finished upload out of it);
+   - abort incomplete multipart uploads after 1 day.
+
+No CORS rule is needed: the browser only loads media through `<video>`, `<img>` and CSS,
+following the app's redirects to signed URLs.
 
 ## 3. First boot
 
@@ -93,8 +126,9 @@ docker compose -f compose.yaml exec backup ls -lh /backups
   rclone/rclone sync /b remote:kappacut-backups
 ```
 
-Media (`kappacut_media`) is large; either `restic`/`rclone` it weekly the same way, or
-accept that a disk loss means users re-upload (the DB rows survive, sources don't).
+Media lives in R2, not on this box, so a disk loss costs only the database. If you want a
+second copy of the media too, `rclone sync` the bucket to another provider on the same cron. The `kappacut_media` volume only matters until
+`app.cli migrate-media` has run on an old install.
 
 ### Restore Postgres
 
@@ -123,10 +157,17 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
 - **Pick a dedicated-vCPU box, not burstable/shared.** ffmpeg is CPU-bound; shared vCPUs
   (e.g. plain DigitalOcean Droplets, AWS `t`-series) throttle hard once a render runs a
   while, and that throttling is *inconsistent* — the same clip renders at different speeds
-  depending on what else the host is doing, which users will notice. Hetzner's `CCX` line
-  (dedicated vCPU) is the recommended default: **CCX23 (4 vCPU / 16 GB)** comfortably
-  covers ~1,000 users with light-to-moderate concurrent activity; go **CCX33 (8 vCPU)** if
-  renders start queueing at peak hours.
+  depending on what else the host is doing, which users will notice. Avoid CPU-credit plans
+  too (Hostinger KVM: full speed for ~3 h, then capped at 30%).
+  Prices checked 2026-11-03, excl. VAT: netcup Root Server G12.5 is the cheapest dedicated
+  core. **RS 1000 (4 cores / 8 GB)** is €18.26/month on a 12-month term (€21 monthly), plus
+  ~€13 for Singapore; go **RS 2000 (8 cores / 16 GB)** (€34.20, ~€14 more in Singapore) once
+  renders queue at peak hours. Upgrades are in place but there are no downgrades, so choose
+  the location on the first order. Hetzner CCX23 now costs €85.99 (it was €31.49 before the
+  June 2026 price change).
+  Size for the peak, not the month: a render costs ~1.67 CPU-s per second of clip, so 30
+  users rendering 6 × 30 s clips at once need ~150 CPU-minutes. That is ~50 min of queue
+  for the last of them on 3 usable cores, ~21 min on 7.
 - **Set `WORKER_CONCURRENCY` and `FFMPEG_THREADS` together — this is what actually makes
   the app feel the same for every user.** Left unset, every concurrent ffmpeg process
   auto-detects and grabs *every* core; two renders at once already means two processes
@@ -137,8 +178,8 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
 
   | Box | `WORKER_CONCURRENCY` | `FFMPEG_THREADS` |
   |---|---|---|
-  | CCX23 (4 vCPU) | 3 | 1 |
-  | CCX33 (8 vCPU) | 3 | 2 |
+  | 4 cores (RS 1000, CCX23) | 3 | 1 |
+  | 8 cores (RS 2000, CCX33) | 3 | 2 |
 
   This gives every job a fixed, equal slice regardless of load — job N+1 waits in the arq
   queue (roughly FIFO) rather than slowing down jobs already running. Uncomment the

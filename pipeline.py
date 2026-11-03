@@ -302,9 +302,19 @@ def build_ass(lines: list[dict], style: str, position: str, size: float,
 
 # ---------------------------------------------------------------- render
 
+def clip_filename(r: dict, i: int) -> str:
+    """The file name render_one gives range `r` as clip number `i` (1-based)."""
+    vertical = bool(r.get("vertical"))
+    crop = r.get("crop") if vertical else None
+    _cm = crop.get("mode") if isinstance(crop, dict) else None
+    vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
+            else "_vertical" if vertical else "")
+    return f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
+
+
 def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
                segments: list[dict] | None = None, sfx_dir: Path | None = None,
-               dur: float | None = None) -> dict | None:
+               dur: float | None = None, probe: dict | None = None) -> dict | None:
     """Cut range `r` as clip number `i` (1-based, it names the file) into out_dir. One call
     per clip: app.jobs runs each as its own queue task. `r`:
     {"start", "end", "vertical", "label", "crop": {"mode","px","py","zoom","blur"}|null,
@@ -317,24 +327,24 @@ def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
     mode "fill" -> full video centred, blurred copy (sigma `blur`) fills the top/bottom bars.
 
     `video` may be a local path or an http(s) URL — ffmpeg seeks a URL with range
-    requests, so a per-clip worker needn't download the whole source. Returns the clip
+    requests, so a per-clip worker needn't download the whole source. `probe` is
+    kappacut.probe_video's result for `video`, when the caller already has it; with it no
+    ffprobe runs here. `cfg["max_fps"]` > 0 caps the output frame rate. Returns the clip
     record, or None when the range is under a second once clamped to the video.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    probe = probe or {}
     if dur is None:
-        dur = cf.probe_duration(video)
+        dur = float(probe.get("duration") or 0.0) or cf.probe_duration(video)
     start = max(0.0, float(r["start"]))
     end = min(dur, float(r["end"]))
     if end - start < 1.0:
         return None
     vertical = bool(r.get("vertical"))
     crop = r.get("crop") if vertical else None
-    _cm = crop.get("mode") if isinstance(crop, dict) else None
-    vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
-            else "_vertical" if vertical else "")
     stem = f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}"
-    name = f"{stem}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
+    name = clip_filename(r, i)
 
     subs = None
     cap = r.get("captions")
@@ -348,7 +358,10 @@ def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
                              anim=cap.get("anim", "none"))
 
     cf.cut_clip(video, start, end, out_dir / name, vertical, subs=subs, crop=crop,
-                loudnorm=cfg.get("loudnorm", True), color=r.get("color"))
+                loudnorm=cfg.get("loudnorm", True), color=r.get("color"),
+                src_height=probe["height"] if probe.get("height") else None,
+                src_fps=probe["fps"] if probe.get("fps") else None,
+                max_fps=int(cfg.get("max_fps") or 0))
 
     sfx = [s for s in (r.get("sfx") or []) if isinstance(s, dict) and s.get("file")]
     if sfx and sfx_dir is not None:

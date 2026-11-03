@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import uuid
+from pathlib import Path
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -23,8 +24,8 @@ from app import groq_gate
 from app import jobs as jobs_mod
 from app.config import settings
 from app.db import async_session_maker, engine
-from app.jobs import (FANOUT, MAX_ATTEMPTS, render_key, requeue, resume_render,
-                      retry_or_end_clip, run_analyze, run_render, run_render_clip)
+from app.jobs import (FANOUT, MAX_ATTEMPTS, owner_worker, release_clip, render_key, requeue,
+                      resume_render, retry_or_end_clip, run_analyze, run_render, run_render_clip)
 from app.models.job import Job
 from app.models.project import Analysis, Project
 from app.retention import run_gc
@@ -98,12 +99,14 @@ async def sweep_orphans(ctx: dict) -> None:
                 # MAX_ATTEMPTS). The job itself isn't orphaned.
                 owners = render_key(jid, "owners")
                 held = await redis.hgetall(owners)
-                for idx, w in held.items():
+                for idx, owner in held.items():
                     idx = int(idx.decode() if isinstance(idx, bytes) else idx)
-                    w = w.decode() if isinstance(w, bytes) else w
-                    # hdel is the claim: neither a concurrent sweep nor the clip itself (if
-                    # it was only slow, not dead) can end the same clip a second time
-                    if not await redis.exists(_hb_key(w)) and await redis.hdel(owners, str(idx)):
+                    owner = owner.decode() if isinstance(owner, bytes) else owner
+                    w = owner_worker(owner)
+                    # releasing exactly the hold we saw is the claim: neither a concurrent
+                    # sweep nor the clip itself (if only slow, not dead) can end the clip a
+                    # second time, and a retry that took it over since keeps its hold
+                    if not await redis.exists(_hb_key(w)) and await release_clip(redis, jid, idx, owner):
                         log.warning("render %s: clip %d lost with worker %s", jid, idx + 1, w)
                         await retry_or_end_clip(jid, await total_of(jid), idx,
                                                 f"clip {idx + 1}: worker stopped mid-clip")
@@ -150,23 +153,48 @@ async def sweep_orphans(ctx: dict) -> None:
                     res.rowcount, stuck)
 
 
-async def _wait_for_schema(poll_s: float = 2.0, log_every: int = 15) -> None:
-    """Block until migrations have created the tables startup touches.
+def _migrations() -> tuple[str | None, set[str]]:
+    """(newest migration this code ships, every revision it knows); (None, set()) when the
+    alembic files aren't next to the app, which leaves only the table check below."""
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
 
-    `alembic upgrade head` is a manual step run after `compose up`, so on a fresh DB the
-    worker can boot first. Querying `jobs` then raises inside arq's startup hook, and under
-    `--watch` that leaves a live container with no worker loop — jobs queue forever.
+        root = Path(__file__).resolve().parent.parent
+        cfg = Config(str(root / "alembic.ini"))
+        cfg.set_main_option("script_location", str(root / "alembic"))
+        script = ScriptDirectory.from_config(cfg)
+        return script.get_current_head(), {r.revision for r in script.walk_revisions()}
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't read the alembic scripts; only checking that tables exist", exc_info=True)
+        return None, set()
+
+
+async def _wait_for_schema(poll_s: float = 2.0, log_every: int = 15) -> None:
+    """Block until the database has every migration this code needs.
+
+    `alembic upgrade head` is a manual step run after `compose up`, so the worker can boot
+    first: on a fresh DB with no tables, or after an upgrade with a column still missing.
+    Querying then raises inside arq's startup hook - a crash loop, or under `--watch` a live
+    container with no worker loop, jobs queuing forever.
     """
+    head, known = await asyncio.to_thread(_migrations)
     for attempt in itertools.count(1):
         async with engine.connect() as conn:
             missing = (await conn.execute(text(
                 "SELECT to_regclass('jobs') IS NULL OR to_regclass('projects') IS NULL"
             ))).scalar()
-        if not missing:
+            current = None
+            if not missing and head and (await conn.execute(
+                    text("SELECT to_regclass('alembic_version') IS NOT NULL"))).scalar():
+                current = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+        # a revision this code doesn't know is newer than it (a rollback in progress): go on
+        behind = bool(head) and current != head and (current is None or current in known)
+        if not missing and not behind:
             return
         if attempt == 1 or attempt % log_every == 0:
-            log.warning("waiting for migrations (jobs/projects tables missing) — "
-                        "run `alembic upgrade head`")
+            log.warning("waiting for migrations (database at %s, this code needs %s) — "
+                        "run `alembic upgrade head`", current or "no tables", head or "its tables")
         await asyncio.sleep(poll_s)
 
 

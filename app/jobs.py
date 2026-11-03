@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
+import json
 import logging
 import math
 import os
@@ -188,6 +190,28 @@ def _short_reason(e: BaseException) -> str:
     return "Connection problem" if "Connection" in n or "Timeout" in n else "Temporary problem"
 
 
+async def _retry_or_fail(job_id: uuid.UUID, kind: str, e: BaseException,
+                         project_id: uuid.UUID | None = None) -> None:
+    """Queue the job again for a blip, else fail it. The requeue itself needs Redis, which
+    may be the thing that just failed: then the job fails instead of staying 'running'."""
+    try:
+        if retriable(e) and await requeue(job_id, kind, _short_reason(e)):
+            return
+    except Exception:  # noqa: BLE001
+        log.warning("%s %s: couldn't queue a retry", kind, job_id, exc_info=True)
+    await _fail(job_id, f"{type(e).__name__}: {e}", project_id)
+
+
+async def _claim(s, job_id: uuid.UUID) -> bool:
+    """queued -> running in one statement. Reading the status and then writing it let two
+    copies of a task (two sweeps re-queue the same orphan) both start the job and pay for
+    transcription twice; under this UPDATE the second one matches no row."""
+    return bool((await s.execute(
+        update(Job).where(Job.id == job_id, Job.status == "queued")
+        .values(status="running", started_at=_now(), worker_id=WORKER_ID)
+    )).rowcount)
+
+
 # --------------------------------------------------------------------- timeouts
 #
 # arq ends a job that runs past job_timeout_seconds (or one an admin aborts) by cancelling
@@ -335,20 +359,29 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         if project is None:           # deleted while the job sat in the queue
             await _fail(job_id, "project no longer exists")
             return
-        job.status, job.started_at, job.worker_id = "running", _now(), WORKER_ID
-        project.status = "analyzing"
-        await s.commit()
         user_id, project_id = project.user_id, project.id
         job_payload = dict(job.payload or {})
         auto_render = project.auto_render
         video_title = project.name or project.source_filename or ""
-    attempt = await _begin_attempt(job_id)
+        if not await _claim(s, job_id):
+            return                    # a duplicate task (two sweeps re-queued it) got here first
+        project.status = "analyzing"
+        await s.commit()
 
-    src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
+    try:
+        attempt = await _begin_attempt(job_id)
+        src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
+        short = await _minutes_short(user_id, src_key) if src_key else None
+    except Exception as e:  # noqa: BLE001
+        # outside the main try below: without this a storage or DB blip here left the row
+        # 'running' under a live worker, which the sweep never reclaims
+        log.exception("analyze %s failed to start", project_id)
+        await _retry_or_fail(job_id, "analyze", e, project_id)
+        return
     if src_key is None:
         await _fail(job_id, "source file missing", project_id)
         return
-    if short := await _minutes_short(user_id, src_key):
+    if short:
         await _fail(job_id, short, project_id)
         return
 
@@ -519,6 +552,94 @@ def _prune_source_cache(keep: uuid.UUID | None = None) -> None:
             _src_locks.pop(d.name, None)
 
 
+# Owners-hash values are "<worker id>|<task token>". The claim and the release are each one
+# Lua call, so a stale or duplicate copy of a clip task can neither overwrite the owner a
+# live retry recorded nor delete it and end the clip with nothing uploaded.
+_CLAIM_CLIP = """
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return 0 end
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then return -1 end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+redis.call('EXPIRE', KEYS[1], ARGV[3])
+return 1
+"""
+_RELEASE_CLIP = """
+if redis.call('HGET', KEYS[1], ARGV[1]) == ARGV[2] then
+  return redis.call('HDEL', KEYS[1], ARGV[1])
+end
+return 0
+"""
+
+
+def owner_worker(owner: str) -> str:
+    """The worker id in an owners-hash value (entries from before task tokens are bare)."""
+    return owner.split("|", 1)[0]
+
+
+async def release_clip(redis, job_id: uuid.UUID | str, idx: int, owner: str) -> bool:
+    """Remove `owner`'s hold on clip `idx` if it still has it. True = the caller now owns
+    the clip's ending (counting it, or retrying it) and nobody else will."""
+    return bool(await redis.eval(_RELEASE_CLIP, 1, render_key(job_id, "owners"), str(idx), owner))
+
+
+# Bump whenever cut_clip / render_one produce different bytes from the same inputs, so
+# clips stored by the old code are cut again rather than reused.
+RENDER_FP_VERSION = 1
+
+
+def render_cfg() -> dict:
+    return {**pipeline.get_cfg(), "max_fps": settings.render_max_fps}
+
+
+def clip_fingerprint(src_key: str, src_size: int, r: dict, segments: list[dict], cfg: dict) -> str:
+    """Everything that decides a rendered clip's bytes. The label only names the file, so a
+    renamed or reordered clip still matches. Captions without explicit lines are built from
+    the transcript, so the segments under the range count too. A user sfx re-uploaded under
+    the same name isn't seen; re-adding it to the clip changes nothing either."""
+    start, end = float(r.get("start") or 0), float(r.get("end") or 0)
+    cap = r.get("captions") or {}
+    under = [] if not cap or cap.get("lines") else [
+        s for s in segments if float(s.get("end", 0)) > start and float(s.get("start", 0)) < end]
+    body = {"v": RENDER_FP_VERSION, "src": [src_key, int(src_size)],
+            "range": {k: v for k, v in r.items() if k != "label"}, "segments": under,
+            "fps": int(cfg.get("max_fps") or 0), "loudnorm": bool(cfg.get("loudnorm", True))}
+    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+async def _stored_output(project_id: uuid.UUID, fp: str) -> dict | None:
+    async with async_session_maker() as s:
+        row = (await s.execute(
+            select(RenderOutput).where(RenderOutput.project_id == project_id,
+                                       RenderOutput.fingerprint == fp)
+            .order_by(RenderOutput.created_at.desc()).limit(1)
+        )).scalar_one_or_none()
+        if row is None:
+            return None
+        return {"filename": row.filename, "duration": row.duration, "vertical": row.vertical,
+                "captions": row.captions, "sfx_count": row.sfx_count, "bytes": row.bytes}
+
+
+async def count_to_render(s, project: Project, ranges: list[dict]) -> int:
+    """How many of `ranges` a render would actually cut - the render quota counts only
+    those. The rest match a stored clip and are reused (see run_render_clip)."""
+    have = set((await s.execute(
+        select(RenderOutput.fingerprint).where(RenderOutput.project_id == project.id,
+                                               RenderOutput.fingerprint.is_not(None))
+    )).scalars())
+    if not have:
+        return len(ranges)
+    src_key = await asyncio.to_thread(storage.find_source, project.user_id, project.id)
+    if src_key is None:
+        return len(ranges)
+    size = await asyncio.to_thread(storage.size_of, src_key)
+    segments: list[dict] = []
+    if any((r.get("captions") or {}) and not (r.get("captions") or {}).get("lines") for r in ranges):
+        analysis = (await s.execute(
+            select(Analysis).where(Analysis.project_id == project.id))).scalar_one_or_none()
+        segments = analysis.segments if analysis else []
+    cfg = render_cfg()
+    return sum(clip_fingerprint(src_key, size, r, segments, cfg) not in have for r in ranges)
+
+
 async def run_render(job_id: uuid.UUID) -> None:
     async with async_session_maker() as s:
         job = await s.get(Job, job_id)
@@ -530,17 +651,29 @@ async def run_render(job_id: uuid.UUID) -> None:
         if project is None:           # deleted while the job sat in the queue
             await _fail(job_id, "project no longer exists")
             return
-        job.status, job.started_at, job.worker_id = "running", _now(), WORKER_ID
-        await s.commit()
         user_id, project_id = project.user_id, project.id
-        total = len((job.payload or {}).get("ranges") or [])
-    attempt = await _begin_attempt(job_id)
+        payload = dict(job.payload or {})
+        total = len(payload.get("ranges") or [])
+        if not await _claim(s, job_id):
+            return
+        await s.commit()
 
+    attempt = 0
     try:
+        attempt = await _begin_attempt(job_id)
         src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
         if src_key is None or not total:
             await _fail(job_id, "nothing to render")
             return
+        # What every clip needs to know about the source, found once here: each clip task
+        # used to LIST the bucket, HEAD the source and ffprobe it twice on its own.
+        src = {"key": src_key, "size": await asyncio.to_thread(storage.size_of, src_key)}
+        try:
+            src.update(await _in_thread(f"probe:{job_id}", cf.probe_video,
+                                        storage.presign_internal(src_key, ttl=300)))
+        except Exception:  # noqa: BLE001 — the clips fall back to probing for themselves
+            log.warning("render %s: couldn't probe the source", job_id, exc_info=True)
+        await _set_job(job_id, payload={**payload, "src": src})
         redis = await get_pool()
         width = max(1, min(settings.render_parallel, total))
         # a retried start whose clips were already queued must not queue (and render) them twice
@@ -557,42 +690,59 @@ async def run_render(job_id: uuid.UUID) -> None:
         log.info("render %s: %d clip(s), %d at a time", project_id, total, width)
     except Exception as e:  # noqa: BLE001
         log.exception("render %s failed to start (attempt %d)", project_id, attempt)
-        if retriable(e) and await requeue(job_id, "render", _short_reason(e)):
-            return
-        await _fail(job_id, f"{type(e).__name__}: {e}")
+        await _retry_or_fail(job_id, "render", e)
 
 
 async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
     started = time.monotonic()
     scope = f"render:{job_id}:{idx}"
-    async with async_session_maker() as s:
-        job = await s.get(Job, job_id)
-        if job is not None and job.status == "queued":
-            # its start is being retried right now: come back once it's running again
-            await (await get_pool()).enqueue_job("render_clip_task", str(job_id), idx, _defer_by=10)
-            return
-        # cancelled, failed or swept while this sat in the queue: stop the chain here
-        if job is None or job.status != "running":
-            return
-        project = await s.get(Project, job.project_id)
-        if project is None:
-            await _fail(job_id, "project no longer exists")
-            return
-        user_id, project_id = project.user_id, project.id
-        ranges = list((job.payload or {}).get("ranges") or [])
-        total = len(ranges)
-        r = ranges[idx]
-        segments: list[dict] = []
-        if (r.get("captions") or {}) and not (r.get("captions") or {}).get("lines"):
-            analysis = (await s.execute(
-                select(Analysis).where(Analysis.project_id == project_id))).scalar_one_or_none()
-            segments = analysis.segments if analysis else []
-
+    # Ownership is per task, not per worker: two copies of one clip (a resume and the
+    # original, or two sweeps) can land on the same worker, and with only the worker id
+    # each took the other's claim for its own.
+    me = f"{WORKER_ID or ''}|{uuid.uuid4().hex[:12]}"
     redis = await get_pool()
     owners = render_key(job_id, "owners")
-    await redis.hset(owners, str(idx), WORKER_ID or "")
-    await redis.expire(owners, _RENDER_KEY_TTL)
-    await _touch_render(redis, job_id)
+    try:
+        async with async_session_maker() as s:
+            job = await s.get(Job, job_id)
+            if job is not None and job.status == "queued":
+                # its start is being retried right now: come back once it's running again
+                await redis.enqueue_job("render_clip_task", str(job_id), idx, _defer_by=10)
+                return
+            # cancelled, failed or swept while this sat in the queue: stop the chain here
+            if job is None or job.status != "running":
+                return
+            project = await s.get(Project, job.project_id)
+            if project is None:
+                await _fail(job_id, "project no longer exists")
+                return
+            user_id, project_id = project.user_id, project.id
+            payload = dict(job.payload or {})
+            ranges = list(payload.get("ranges") or [])
+            total = len(ranges)
+            r = ranges[idx]
+            src_info = dict(payload.get("src") or {})
+            segments: list[dict] = []
+            if (r.get("captions") or {}) and not (r.get("captions") or {}).get("lines"):
+                analysis = (await s.execute(
+                    select(Analysis).where(Analysis.project_id == project_id))).scalar_one_or_none()
+                segments = analysis.segments if analysis else []
+        # 0: the clip already ended (a resumed or doubly swept copy); -1: another task holds
+        # it, and the sweep re-runs it if that task's worker dies. Either way, not ours.
+        if await redis.eval(_CLAIM_CLIP, 2, owners, render_key(job_id, "ended"),
+                            str(idx), me, _RENDER_KEY_TTL) != 1:
+            log.info("render %s clip %d: taken or already done - dropping this copy", job_id, idx + 1)
+            return
+        await _touch_render(redis, job_id)
+    except Exception as e:  # noqa: BLE001
+        if not retriable(e):
+            raise
+        # nothing is held yet, so nothing would pick the clip up before the hour-long
+        # `alive` timeout: put this task back instead
+        log.warning("render %s clip %d: couldn't start (%s) - retrying", job_id, idx + 1, e)
+        with contextlib.suppress(Exception):
+            await redis.enqueue_job("render_clip_task", str(job_id), idx, _defer_by=CLIP_RETRY_DELAY)
+        return
 
     err: str | None = None
     src: Path | str = ""
@@ -601,38 +751,62 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
     try:
         await asyncio.to_thread(_prune_source_cache, job_id)
         await _set_job(job_id, stage=f"Rendering clip {idx + 1} of {total}")
-        src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
-        if src_key is None:
-            raise RuntimeError("source file missing")
-        root = Path(tmp.name)
-        if await asyncio.to_thread(storage.size_of, src_key) <= settings.render_local_source_max_bytes:
-            src = await _local_source(job_id, src_key)
+        if src_info.get("key"):
+            src_key, src_size = src_info["key"], int(src_info.get("size") or 0)
+        else:                                     # a render started before run_render recorded it
+            src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
+            if src_key is None:
+                raise RuntimeError("source file missing")
+            src_size = await asyncio.to_thread(storage.size_of, src_key)
+        cfg = render_cfg()
+        fp = clip_fingerprint(src_key, src_size, r, segments, cfg)
+        name = pipeline.clip_filename(r, idx + 1)
+        hit = await _stored_output(project_id, fp)
+        if hit and not await asyncio.to_thread(
+                storage.exists, storage.clip_key(user_id, project_id, hit["filename"])):
+            hit = None
+
+        if hit:
+            # Same range, settings and source as a clip already stored: that file is this
+            # clip. Under a new name (renamed or reordered) it's a server-side copy; nothing
+            # is cut, and nothing counts against the render quota.
+            if hit["filename"] != name:
+                await asyncio.to_thread(storage.copy, storage.clip_key(user_id, project_id, hit["filename"]),
+                                        storage.clip_key(user_id, project_id, name))
+            rec = {"file": name, "duration": hit["duration"], "vertical": hit["vertical"],
+                   "captions": hit["captions"], "sfx": hit["sfx_count"]}
+            size = hit["bytes"]
         else:
-            src = storage.presign_internal(src_key)
+            root = Path(tmp.name)
+            if src_size <= settings.render_local_source_max_bytes:
+                src = await _local_source(job_id, src_key)
+            else:
+                src = storage.presign_internal(src_key)
 
-        # stage this clip's sfx objects (builtin or the user's) for the renderer
-        sfx_stage = root / "sfx"
-        sfx_stage.mkdir(parents=True, exist_ok=True)
-        for fn in _stageable_sfx([r]):
-            for key in (storage.builtin_sfx_key(fn), storage.user_sfx_key(user_id, fn)):
-                if await asyncio.to_thread(storage.exists, key):
-                    await asyncio.to_thread(storage.download, key, sfx_stage / fn)
-                    break
+            # stage this clip's sfx objects (builtin or the user's) for the renderer
+            sfx_stage = root / "sfx"
+            sfx_stage.mkdir(parents=True, exist_ok=True)
+            for fn in _stageable_sfx([r]):
+                for key in (storage.builtin_sfx_key(fn), storage.user_sfx_key(user_id, fn)):
+                    if await asyncio.to_thread(storage.exists, key):
+                        await asyncio.to_thread(storage.download, key, sfx_stage / fn)
+                        break
 
-        out_dir = root / "clips"
-        rec = await _in_thread(scope, pipeline.render_one, src, r, idx + 1, pipeline.get_cfg(),
-                               out_dir, segments, sfx_stage)
+            out_dir = root / "clips"
+            rec = await _in_thread(scope, pipeline.render_one, src, r, idx + 1, cfg,
+                                   out_dir, segments, sfx_stage, None, src_info or None)
         # cancelled (or swept) while cutting: don't upload, store or bill the clip
         async with async_session_maker() as s:
             live = await s.scalar(select(Job.status).where(Job.id == job_id)) == "running"
         # still ours? if the sweep took the clip away (heartbeat lapsed) a retry owns it now
         held_by = await redis.hget(owners, str(idx))
-        mine = (held_by.decode() if isinstance(held_by, bytes) else held_by) == (WORKER_ID or "")
+        mine = (held_by.decode() if isinstance(held_by, bytes) else held_by) == me
         if rec is not None and live and mine:
-            local = out_dir / rec["file"]
             key = storage.clip_key(user_id, project_id, rec["file"])
-            size = await asyncio.to_thread(storage.put_file, key, local, "video/mp4") \
-                if local.exists() else 0
+            if not hit:
+                local = out_dir / rec["file"]
+                size = await asyncio.to_thread(storage.put_file, key, local, "video/mp4") \
+                    if local.exists() else 0
             async with async_session_maker() as s:
                 # the progress bump doubles as the liveness gate for the rows below
                 bumped = (await s.execute(update(Job).where(Job.id == job_id, Job.status.in_(_LIVE))
@@ -646,18 +820,27 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
                         filename=rec["file"], duration=float(rec.get("duration") or 0.0),
                         vertical=bool(rec.get("vertical")), captions=bool(rec.get("captions")),
                         sfx_count=int(rec.get("sfx") or 0),
-                        bytes=size,
+                        bytes=size, fingerprint=fp,
                     ))
-                    s.add(UsageEvent(user_id=user_id, project_id=project_id, kind="render_clip", quantity=1))
+                    if not hit:
+                        s.add(UsageEvent(user_id=user_id, project_id=project_id, kind="render_clip", quantity=1))
                 await s.commit()
-            if not bumped:                        # ended between the check and the upload
-                await asyncio.to_thread(storage.delete_key, key)
+            # Ended between the check and the upload: drop what this task wrote - unless a
+            # row still lists that name. Then it's an earlier render's clip, overwritten in
+            # place, and deleting it would leave that row pointing at nothing.
+            if not bumped and not (hit and hit["filename"] == rec["file"]):
+                async with async_session_maker() as s:
+                    listed = await s.scalar(select(RenderOutput.id).where(
+                        RenderOutput.project_id == project_id,
+                        RenderOutput.filename == rec["file"]).limit(1))
+                if not listed:
+                    await asyncio.to_thread(storage.delete_key, key)
     except asyncio.CancelledError:
         cf.cancel_scope(scope)
         if _timed_out(started):
             # out of time once is out of time again: count the clip failed, don't retry it
             async def end() -> None:
-                if await redis.hdel(owners, str(idx)):
+                if await release_clip(redis, job_id, idx, me):
                     await clip_ended(job_id, total, idx, f"clip {idx + 1}: {_timeout_msg()}")
 
             await asyncio.shield(end())
@@ -671,10 +854,11 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
     finally:
         tmp.cleanup()
 
-    # hdel is the claim on this clip's ending: if the sweep already ended it (our heartbeat
-    # lapsed while we kept working) it has been counted once and must not be counted again.
-    # A crash between the hdel and clip_ended breaks the chain; the `alive` timeout catches it.
-    if await redis.hdel(owners, str(idx)):
+    # Releasing our own hold is the claim on this clip's ending: if the sweep took it away
+    # (our heartbeat lapsed while we kept working) it was counted or re-run already and must
+    # not be counted again - and whatever task holds it now keeps its hold.
+    # A crash between the release and clip_ended breaks the chain; `alive` catches it.
+    if await release_clip(redis, job_id, idx, me):
         if err:
             await retry_or_end_clip(job_id, total, idx, err)
         else:

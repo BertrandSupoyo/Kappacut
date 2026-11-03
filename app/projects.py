@@ -527,10 +527,13 @@ async def start_render(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    from app.jobs import count_to_render  # local import: jobs pulls in the whole pipeline
+
     p = await _owned(project_id, user, session)
     ranges = _validate_ranges((body or {}).get("ranges"))
     await _guard_enqueue(session, user)
-    await check_quota(session, user, "render", count=len(ranges))
+    # clips that match a stored render are reused, not cut, and don't count
+    await check_quota(session, user, "render", count=await count_to_render(session, p, ranges))
 
     job = Job(user_id=user.id, project_id=p.id, kind="render", status="queued",
               payload={"ranges": ranges})
