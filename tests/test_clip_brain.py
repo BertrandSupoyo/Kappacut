@@ -921,6 +921,39 @@ def test_a_cancelled_job_stops_its_running_processes():
     assert "test-cancel" not in cf._CANCELLED
 
 
+SIGNED = "https://acct.r2.cloudflarestorage.com/kappacut/users/u/source.mp4?X-Amz-Signature=SECRETSIG&X-Amz-Credential=SECRETKEY"
+
+
+def _failure_of(*cmd: str) -> str:
+    try:
+        cf.run(list(cmd))
+    except RuntimeError as e:
+        return str(e)
+    raise AssertionError("the command was meant to fail")
+
+
+def test_a_failed_command_never_shows_a_signed_url():
+    # how ffmpeg reports a source it can't open
+    msg = _failure_of(sys.executable, "-c",
+                      f"import sys; sys.stderr.write(\"{SIGNED}: Server returned 403 Forbidden\\n\"); sys.exit(1)")
+    assert "SECRET" not in msg and "X-Amz" not in msg
+    assert "<url>" in msg and "Server returned 403" in msg           # the useful part stays
+
+
+def test_a_signed_url_cut_by_the_stderr_limit_stays_hidden():
+    # the URL straddles the 1000-character tail, so only its query string survives the cut
+    tail = " " + "x" * (999 - len(SIGNED) // 2)
+    msg = _failure_of(sys.executable, "-c",
+                      f"import sys; sys.stderr.write({SIGNED + tail!r}); sys.exit(1)")
+    assert "SECRET" not in msg and "X-Amz" not in msg
+
+
+def test_a_url_in_the_command_itself_is_hidden_too():
+    # the web process's waveform command has `-i <url>` inside the first four arguments
+    msg = _failure_of(sys.executable, "-c", "import sys; sys.exit(1)", SIGNED)
+    assert "SECRET" not in msg
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

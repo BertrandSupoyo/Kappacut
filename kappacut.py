@@ -287,11 +287,24 @@ def _exec(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+_URL_RE = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
+
+
+def redact_urls(text: str) -> str:
+    """Every URL in `text` as <url>. A source read from the bucket is a signed URL, and it's
+    a working credential until it expires; errors built from ffmpeg's output reach job rows,
+    the user's error toast and the logs."""
+    return _URL_RE.sub("<url>", text)
+
+
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
     p = _exec(cmd, cwd)
     _check_cancelled()                    # killed mid-run: say so, not "command failed"
     if p.returncode:
-        raise RuntimeError(f"command failed: {' '.join(str(c) for c in cmd[:4])} ...\n{p.stderr[-1000:]}")
+        # Redact, then cut. Cut first and a URL straddling the boundary loses its `https://`
+        # but keeps its X-Amz-Signature, and no longer looks like a URL to anything.
+        head = redact_urls(" ".join(str(c) for c in cmd[:4]))
+        raise RuntimeError(f"command failed: {head} ...\n{redact_urls(p.stderr)[-1000:]}")
     return p
 
 

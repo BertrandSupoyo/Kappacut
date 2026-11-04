@@ -695,7 +695,7 @@ async def _derive(key: str, src_key: str, build: list, what: str) -> None:
     try:
         await run_in_threadpool(work)
     except Exception:  # noqa: BLE001
-        # logged, not returned: ffmpeg's error text can carry the signed source URL
+        # logged, not returned: ffmpeg's error text means nothing to the person looking at it
         log.exception("%s failed for %s", what, src_key)
         raise HTTPException(500, f"couldn't make the {what}")
 

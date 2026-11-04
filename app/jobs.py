@@ -745,7 +745,6 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
         return
 
     err: str | None = None
-    src: Path | str = ""
     # The temp dir goes away in `finally`, so a crashed clip can't leave a source behind.
     tmp = tempfile.TemporaryDirectory(prefix="kappacut_render_")
     try:
@@ -847,10 +846,8 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
         raise
     except Exception as e:  # noqa: BLE001
         log.exception("render %s clip %d failed", project_id, idx + 1)
-        msg = str(e)
-        if isinstance(src, str) and src:
-            msg = msg.replace(src, "<source>")    # never show the signed internal URL to a user
-        err = f"clip {idx + 1}: {type(e).__name__}: {msg}"
+        # kappacut.run already redacts what ffmpeg said; this covers every other exception
+        err = f"clip {idx + 1}: {type(e).__name__}: {cf.redact_urls(str(e))}"
     finally:
         tmp.cleanup()
 
