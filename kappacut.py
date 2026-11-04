@@ -324,6 +324,14 @@ def probe_height(path: Path) -> int:
         return 0
 
 
+def has_audio(path: Path | str) -> bool:
+    """Does the file have an audio stream at all? YouTube serves video and audio as separate
+    files, so a grabbed `videoplayback.mp4` is often picture only."""
+    p = run([FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
+             "-of", "csv=p=0", str(path)])
+    return bool(p.stdout.strip())
+
+
 def _rate(rate: str) -> float:
     """ffprobe's "60000/1001" (or "30") as a number; 0 for "0/0", "" or junk."""
     num, _, den = (rate or "").partition("/")

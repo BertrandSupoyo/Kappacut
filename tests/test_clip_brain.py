@@ -921,6 +921,20 @@ def test_a_cancelled_job_stops_its_running_processes():
     assert "test-cancel" not in cf._CANCELLED
 
 
+def test_has_audio_tells_a_picture_only_file_from_one_with_sound():
+    if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+        print("    (skipped: ffmpeg not installed)")
+        return
+    picture = ["-f", "lavfi", "-i", "testsrc=size=160x90:rate=5:duration=1"]
+    sound = ["-f", "lavfi", "-i", "sine=frequency=440:duration=1"]
+    with tempfile.TemporaryDirectory() as d:
+        silent, voiced = Path(d) / "silent.mp4", Path(d) / "voiced.mp4"
+        subprocess.run([cf.FFMPEG, "-v", "error", "-y", *picture, str(silent)], check=True)
+        subprocess.run([cf.FFMPEG, "-v", "error", "-y", *picture, *sound, "-shortest", str(voiced)], check=True)
+        assert cf.has_audio(silent) is False
+        assert cf.has_audio(voiced) is True
+
+
 SIGNED = "https://acct.r2.cloudflarestorage.com/kappacut/users/u/source.mp4?X-Amz-Signature=SECRETSIG&X-Amz-Credential=SECRETKEY"
 
 

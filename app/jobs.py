@@ -392,6 +392,23 @@ async def _minutes_short(user_id: uuid.UUID, src_key: str) -> str | None:
             f"{max(0, math.floor(cap - used))} of your {cap} monthly minutes left.")
 
 
+NO_AUDIO_MSG = ("This video has no sound, so there's nothing to transcribe. If you downloaded it, "
+                "the picture and sound may be separate files: get a version with both and upload that.")
+
+
+async def _no_audio(src_key: str) -> bool:
+    """Picture-only source? Every clip is picked from what's said, so this can only fail -
+    and ffprobe knows from the container header, before a 2 GB download and with a message
+    a person can act on, where ffmpeg would say "Output file does not contain any stream".
+    Fails open: an unreadable header leaves the decision to the analysis itself."""
+    try:
+        return not await _in_thread(f"probe:{src_key}", cf.has_audio,
+                                    storage.presign_internal(src_key, ttl=300))
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't check %s for an audio stream", src_key, exc_info=True)
+        return False
+
+
 async def run_analyze(job_id: uuid.UUID) -> None:
     started = time.monotonic()
     scope = f"analyze:{job_id}"
@@ -417,7 +434,9 @@ async def run_analyze(job_id: uuid.UUID) -> None:
     try:
         attempt = await _begin_attempt(job_id)
         src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
-        short = await _minutes_short(user_id, src_key) if src_key else None
+        refusal = None
+        if src_key:
+            refusal = NO_AUDIO_MSG if await _no_audio(src_key) else await _minutes_short(user_id, src_key)
     except Exception as e:  # noqa: BLE001
         # outside the main try below: without this a storage or DB blip here left the row
         # 'running' under a live worker, which the sweep never reclaims
@@ -427,8 +446,8 @@ async def run_analyze(job_id: uuid.UUID) -> None:
     if src_key is None:
         await _fail(job_id, "source file missing", project_id)
         return
-    if short:
-        await _fail(job_id, short, project_id)
+    if refusal:
+        await _fail(job_id, refusal, project_id)
         return
 
     loop = asyncio.get_running_loop()
