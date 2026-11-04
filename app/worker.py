@@ -24,8 +24,8 @@ from app import groq_gate
 from app import jobs as jobs_mod
 from app.config import settings
 from app.db import async_session_maker, engine
-from app.jobs import (FANOUT, MAX_ATTEMPTS, owner_worker, release_clip, render_key, requeue,
-                      resume_render, retry_or_end_clip, run_analyze, run_render, run_render_clip)
+from app.jobs import (FANOUT, MAX_ATTEMPTS, owner_worker, recover_queued, release_clip, render_key,
+                      requeue, resume_render, retry_or_end_clip, run_analyze, run_render, run_render_clip)
 from app.models.job import Job
 from app.models.project import Analysis, Project
 from app.retention import run_gc
@@ -80,6 +80,10 @@ async def sweep_orphans(ctx: dict) -> None:
     when no worker restarts afterwards.
     """
     redis = ctx["redis"]
+    try:
+        await recover_queued()
+    except Exception:  # noqa: BLE001 — the running jobs below still need their sweep
+        log.warning("couldn't check queued jobs against the queue", exc_info=True)
     async with async_session_maker() as s:
         running = (await s.execute(
             select(Job.id, Job.project_id, Job.worker_id, Job.kind).where(Job.status == "running")

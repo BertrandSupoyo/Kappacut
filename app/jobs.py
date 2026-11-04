@@ -21,6 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
+from arq.jobs import Job as ArqJob, JobStatus
 from sqlalchemy import delete, select, update
 
 import kappacut as cf
@@ -188,6 +189,51 @@ async def requeue(job_id: uuid.UUID, kind: str, reason: str) -> bool:
 def _short_reason(e: BaseException) -> str:
     n = type(e).__name__
     return "Connection problem" if "Connection" in n or "Timeout" in n else "Temporary problem"
+
+
+# A 'queued' row counts as the user's one active job, but only a queue entry can run it. If
+# the entry never existed (Redis was down at enqueue, the web process died just after its
+# commit) or is gone (Redis lost its data, the task died before claiming the row), nothing
+# ever would, and the user is told "you already have a job running" until an admin steps in.
+# The sweep puts such rows back on the queue. An old copy of the task that turns out to be
+# still out there does no harm: _claim lets only one of them start the job.
+QUEUED_GRACE_SECONDS = 60         # the request that made the row may be about to enqueue it
+_RECOVER_LOCK_SECONDS = 120       # one sweep at a time per job, and time for a new entry to run
+
+
+async def recover_queued() -> int:
+    """Re-queue 'queued' jobs the queue doesn't know about; returns how many. After
+    MAX_ATTEMPTS of those a job is failed, so a task that keeps dying before it can claim
+    the row still releases the user."""
+    redis = await get_pool()
+    async with async_session_maker() as s:
+        rows = (await s.execute(
+            select(Job.id, Job.kind, Job.project_id, Job.arq_job_id).where(
+                Job.status == "queued",
+                Job.created_at < _now() - dt.timedelta(seconds=QUEUED_GRACE_SECONDS))
+        )).all()
+    recovered = 0
+    for job_id, kind, project_id, arq_id in rows:
+        if arq_id and await ArqJob(arq_id, redis).status() in (
+                JobStatus.queued, JobStatus.deferred, JobStatus.in_progress):
+            continue
+        if not await redis.set(f"kappacut:job:{job_id}:recovering", 1, ex=_RECOVER_LOCK_SECONDS, nx=True):
+            continue
+        tries_key = f"kappacut:job:{job_id}:recoveries"
+        tries = await redis.incr(tries_key)
+        await redis.expire(tries_key, 2 * 86400)
+        if tries > MAX_ATTEMPTS:
+            log.error("%s %s: never got running after %d re-queues", kind, job_id, MAX_ATTEMPTS)
+            await _fail(job_id, "couldn't get this job started - please try again",
+                        project_id if kind == "analyze" else None)
+            continue
+        task = "analyze_task" if kind == "analyze" else "render_task"
+        arq_job = await redis.enqueue_job(task, str(job_id))
+        if arq_job:
+            await _set_job(job_id, arq_job_id=arq_job.job_id)   # admin cancel aborts the right task
+        log.warning("%s %s: not on the queue - re-queued (%d of %d)", kind, job_id, tries, MAX_ATTEMPTS)
+        recovered += 1
+    return recovered
 
 
 async def _retry_or_fail(job_id: uuid.UUID, kind: str, e: BaseException,
