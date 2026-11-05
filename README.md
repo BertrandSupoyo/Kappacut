@@ -43,6 +43,34 @@ Before changing models, prompts or effort, re-run the same test — `tests/model
 stored transcripts, so no Whisper cost; about $0.03 per video, hard spend cap — and keep the
 change only if it wins. The run command is in the file's docstring.
 
+## Measuring and training the picks
+
+Superusers do this in **Admin > Training**: watch one of your own videos, mark every moment worth
+posting, then finish to see how the AI compares. The AI's picks stay hidden until you finish, so
+label a video before you open it in the editor. Labels and runs are in the database. Labelled
+projects are kept by the retention job, and deleting a project deletes its label.
+
+| Number | Question it answers |
+|---|---|
+| **Found** | Of the moments you marked, how many did the AI catch? This is the one to quote, because it shows what the AI missed. |
+| **Good** | Of the AI's picks, how many sit on a moment you marked? |
+| **Ranking** | When a video has good and bad picks, how often does a good one score higher? 50% is chance. |
+
+These show how well the AI matches one person's taste, not how many views a clip gets.
+
+**Run training** learns the six `SCORE_WEIGHTS` from your labels and Keep/Skip choices, then tests
+them on videos they weren't trained on. It needs at least 10 videos that each have both a good
+and a bad pick, and it only offers replacement weights if they clearly beat the current ones.
+Adopting them is a one-line edit in `kappacut.py`; nothing changes on its own.
+
+The same numbers are available from the command line, and make no AI calls:
+
+```powershell
+docker compose exec web python -m app.cli eval-picks      # against what users kept and rendered
+docker compose exec web python -m app.cli eval-labels     # against moments marked by hand
+docker compose exec web python -m app.cli train-weights   # learn the score weights
+```
+
 ## Running it
 
 ```powershell

@@ -10,6 +10,8 @@ import { Reset } from "./pages/Reset";
 import { Projects } from "./pages/Projects";
 import { Account } from "./pages/Account";
 import { Admin } from "./pages/Admin";
+import { AdminTraining } from "./pages/AdminTraining";
+import { AdminLabel } from "./pages/AdminLabel";
 import { Editor } from "./pages/Editor";
 import { NotFound } from "./pages/NotFound";
 
@@ -58,6 +60,26 @@ export function App() {
           <RequireVerified>
             <AppShell>
               <Admin />
+            </AppShell>
+          </RequireVerified>
+        }
+      />
+      <Route
+        path="/admin/training"
+        element={
+          <RequireVerified>
+            <AppShell>
+              <AdminTraining />
+            </AppShell>
+          </RequireVerified>
+        }
+      />
+      <Route
+        path="/admin/training/:id"
+        element={
+          <RequireVerified>
+            <AppShell>
+              <AdminLabel />
             </AppShell>
           </RequireVerified>
         }

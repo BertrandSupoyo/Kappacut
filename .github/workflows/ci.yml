@@ -53,6 +53,8 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends ffmpeg
       - run: python tests/test_clip_brain.py
       - run: python tests/test_evaluate.py
+      - run: python tests/test_train_weights.py
+      - run: python tests/test_training.py
       - run: python tests/test_request_checks.py
 
   frontend:

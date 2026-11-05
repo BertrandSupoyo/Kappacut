@@ -8,6 +8,10 @@ report; `evaluate_project()` is the pure core (tests/test_evaluate.py).
 What counts: only projects the user actually reviewed - a saved edit or a render after the
 current analysis. An untouched project tells us nothing (nobody said yes or no), so it is
 reported as coverage, not scored as "all kept".
+
+Those decisions only cover clips the AI proposed, so they can't show what it missed. For that,
+Admin > Training and `python -m app.cli eval-labels` score the picks against moments marked by
+hand (the video_labels table); `evaluate_moments()` is the pure core.
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ from dataclasses import dataclass, field
 
 TRIM_THRESHOLD = 1.0          # seconds an edge must move to count as "trimmed"
 RENDER_OVERLAP = 0.5          # a rendered range covering half a pick counts as rendering it
+MOMENT_OVERLAP = 0.5          # a pick and a marked moment match when they share half of the shorter one
 
 
 def _score(c: dict) -> float:
@@ -41,6 +46,11 @@ def _framing_changed(edit_look: dict | None, auto: dict | None) -> bool:
     if bool(edit_look.get("follow")) != bool(crop.get("follow")):
         return True
     return any(abs(float(edit_look.get(k, 0.5)) - float(crop.get(k, 0.5))) > 0.05 for k in ("px", "py", "zoom"))
+
+
+def _pairs_right(pairs: list[tuple[float, float]]) -> float:
+    """Of (should-win, should-lose) score pairs, how many went the right way; a tie is half."""
+    return sum(1 for a, b in pairs if a > b) + 0.5 * sum(1 for a, b in pairs if a == b)
 
 
 def evaluate_project(clips: list[dict], edits: dict | None, rendered: list[tuple[float, float]]) -> dict:
@@ -79,8 +89,57 @@ def evaluate_project(clips: list[dict], edits: dict | None, rendered: list[tuple
         "score_kept": sum(r["score"] for r in kept) / len(kept) if kept else None,
         "score_skipped": sum(r["score"] for r in skipped) / len(skipped) if skipped else None,
         "pairs": len(pairs),
-        "pairs_right": sum(1 for k, s in pairs if k > s) + 0.5 * sum(1 for k, s in pairs if k == s),
+        "pairs_right": _pairs_right(pairs),
     }
+
+
+def matches_moment(a0: float, a1: float, m0: float, m1: float) -> bool:
+    """Measured against the shorter side, so a long pick that fully contains a short moment
+    matches, and a pick that only brushes one doesn't."""
+    return _overlap(a0, a1, m0, m1) >= MOMENT_OVERLAP * max(min(a1 - a0, m1 - m0), 0.1)
+
+
+def evaluate_moments(clips: list[dict], moments: list[tuple[float, float]]) -> dict:
+    """Per-video numbers against the moments someone marked: `found` of `moments` were caught
+    (recall), `good` of `picks` sit on a moment (precision). The moments must be every good
+    one in the video, or a fine pick the labeller skipped counts against the AI."""
+    spans = [(float(c["start_seconds"]), float(c["end_seconds"])) for c in clips]
+    good = [any(matches_moment(*s, *m) for m in moments) for s in spans]
+    pairs = [(_score(a), _score(b)) for a, a_good in zip(clips, good) if a_good
+             for b, b_good in zip(clips, good) if not b_good]
+    return {
+        "picks": len(clips),
+        "good": sum(good),
+        "moments": len(moments),
+        "found": sum(any(matches_moment(*s, *m) for s in spans) for m in moments),
+        "pairs": len(pairs),
+        "pairs_right": _pairs_right(pairs),
+    }
+
+
+def label_is_current(label_bytes: int | None, source_bytes: int | None) -> bool:
+    """False once the project's source was replaced: the times point at a different video."""
+    return label_bytes is None or source_bytes is None or label_bytes == source_bytes
+
+
+def label_spans(moments: list[dict] | None) -> list[tuple[float, float]]:
+    return [(float(m["start"]), float(m["end"])) for m in moments or []]
+
+
+async def load_labels(session) -> dict:
+    """{project id: [(start, end), ...]} for every finished label that still fits its video."""
+    from sqlalchemy import select
+
+    from app.models.project import Project
+    from app.models.training import VideoLabel
+
+    rows = (await session.execute(
+        select(VideoLabel, Project.source_bytes)
+        .join(Project, Project.id == VideoLabel.project_id)
+        .where(VideoLabel.done)
+    )).all()
+    return {label.project_id: label_spans(label.moments) for label, size in rows
+            if label_is_current(label.source_bytes, size)}
 
 
 @dataclass
@@ -101,12 +160,14 @@ class Report:
 
 async def build_report(session, user_email: str | None = None) -> Report:
     from sqlalchemy import select
+    from sqlalchemy.orm import defer
 
     from app.models.job import Job
     from app.models.project import Analysis, Project, ProjectEdit
     from app.models.user import User
 
-    q = select(Project, Analysis).join(Analysis, Analysis.project_id == Project.id)
+    q = (select(Project, Analysis).join(Analysis, Analysis.project_id == Project.id)
+         .options(defer(Analysis.segments)))          # the Admin page reads this; transcripts are large
     if user_email:
         q = q.join(User, User.id == Project.user_id).where(User.email == user_email)
     rep = Report()
@@ -155,4 +216,68 @@ def format_report(rep: Report) -> str:
                      f"of {t['pairs']} pairs (50% = no better than chance).")
     else:
         lines.append("Score ranking: no skipped clips yet, so the score can't be checked against your choices.")
+    return "\n".join(lines)
+
+
+@dataclass
+class MomentReport:
+    scored: list[tuple[str, dict]] = field(default_factory=list)        # evaluate_moments + "blind"
+    stale: list[str] = field(default_factory=list)                      # labels whose video was replaced
+
+    def total(self, blind_only: bool = False) -> dict:
+        rows = [p for _, p in self.scored if p["blind"] or not blind_only]
+        t = {k: sum(p[k] for p in rows) for k in ("moments", "found", "picks", "good", "pairs", "pairs_right")}
+        return {"videos": len(rows), **t}
+
+
+async def build_moment_report(session) -> MomentReport:
+    from sqlalchemy import select
+
+    from app.models.project import Analysis, Project
+    from app.models.training import VideoLabel
+
+    rep = MomentReport()
+    rows = (await session.execute(
+        select(Project.name, Project.source_bytes, Analysis.clips, VideoLabel)
+        .join(Analysis, Analysis.project_id == Project.id)
+        .join(VideoLabel, VideoLabel.project_id == Project.id)
+        .where(VideoLabel.done)
+        .order_by(Project.created_at)
+    )).all()
+    for name, size, clips, label in rows:
+        if label_is_current(label.source_bytes, size):
+            rep.scored.append((name, {**evaluate_moments(clips or [], label_spans(label.moments)), "blind": label.blind}))
+        else:
+            rep.stale.append(name)
+    return rep
+
+
+def format_moment_report(rep: MomentReport) -> str:
+    def pct(a, b):
+        return f"{100 * a / b:.0f}%" if b else "—"
+
+    lines = []
+    if rep.scored:
+        lines.append(f"{'project':<40} {'moments':>8} {'found':>6} {'picks':>6} {'good':>6}")
+        for name, p in rep.scored:
+            lines.append(f"{name[:40]:<40} {p['moments']:>8} {pct(p['found'], p['moments']):>6} "
+                         f"{p['picks']:>6} {pct(p['good'], p['picks']):>6}")
+        t = rep.total()
+        lines.append("-" * 70)
+        lines.append(f"{'ALL':<40} {t['moments']:>8} {pct(t['found'], t['moments']):>6} "
+                     f"{t['picks']:>6} {pct(t['good'], t['picks']):>6}")
+        lines.append("")
+        lines.append(f"Found: the AI caught {t['found']} of the {t['moments']} moments you marked ({pct(t['found'], t['moments'])}).")
+        lines.append(f"Good: {t['good']} of its {t['picks']} picks sit on one of them ({pct(t['good'], t['picks'])}).")
+        if t["pairs"]:
+            lines.append(f"Ranking: a good pick outscored a bad one in {pct(t['pairs_right'], t['pairs'])} "
+                         f"of {t['pairs']} pairs (50% = no better than chance).")
+        else:
+            lines.append("Ranking: needs a video with both good and bad picks.")
+        blind = rep.total(blind_only=True)
+        lines.append(f"Marked before seeing the AI's picks: {blind['videos']} of {t['videos']} videos.")
+    else:
+        lines.append("No labelled videos yet. Label them in Admin > Training.")
+    for name in rep.stale:
+        lines.append(f"WARNING: the video in \"{name[:60]}\" was replaced after labelling, so it was not scored.")
     return "\n".join(lines)

@@ -27,6 +27,7 @@ from app.projects import media_router, router as projects_router
 from app.quota import QuotaError
 from app.ratelimit import GlobalRateLimitMiddleware
 from app.sfx import router as sfx_router
+from app.training import router as training_router
 from app.uploads import router as uploads_router
 
 
@@ -128,6 +129,7 @@ async def health() -> JSONResponse:
 install_auth(app)
 app.include_router(account_router)
 app.include_router(admin_router)
+app.include_router(training_router)
 app.include_router(projects_router)
 app.include_router(media_router)
 app.include_router(sfx_router)

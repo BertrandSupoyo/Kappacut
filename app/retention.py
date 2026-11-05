@@ -16,6 +16,7 @@ from app.db import async_session_maker
 from app.email import send_retention_warning
 from app.models.job import Job
 from app.models.project import Project
+from app.models.training import VideoLabel
 from app.models.user import User
 
 log = logging.getLogger("kappacut.retention")
@@ -38,6 +39,9 @@ async def run_gc() -> dict:
     warned = deleted = skipped = objects = 0
     now = dt.datetime.now(dt.UTC)
     idle = func.coalesce(Project.last_opened_at, Project.created_at)
+    # a finished label is hours of someone's work and the training set; a project nobody opens
+    # again is normal for one, and deleting it would quietly shrink what the score is based on
+    unlabelled = Project.id.not_in(select(VideoLabel.project_id).where(VideoLabel.done))
 
     async with async_session_maker() as s:
         # 1) warn — past the warn line but not yet past the delete line
@@ -46,6 +50,7 @@ async def run_gc() -> dict:
                 idle < _idle_before(settings.retention_warn_days),
                 idle >= _idle_before(settings.retention_delete_days),
                 Project.retention_warned_at.is_(None),
+                unlabelled,
             )
         )).scalars().all()
         for p in to_warn:
@@ -61,7 +66,7 @@ async def run_gc() -> dict:
 
         # 2) delete
         to_delete = (await s.execute(
-            select(Project).where(idle < _idle_before(settings.retention_delete_days))
+            select(Project).where(idle < _idle_before(settings.retention_delete_days), unlabelled)
         )).scalars().all()
         for p in to_delete:
             active = await s.scalar(

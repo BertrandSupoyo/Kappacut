@@ -10,7 +10,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.evaluate import evaluate_project  # noqa: E402
+from app.evaluate import (  # noqa: E402
+    MomentReport,
+    evaluate_moments,
+    evaluate_project,
+    format_moment_report,
+    label_is_current,
+    label_spans,
+    matches_moment,
+)
 
 
 def _clip(a, b, score=50, crop=None):
@@ -60,6 +68,60 @@ def test_older_analyses_fall_back_to_the_1_to_10_score():
     old = [{"start_seconds": 0, "end_seconds": 20, "score": 8.0}, {"start_seconds": 30, "end_seconds": 50, "score": 3.0}]
     p = evaluate_project(old, {"1": {"keep": False}}, [])
     assert p["score_kept"] == 80 and p["score_skipped"] == 30
+
+
+def test_a_pick_matches_a_moment_when_they_share_half_of_the_shorter():
+    assert matches_moment(100, 130, 110, 120)                            # contains it
+    assert matches_moment(110, 120, 100, 130)                            # sits inside it
+    assert matches_moment(100, 120, 110, 130)                            # half of each
+    assert not matches_moment(100, 120, 118, 138)                        # only brushes it
+    assert not matches_moment(100, 120, 200, 220)
+
+
+def test_found_and_good_measure_different_failures():
+    clips = [_clip(100, 120, 90), _clip(105, 125, 80), _clip(300, 320, 70)]
+    p = evaluate_moments(clips, [(100.0, 125.0), (500.0, 520.0)])
+    assert p["moments"] == 2 and p["found"] == 1                         # two picks on one moment count once
+    assert p["picks"] == 3 and p["good"] == 2                            # ...but both are good picks
+    assert p["pairs"] == 2 and p["pairs_right"] == 2
+
+
+def test_ranking_against_moments_catches_a_bad_pick_scored_high():
+    clips = [_clip(100, 120, 40), _clip(300, 320, 90)]
+    p = evaluate_moments(clips, [(100.0, 120.0)])
+    assert p["pairs"] == 1 and p["pairs_right"] == 0
+
+
+def test_a_video_with_no_good_moments_scores_every_pick_bad():
+    p = evaluate_moments([_clip(0, 20)], [])
+    assert p["good"] == 0 and p["moments"] == 0 and p["pairs"] == 0
+
+
+def test_a_label_stops_counting_once_its_video_is_replaced():
+    assert label_is_current(1000, 1000)
+    assert not label_is_current(1000, 2000)
+    assert label_is_current(None, 2000) and label_is_current(1000, None)      # a size never recorded
+
+
+def test_label_spans_reads_stored_moments():
+    assert label_spans([{"start": 1, "end": 2.5, "note": "x"}]) == [(1.0, 2.5)]
+    assert label_spans(None) == [] and label_spans([]) == []
+
+
+def _scored(blind, found=1, moments=2):
+    return {"picks": 4, "good": 2, "moments": moments, "found": found, "pairs": 4, "pairs_right": 3, "blind": blind}
+
+
+def test_moment_totals_can_count_only_blind_labels():
+    rep = MomentReport(scored=[("a", _scored(True)), ("b", _scored(False, found=2))])
+    assert rep.total()["videos"] == 2 and rep.total()["found"] == 3 and rep.total()["moments"] == 4
+    assert rep.total(blind_only=True)["videos"] == 1 and rep.total(blind_only=True)["found"] == 1
+
+
+def test_report_says_how_many_labels_were_blind_and_flags_a_replaced_video():
+    text = format_moment_report(MomentReport(scored=[("a", _scored(True))], stale=["old upload"]))
+    assert "1 of 1 videos" in text and "old upload" in text and "not scored" in text
+    assert "Admin > Training" in format_moment_report(MomentReport())
 
 
 if __name__ == "__main__":

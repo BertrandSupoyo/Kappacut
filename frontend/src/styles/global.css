@@ -169,6 +169,38 @@ fieldset.dim-when-disabled:disabled { opacity: .4; pointer-events: none; }
 .admin-input { width: 88px; font: inherit; color: var(--text); background: rgba(0,0,0,.28); border: 1px solid var(--border); border-radius: var(--r-xs); padding: 5px 8px; }
 .admin-input:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus); }
 
+/* ---- admin: training ---- */
+/* the two timeline identities, checked with the data-viz palette validator against --glass */
+.training { --viz-you: #4a8fe0; --viz-ai: #e3622f; }
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: var(--sp-3); }
+.stat-tile { padding: var(--sp-3) var(--sp-4); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.stat-label { font-size: var(--fs-xs); color: var(--text-mut); }
+.stat-value { font: 600 var(--fs-2xl) "Space Grotesk", sans-serif; font-variant-numeric: tabular-nums; margin: 2px 0; }
+.stat-sub { font-size: var(--fs-xs); color: var(--text-mut); }
+.meter { height: 8px; border-radius: var(--r-pill); background: var(--glass-2); overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--text); border-radius: var(--r-pill); }
+.paste-line { margin: 0 0 var(--sp-3); padding: var(--sp-2) var(--sp-3); background: var(--glass-2); border: 1px solid var(--border); border-radius: var(--r-xs); font-size: var(--fs-xs); overflow-x: auto; }
+.label-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); gap: var(--sp-4); align-items: start; }
+@media (max-width: 900px) { .label-grid { grid-template-columns: minmax(0, 1fr); } }
+.label-video { width: 100%; max-height: 56vh; background: #000; border-radius: var(--r-xs); display: block; }
+.tl { display: grid; gap: 6px; }
+.tl-row { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: center; gap: var(--sp-2); }
+.tl-name { font-size: var(--fs-xs); color: var(--text-mut); }
+.tl-track { position: relative; height: 22px; background: var(--glass-2); border-radius: 4px; cursor: pointer; }
+.tl-seg { position: absolute; top: 3px; bottom: 3px; min-width: 4px; padding: 0; border: 0; border-radius: 3px; background: var(--seg); cursor: pointer; }
+.tl-seg.hollow { background: transparent; border: 1.5px solid var(--seg); }
+.tl-seg:focus-visible { outline: 2px solid var(--white); outline-offset: 1px; }
+.tl-pending { position: absolute; top: 3px; bottom: 3px; min-width: 2px; border: 1.5px dashed var(--viz-you); border-radius: 3px; pointer-events: none; }
+.tl-head { position: absolute; top: -2px; bottom: -2px; width: 2px; margin-left: -1px; background: var(--white); pointer-events: none; }
+.tl-scale { display: flex; justify-content: space-between; font-size: var(--fs-2xs); font-variant-numeric: tabular-nums; }
+.moment-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); }
+.moment-row { display: flex; align-items: center; gap: 6px; }
+.moment-jump { width: 30px; height: 30px; padding: 0; flex: none; font-size: var(--fs-xs); }
+.time-input { width: 62px; flex: none; padding: 5px 6px; font-variant-numeric: tabular-nums; }
+.moment-note { flex: 1; width: auto; min-width: 0; }
+.link-btn { padding: 0; border: 0; background: none; color: var(--text); font: inherit; font-variant-numeric: tabular-nums; text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--border-strong); cursor: pointer; }
+.link-btn:hover { text-decoration-color: currentColor; }
+
 /* ---- review ---- */
 .review-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); }
 .review-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--sp-4); align-items: stretch; }

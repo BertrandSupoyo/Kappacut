@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, jget, jpost } from "@/api/client";
@@ -43,7 +43,7 @@ const STATUS_COLOR: Record<AdminJob["status"], string> = {
   error: "var(--danger)",
 };
 
-export function Admin() {
+export function AdminOnly({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   if (!user?.is_superuser) {
     return (
@@ -55,12 +55,21 @@ export function Admin() {
       </div>
     );
   }
+  return <>{children}</>;
+}
+
+export function Admin() {
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-5)", margin: "var(--sp-4) 0" }}>
-      <h1 style={{ fontSize: "var(--fs-2xl)" }}>Admin</h1>
-      <QueueSection />
-      <UsersSection />
-    </div>
+    <AdminOnly>
+      <div style={{ display: "flex", flexDirection: "column", gap: "var(--sp-5)", margin: "var(--sp-4) 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)", flexWrap: "wrap" }}>
+          <h1 style={{ fontSize: "var(--fs-2xl)" }}>Admin</h1>
+          <Link to="/admin/training" className="btn ghost" style={{ marginLeft: "auto", padding: "6px 14px" }}>Training</Link>
+        </div>
+        <QueueSection />
+        <UsersSection />
+      </div>
+    </AdminOnly>
   );
 }
 

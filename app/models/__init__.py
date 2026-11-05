@@ -2,6 +2,7 @@
 from app.models.job import Job, RenderOutput
 from app.models.project import Analysis, Project, ProjectEdit
 from app.models.sfx import SfxAsset
+from app.models.training import TrainingRun, VideoLabel
 from app.models.usage import UsageEvent
 from app.models.user import User
 
@@ -14,4 +15,6 @@ __all__ = [
     "RenderOutput",
     "SfxAsset",
     "UsageEvent",
+    "VideoLabel",
+    "TrainingRun",
 ]
