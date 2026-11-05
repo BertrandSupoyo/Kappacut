@@ -23,6 +23,16 @@ _DEV_SECRETS = {
 # Hosts that only exist on a dev machine or inside the dev compose network
 # (compose.override.yaml's S3 mock is the `minio` service, its Mailpit the `mailhog` one).
 _DEV_HOSTS = {"", "localhost", "127.0.0.1", "::1", "minio", "mailhog", "mailpit"}
+# The date of the current Terms and Privacy Policy text (frontend/src/pages/Legal.tsx). Each
+# new account records the version it accepted, so change this whenever that text changes.
+TERMS_VERSION = "2026-11-05"
+# Who runs this deployment. The legal pages print these, so a public deploy needs them all.
+_LEGAL_FIELDS = {
+    "support_email": "the address on the legal pages and in error messages",
+    "legal_name": "the person or company running this service",
+    "legal_address": "the postal address on the legal pages",
+    "legal_jurisdiction": "the law the Terms are governed by",
+}
 
 
 class Settings(BaseSettings):
@@ -128,6 +138,21 @@ class Settings(BaseSettings):
     groq_tokens_per_minute: int = 8000       # shared-key TPM budget (free tier)
     retention_warn_days: int = 30
     retention_delete_days: int = 37  # 0 disables
+    retention_unverified_days: int = 14   # accounts that never confirmed their email; 0 disables
+    backup_keep: int = 7                  # nightly database dumps kept (compose reads the same variable)
+
+    # --- launch (legal pages, support, who may sign up) ------------------
+    support_email: str = ""
+    copyright_email: str = ""             # takedown notices; empty = support_email
+    legal_name: str = ""
+    legal_address: str = ""
+    legal_jurisdiction: str = ""
+    legal_eu_representative: str = ""     # only if you need one under GDPR Art. 27
+    hosting_provider: str = "netcup (Germany or Austria)"   # named in the Privacy Policy
+    # Keeps the "draft" banner off the legal pages. Set it once a lawyer has checked them.
+    legal_reviewed: bool = False
+    # Only emails an admin has invited can register (Admin > Invites).
+    invite_only: bool = False
 
     # --- ops (Phase 8) ------------------------------------------------
     # nightly pg_dump is a dedicated compose service (`backup`), not app code
@@ -200,6 +225,9 @@ class Settings(BaseSettings):
         # every analysis transcribes through Groq, with or without the Anthropic picker
         if not self.groq_api_key:
             problems.append("GROQ_API_KEY is unset — every analysis would fail at transcription")
+        for field, what in _LEGAL_FIELDS.items():
+            if not getattr(self, field).strip():
+                problems.append(f"{field.upper()} is unset — {what}")
 
         if problems:
             raise RuntimeError(

@@ -14,11 +14,15 @@ import { AdminTraining } from "./pages/AdminTraining";
 import { AdminLabel } from "./pages/AdminLabel";
 import { Editor } from "./pages/Editor";
 import { NotFound } from "./pages/NotFound";
+import { Copyright, Privacy, Terms } from "./pages/Legal";
 
 export function App() {
   return (
     <Routes>
       <Route path="/" element={<Landing />} />
+      <Route path="/terms" element={<Terms />} />
+      <Route path="/privacy" element={<Privacy />} />
+      <Route path="/copyright" element={<Copyright />} />
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route path="/verify" element={<Verify />} />

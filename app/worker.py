@@ -57,6 +57,7 @@ async def retention_gc(ctx: dict) -> None:
 # replacing while it finishes its job) and must be left alone.
 HEARTBEAT_TTL = 45          # three missed beats: a live worker never lapses by accident
 HEARTBEAT_EVERY = 15
+_RESTARTED = "Our server restarted while working on this. Please try again."
 
 
 def _hb_key(worker_id: str) -> str:
@@ -112,8 +113,10 @@ async def sweep_orphans(ctx: dict) -> None:
                     # second time, and a retry that took it over since keeps its hold
                     if not await redis.exists(_hb_key(w)) and await release_clip(redis, jid, idx, owner):
                         log.warning("render %s: clip %d lost with worker %s", jid, idx + 1, w)
-                        await retry_or_end_clip(jid, await total_of(jid), idx,
-                                                f"clip {idx + 1}: worker stopped mid-clip")
+                        await retry_or_end_clip(
+                            jid, await total_of(jid), idx,
+                            f"Clip {idx + 1}: our server restarted while cutting it. Please render it again.",
+                            f"clip {idx + 1}: worker {w} stopped mid-clip")
                 # Nothing held and nothing happened for a whole job timeout: the chain broke
                 # where no owner was recorded (a clip task lost before claiming its slot).
                 # Pick it back up from the clips that never ended.
@@ -131,7 +134,8 @@ async def sweep_orphans(ctx: dict) -> None:
         orphaned = {pid for _, pid in dead}
         res = await s.execute(
             update(Job).where(Job.id.in_([jid for jid, _ in dead]), Job.status == "running")
-            .values(status="error", error=f"worker restarted (gave up after {MAX_ATTEMPTS} attempts)")
+            .values(status="error", error=_RESTARTED,
+                    error_detail=f"worker restarted (gave up after {MAX_ATTEMPTS} attempts)")
         )
         # The job row is only half the state. A project whose analyze job died still reads
         # 'analyzing', and the SPA polls that forever with no error to show — so fail the
@@ -149,7 +153,7 @@ async def sweep_orphans(ctx: dict) -> None:
                         .values(status="ready", error=None))
         stuck = (await s.execute(
             update(Project).where(*stranded, ~has_analysis)
-            .values(status="failed", error="worker restarted")
+            .values(status="failed", error=_RESTARTED)
         )).rowcount or 0
         await s.commit()
     if res.rowcount:

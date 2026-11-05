@@ -96,15 +96,19 @@ async def _set_job(job_id: uuid.UUID, **fields) -> bool:
     return bool(res.rowcount)
 
 
-async def _fail(job_id: uuid.UUID, error: str, project_id: uuid.UUID | None = None) -> None:
+async def _fail(job_id: uuid.UUID, error: str, project_id: uuid.UUID | None = None,
+                detail: str | None = None) -> None:
     """Terminal failure for a job (and the project it belongs to, when analyze owns it).
 
     Every path out of a job has to land here: a row left at 'running' counts against
     `quota_concurrent_jobs` forever, which locks the user out of starting anything new
     until a worker restart sweeps it.
+
+    `error` is what the user reads (see explain); `detail` is what happened, for admins.
     """
+    extra = {"error_detail": cf.redact_urls(detail)[:4000]} if detail else {}
     # An already-ended job leaves the project alone: it may have a newer job running.
-    if await _set_job(job_id, status="error", error=error[:2000], finished_at=_now()) \
+    if await _set_job(job_id, status="error", error=error[:2000], finished_at=_now(), **extra) \
             and project_id is not None:
         async with async_session_maker() as s:
             # a failed *re*-analysis must not hide the clips the project already has: keep it
@@ -116,6 +120,55 @@ async def _fail(job_id: uuid.UUID, error: str, project_id: uuid.UUID | None = No
                 error=None if has_analysis else error[:2000],
             ))
             await s.commit()
+
+
+def explain(e: BaseException, kind: str) -> str:
+    """The sentence a person sees when `kind` ("analyze" or "clip") failed. ffmpeg's stderr and
+    exception names mean nothing to them and say more than they should about the server, so
+    those go in Job.error_detail for admins, and every other reason gets a next step."""
+    if type(e).__name__ == "GroqQuotaError":           # already written for them ("try again in ~N min")
+        return str(e)
+    if retriable(e):
+        return "A service we rely on is having trouble right now. Please try again in a few minutes."
+    if str(e).startswith("command failed"):            # kappacut.run: ffmpeg or ffprobe refused the file
+        if kind == "clip":
+            return "We couldn't cut this part of your video. Try moving the clip's start or end a little."
+        return ("We couldn't read this video. The file may be damaged or in an unusual format: "
+                "try exporting it again as an MP4 and uploading that.")
+    contact = f"email {settings.support_email}" if settings.support_email else "contact support"
+    return f"Something went wrong on our side. Please try again, and if it keeps happening {contact}."
+
+
+async def stop_jobs(reason: str, *where) -> int:
+    """End every live job matching `where`. Their tasks see it within seconds (_watch_job) and
+    kill their ffmpeg; a job still waiting in the queue never starts."""
+    async with async_session_maker() as s:
+        rows = (await s.execute(select(Job.id, Job.kind, Job.project_id)
+                                .where(Job.status.in_(_LIVE), *where))).all()
+    for job_id, kind, project_id in rows:
+        await _fail(job_id, reason, project_id if kind == "analyze" else None)
+    return len(rows)
+
+
+# Every way of ending a job from outside (an admin's Cancel, a deleted account or project, a
+# takedown) changes its row, so that's what a running task watches. arq's own abort can't do
+# this: it has to be switched on per worker, and a render's clip tasks have no recorded id.
+JOB_WATCH_SECONDS = 2.0
+
+
+async def _watch_job(job_id: uuid.UUID, scope: str) -> None:
+    """Runs beside a task's work and stops `scope` once the job is no longer live. It keeps
+    polling after that, in case the work hadn't reached its first ffmpeg yet (a download)."""
+    while True:
+        await asyncio.sleep(JOB_WATCH_SECONDS)
+        try:
+            async with async_session_maker() as s:
+                status = await s.scalar(select(Job.status).where(Job.id == job_id))
+        except Exception:  # noqa: BLE001 — a database blip isn't a cancel
+            log.warning("couldn't check job %s", job_id, exc_info=True)
+            continue
+        if status not in _LIVE:
+            cf.cancel_scope(scope)
 
 
 # --------------------------------------------------------------------- retries
@@ -181,7 +234,7 @@ async def requeue(job_id: uuid.UUID, kind: str, reason: str) -> bool:
     task = "analyze_task" if kind == "analyze" else "render_task"
     arq_job = await (await get_pool()).enqueue_job(task, str(job_id), _defer_by=delay)
     if arq_job:
-        await _set_job(job_id, arq_job_id=arq_job.job_id)   # admin cancel aborts the right task
+        await _set_job(job_id, arq_job_id=arq_job.job_id)   # recover_queued looks this entry up
     log.warning("%s %s: %s - retry %d/%d in %ds", kind, job_id, reason, done + 1, MAX_ATTEMPTS, delay)
     return True
 
@@ -230,7 +283,7 @@ async def recover_queued() -> int:
         task = "analyze_task" if kind == "analyze" else "render_task"
         arq_job = await redis.enqueue_job(task, str(job_id))
         if arq_job:
-            await _set_job(job_id, arq_job_id=arq_job.job_id)   # admin cancel aborts the right task
+            await _set_job(job_id, arq_job_id=arq_job.job_id)   # the next sweep looks this entry up
         log.warning("%s %s: not on the queue - re-queued (%d of %d)", kind, job_id, tries, MAX_ATTEMPTS)
         recovered += 1
     return recovered
@@ -245,7 +298,7 @@ async def _retry_or_fail(job_id: uuid.UUID, kind: str, e: BaseException,
             return
     except Exception:  # noqa: BLE001
         log.warning("%s %s: couldn't queue a retry", kind, job_id, exc_info=True)
-    await _fail(job_id, f"{type(e).__name__}: {e}", project_id)
+    await _fail(job_id, explain(e, kind), project_id, detail=f"{type(e).__name__}: {e}")
 
 
 async def _claim(s, job_id: uuid.UUID) -> bool:
@@ -409,6 +462,23 @@ async def _no_audio(src_key: str) -> bool:
         return False
 
 
+def not_english_msg(language: str) -> str:
+    return (f"This video sounds like it's in {language}. Kappacut only works with English for now, "
+            "so the clips and captions would be poor. None of your minutes were used.")
+
+
+async def _other_language(job_id: uuid.UUID, src_key: str) -> str | None:
+    """The language this video is in, if it's clearly not English. Fails open, like the two
+    checks above: a Groq or storage hiccup here leaves the decision to the analysis itself."""
+    await _set_job(job_id, progress_pct=1, progress_msg="Checking the language")
+    try:
+        return await _in_thread(f"language:{job_id}", cf.detect_foreign_language,
+                                storage.presign_internal(src_key, ttl=600), pipeline.get_cfg())
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't check the language of %s", src_key, exc_info=True)
+        return None
+
+
 async def run_analyze(job_id: uuid.UUID) -> None:
     started = time.monotonic()
     scope = f"analyze:{job_id}"
@@ -434,9 +504,12 @@ async def run_analyze(job_id: uuid.UUID) -> None:
     try:
         attempt = await _begin_attempt(job_id)
         src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
-        refusal = None
+        refusal = language = None
         if src_key:
             refusal = NO_AUDIO_MSG if await _no_audio(src_key) else await _minutes_short(user_id, src_key)
+        # the first attempt has already answered this for any retry; "Analyze anyway" skips it
+        if src_key and not refusal and attempt == 1 and not job_payload.get("any_language"):
+            language = await _other_language(job_id, src_key)
     except Exception as e:  # noqa: BLE001
         # outside the main try below: without this a storage or DB blip here left the row
         # 'running' under a live worker, which the sweep never reclaims
@@ -444,10 +517,18 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         await _retry_or_fail(job_id, "analyze", e, project_id)
         return
     if src_key is None:
-        await _fail(job_id, "source file missing", project_id)
+        await _fail(job_id, "The video file for this project is missing. Please upload it again.", project_id)
         return
     if refusal:
         await _fail(job_id, refusal, project_id)
+        return
+    if language:
+        # the editor offers "Analyze anyway" when it sees this on the job
+        await _set_job(job_id, result={"language": language})
+        await _fail(job_id, not_english_msg(language), project_id)
+        return
+    # ended during those checks: don't fetch a 2 GB video for nothing
+    if not await _set_job(job_id, progress_pct=2, progress_msg="Fetching your video"):
         return
 
     loop = asyncio.get_running_loop()
@@ -477,11 +558,11 @@ async def run_analyze(job_id: uuid.UUID) -> None:
             await asyncio.sleep(0.4)
 
     drainer = asyncio.create_task(drain())
+    watcher = asyncio.create_task(_watch_job(job_id, scope))
     # ffmpeg and Whisper both need a seekable local file, so the source comes down once
     # into a temp dir this job owns and that goes away with it — including on a crash.
     tmp = tempfile.TemporaryDirectory(prefix="kappacut_analyze_")
     try:
-        on_progress(2, "Fetching your video")      # a 2 GB download used to sit at 0%
         src = await asyncio.to_thread(
             storage.download, src_key, Path(tmp.name) / Path(src_key).name
         )
@@ -545,6 +626,11 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         if _timed_out(started):
             await asyncio.shield(_fail(job_id, _timeout_msg(), project_id))
         raise
+    except cf.Cancelled:                  # _watch_job: whoever ended the job already recorded why
+        q.put_nowait(None)
+        with contextlib.suppress(Exception):
+            await drainer
+        log.info("analyze %s stopped: its job was ended", project_id)
     except Exception as e:  # noqa: BLE001
         q.put_nowait(None)
         with contextlib.suppress(Exception):
@@ -552,12 +638,12 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         log.exception("analyze %s failed (attempt %d)", project_id, attempt)
         if retriable(e) and await requeue(job_id, "analyze", _short_reason(e)):
             return
-        # GroqQuotaError's message is already written for the user ("try again in ~N min")
-        msg = str(e) if type(e).__name__ == "GroqQuotaError" else f"{type(e).__name__}: {e}"
+        detail = f"{type(e).__name__}: {e}"
         if retriable(e):
-            msg += f" (gave up after {attempt} attempts)"
-        await _fail(job_id, msg, project_id)
+            detail += f" (gave up after {attempt} attempts)"
+        await _fail(job_id, explain(e, "analyze"), project_id, detail=detail)
     finally:
+        watcher.cancel()
         tmp.cleanup()
 
 
@@ -728,7 +814,7 @@ async def run_render(job_id: uuid.UUID) -> None:
         attempt = await _begin_attempt(job_id)
         src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
         if src_key is None or not total:
-            await _fail(job_id, "nothing to render")
+            await _fail(job_id, "There's nothing to render: the video or its clips are gone.")
             return
         # What every clip needs to know about the source, found once here: each clip task
         # used to LIST the bucket, HEAD the source and ffprobe it twice on its own.
@@ -810,8 +896,10 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
         return
 
     err: str | None = None
+    detail: str | None = None
     # The temp dir goes away in `finally`, so a crashed clip can't leave a source behind.
     tmp = tempfile.TemporaryDirectory(prefix="kappacut_render_")
+    watcher = asyncio.create_task(_watch_job(job_id, scope))
     try:
         await asyncio.to_thread(_prune_source_cache, job_id)
         await _set_job(job_id, stage=f"Rendering clip {idx + 1} of {total}")
@@ -905,15 +993,19 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
             # out of time once is out of time again: count the clip failed, don't retry it
             async def end() -> None:
                 if await release_clip(redis, job_id, idx, me):
-                    await clip_ended(job_id, total, idx, f"clip {idx + 1}: {_timeout_msg()}")
+                    await clip_ended(job_id, total, idx, f"Clip {idx + 1}: {_timeout_msg()}")
 
             await asyncio.shield(end())
         raise
+    except cf.Cancelled:                  # _watch_job: the job was ended, so nothing here is retried
+        log.info("render %s clip %d: stopped, its job was ended", project_id, idx + 1)
     except Exception as e:  # noqa: BLE001
         log.exception("render %s clip %d failed", project_id, idx + 1)
+        err = f"Clip {idx + 1}: {explain(e, 'clip')}"
         # kappacut.run already redacts what ffmpeg said; this covers every other exception
-        err = f"clip {idx + 1}: {type(e).__name__}: {cf.redact_urls(str(e))}"
+        detail = f"clip {idx + 1}: {type(e).__name__}: {cf.redact_urls(str(e))}"
     finally:
+        watcher.cancel()
         tmp.cleanup()
 
     # Releasing our own hold is the claim on this clip's ending: if the sweep took it away
@@ -922,7 +1014,7 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
     # A crash between the release and clip_ended breaks the chain; `alive` catches it.
     if await release_clip(redis, job_id, idx, me):
         if err:
-            await retry_or_end_clip(job_id, total, idx, err)
+            await retry_or_end_clip(job_id, total, idx, err, detail)
         else:
             await clip_ended(job_id, total, idx, None)
 
@@ -930,18 +1022,20 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
 CLIP_RETRY_DELAY = 10
 
 
-async def retry_or_end_clip(job_id: uuid.UUID, total: int, idx: int, err: str) -> None:
+async def retry_or_end_clip(job_id: uuid.UUID, total: int, idx: int, err: str,
+                            detail: str | None = None) -> None:
     """A clip that failed (or whose worker died, or whose task got lost) runs again, up to
     MAX_ATTEMPTS in all, before it counts as failed. Its slot stays taken meanwhile."""
     redis = await get_pool()
     tries = await redis.hincrby(render_key(job_id, "tries"), str(idx), 1)
     await redis.expire(render_key(job_id, "tries"), _RENDER_KEY_TTL)
+    what = detail or err
     if tries < MAX_ATTEMPTS:
         await _touch_render(redis, job_id)
         await redis.enqueue_job("render_clip_task", str(job_id), idx, _defer_by=CLIP_RETRY_DELAY)
-        log.warning("render %s clip %d: %s - retry %d/%d", job_id, idx + 1, err, tries + 1, MAX_ATTEMPTS)
+        log.warning("render %s clip %d: %s - retry %d/%d", job_id, idx + 1, what, tries + 1, MAX_ATTEMPTS)
     else:
-        await clip_ended(job_id, total, idx, f"{err} (gave up after {tries} attempts)")
+        await clip_ended(job_id, total, idx, err, f"{what} (gave up after {tries} attempts)")
 
 
 async def resume_render(job_id: uuid.UUID, total: int) -> None:
@@ -959,10 +1053,12 @@ async def resume_render(job_id: uuid.UUID, total: int) -> None:
         missing = [nxt] if nxt < total else []
     log.warning("render %s: chain broke - resuming clip(s) %s", job_id, [i + 1 for i in missing])
     for i in missing:
-        await retry_or_end_clip(job_id, total, i, f"clip {i + 1}: its task was lost")
+        await retry_or_end_clip(job_id, total, i, f"Clip {i + 1} couldn't be finished. Please render it again.",
+                                f"clip {i + 1}: its task was lost")
 
 
-async def clip_ended(job_id: uuid.UUID, total: int, idx: int, err: str | None) -> None:
+async def clip_ended(job_id: uuid.UUID, total: int, idx: int, err: str | None,
+                     detail: str | None = None) -> None:
     """Account for one finished (or finally failed) clip: close the job if it was the last
     one, otherwise hand its slot to the next unclaimed clip."""
     redis = await get_pool()
@@ -973,7 +1069,9 @@ async def clip_ended(job_id: uuid.UUID, total: int, idx: int, err: str | None) -
     if err:
         await redis.incr(render_key(job_id, "failed"))
         await redis.rpush(render_key(job_id, "errors"), err[:500])
+        await redis.rpush(render_key(job_id, "details"), cf.redact_urls(detail or err)[:1500])
         await redis.expire(render_key(job_id, "errors"), _RENDER_KEY_TTL)
+        await redis.expire(render_key(job_id, "details"), _RENDER_KEY_TTL)
     if await redis.incr(render_key(job_id, "finished")) >= total:
         await _finish_render(job_id, total)
     else:
@@ -987,18 +1085,21 @@ async def _finish_render(job_id: uuid.UUID, total: int) -> None:
     failed = int(await redis.get(render_key(job_id, "failed")) or 0)
     errors = [e.decode() if isinstance(e, bytes) else e
               for e in await redis.lrange(render_key(job_id, "errors"), 0, 2)]
+    details = "\n".join(d.decode() if isinstance(d, bytes) else d
+                        for d in await redis.lrange(render_key(job_id, "details"), 0, 2)) or None
     async with async_session_maker() as s:
         rendered = int(await s.scalar(select(Job.progress_pct).where(Job.id == job_id)) or 0)
     if failed >= total:
-        await _fail(job_id, errors[0] if errors else "render failed")
+        await _fail(job_id, errors[0] if errors else "This render didn't work. Please try again.", detail=details)
     else:
         await _set_job(
             job_id, status="done", stage="done", finished_at=_now(),
             result={"clips": rendered, "total": total, "failed": failed},
             # the render still finished; the editor shows this as a warning, not a failure
-            error=(f"{failed} of {total} clips failed — {errors[0]}" if failed else None),
+            error=(f"{failed} of {total} clips failed. {errors[0]}" if failed else None),
+            error_detail=details,
         )
-    for part in ("next", "finished", "failed", "errors", "alive", "tries", "ended"):
+    for part in ("next", "finished", "failed", "errors", "details", "alive", "tries", "ended"):
         await redis.delete(render_key(job_id, part))
     # this worker's cached copy of the source; other workers' copies age out of the prune
     shutil.rmtree(_SRC_CACHE / str(job_id), ignore_errors=True)

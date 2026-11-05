@@ -1,21 +1,26 @@
-"""Superuser-only endpoints — user list + usage, quota overrides, force delete, job cancel."""
+"""Superuser-only endpoints — user list + usage, quota overrides, force delete, job cancel,
+invites, copyright takedowns."""
 from __future__ import annotations
 
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import func, select
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import delete, func, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import storage
 from app.auth import current_superuser
+from app.config import settings
 from app.db import get_session
+from app.email import send_invite_email, send_takedown_notice
 from app.models.job import Job
+from app.models.launch import Invite, Takedown
 from app.models.project import Project
 from app.models.user import User
 from app.quota import is_unlimited, minutes_cap, monthly_minutes, project_count, storage_bytes, storage_cap_bytes
-from app.queue import abort_job
 
 router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(current_superuser)])
 
@@ -23,6 +28,8 @@ router = APIRouter(prefix="/api/admin", tags=["admin"], dependencies=[Depends(cu
 @router.get("/users")
 async def list_users(session: AsyncSession = Depends(get_session)) -> dict:
     users = (await session.execute(select(User).order_by(User.created_at))).scalars().all()
+    removals = dict((await session.execute(
+        select(Takedown.user_id, func.count()).group_by(Takedown.user_id))).all())
     out = []
     for u in users:
         out.append({
@@ -39,8 +46,19 @@ async def list_users(session: AsyncSession = Depends(get_session)) -> dict:
             "storage_cap_mb": round(storage_cap_bytes(u) / 1024**2),
             "minutes_override": u.quota_minutes_override,
             "storage_mb_override": u.quota_storage_mb_override,
+            "takedowns": removals.get(u.id, 0),
         })
     return {"users": out}
+
+
+@router.get("/users/{user_id}/projects")
+async def list_user_projects(user_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> dict:
+    """Names only, enough to find what a copyright notice is about."""
+    rows = (await session.execute(
+        select(Project).where(Project.user_id == user_id).order_by(Project.created_at.desc())
+    )).scalars().all()
+    return {"projects": [{"id": str(p.id), "name": p.name, "source_filename": p.source_filename,
+                          "status": p.status, "created_at": p.created_at.isoformat()} for p in rows]}
 
 
 @router.get("/jobs")
@@ -58,7 +76,7 @@ async def list_jobs(limit: int = 50, session: AsyncSession = Depends(get_session
     )).all()
     return {"jobs": [{
         "id": str(j.id), "kind": j.kind, "status": j.status, "pct": j.progress_pct,
-        "msg": j.progress_msg or j.stage, "error": j.error,
+        "msg": j.progress_msg or j.stage, "error": j.error, "detail": j.error_detail,
         "user": email, "project": name, "project_id": str(j.project_id) if j.project_id else None,
         "created_at": j.created_at.isoformat(),
         "finished_at": j.finished_at.isoformat() if j.finished_at else None,
@@ -107,6 +125,92 @@ async def force_delete_project(
     return {"ok": True}
 
 
+class TakedownIn(BaseModel):
+    reference: str = Field(min_length=1, max_length=500)
+
+
+@router.post("/projects/{project_id}/takedown")
+async def take_down_project(
+    project_id: uuid.UUID,
+    body: TakedownIn,
+    admin: User = Depends(current_superuser),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Remove a project after a copyright notice. Unlike a plain delete this keeps a record
+    (a repeat-infringer policy needs the count, and it has to survive the account) and tells
+    the owner, who is entitled to dispute it."""
+    from app.jobs import stop_jobs      # local import: jobs pulls in the whole pipeline
+
+    reference = body.reference.strip()
+    if not reference:
+        raise HTTPException(400, "Say which notice this is for.")
+    p = await session.get(Project, project_id)
+    if p is None:
+        raise HTTPException(404, "no such project")
+    owner = await session.get(User, p.user_id)
+    name, email, owner_id = p.name, owner.email, owner.id
+
+    await stop_jobs("This project was removed after a copyright notice.", Job.project_id == p.id)
+    await run_in_threadpool(storage.delete_project_media, p.user_id, p.id)
+    session.add(Takedown(user_id=owner_id, user_email=email, project_name=name,
+                         reference=reference, created_by=admin.id))
+    await session.delete(p)
+    await session.commit()
+    await send_takedown_notice(email, name, reference)
+    total = await session.scalar(select(func.count()).select_from(Takedown).where(Takedown.user_id == owner_id))
+    return {"ok": True, "takedowns": total}
+
+
+@router.get("/takedowns")
+async def list_takedowns(session: AsyncSession = Depends(get_session)) -> dict:
+    rows = (await session.execute(
+        select(Takedown).order_by(Takedown.created_at.desc()).limit(200)
+    )).scalars().all()
+    return {"takedowns": [{"id": str(t.id), "user_email": t.user_email, "project": t.project_name,
+                           "reference": t.reference, "created_at": t.created_at.isoformat()} for t in rows]}
+
+
+@router.get("/invites")
+async def list_invites(session: AsyncSession = Depends(get_session)) -> dict:
+    rows = (await session.execute(
+        select(Invite, User.id).outerjoin(User, User.email == Invite.email).order_by(Invite.created_at.desc())
+    )).all()
+    return {"invite_only": settings.invite_only,
+            "invites": [{"id": str(i.id), "email": i.email, "registered": uid is not None,
+                         "created_at": i.created_at.isoformat()} for i, uid in rows]}
+
+
+class InviteIn(BaseModel):
+    email: EmailStr
+
+
+@router.post("/invites")
+async def create_invite(
+    body: InviteIn,
+    admin: User = Depends(current_superuser),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Inviting someone twice is harmless and sends no second email."""
+    created = await session.scalar(
+        insert(Invite).values(id=uuid.uuid4(), email=body.email, created_by=admin.id)
+        .on_conflict_do_nothing(index_elements=[Invite.email]).returning(Invite.id))
+    await session.commit()
+    if created:
+        await send_invite_email(body.email)
+    return {"ok": True, "created": created is not None}
+
+
+@router.delete("/invites/{invite_id}")
+async def delete_invite(invite_id: uuid.UUID, session: AsyncSession = Depends(get_session)) -> dict:
+    """Stops this email signing up. An account it already made keeps working."""
+    invite = await session.get(Invite, invite_id)
+    if invite is None:
+        raise HTTPException(404, "no such invite")
+    await session.delete(invite)
+    await session.commit()
+    return {"ok": True}
+
+
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: uuid.UUID,
@@ -129,6 +233,7 @@ async def delete_user(
         # a running job would write clips back under the prefix after it was swept
         raise HTTPException(409, "this user has a job queued or running — cancel it first")
     objects = await run_in_threadpool(storage.delete_user_media, u.id)
+    await session.execute(delete(Invite).where(Invite.email == u.email))
     await session.delete(u)
     await session.commit()
     return {"ok": True, "objects_deleted": objects}
@@ -143,14 +248,13 @@ async def cancel_job(
     j = await session.get(Job, job_id)
     if j is None:
         raise HTTPException(404, "no such job")
-    kind, project_id, arq_id, live = j.kind, j.project_id, j.arq_job_id, j.status in ("queued", "running")
-    if arq_id:
-        await abort_job(arq_id)
+    kind, project_id, live = j.kind, j.project_id, j.status in ("queued", "running")
     if live:
         # the same exit as a worker failure: job -> error, and an analyze job's project goes
         # back to its previous clips (or "failed" if it had none). Setting only the job row,
-        # as this did before, left the project "analyzing" forever.
-        await _fail(job_id, "cancelled by admin", project_id if kind == "analyze" else None)
+        # as this did before, left the project "analyzing" forever. The task running it sees
+        # the row change within seconds and kills its ffmpeg (app.jobs._watch_job).
+        await _fail(job_id, "An administrator stopped this job.", project_id if kind == "analyze" else None)
     await session.refresh(j)
     return {"ok": True, "status": j.status}
 

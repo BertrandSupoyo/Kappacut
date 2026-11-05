@@ -1,5 +1,6 @@
 """Import every model here so `Base.metadata` is complete for Alembic autogenerate."""
 from app.models.job import Job, RenderOutput
+from app.models.launch import Invite, Takedown
 from app.models.project import Analysis, Project, ProjectEdit
 from app.models.sfx import SfxAsset
 from app.models.training import TrainingRun, VideoLabel
@@ -17,4 +18,6 @@ __all__ = [
     "UsageEvent",
     "VideoLabel",
     "TrainingRun",
+    "Invite",
+    "Takedown",
 ]

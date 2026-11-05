@@ -299,7 +299,24 @@ def delete_project_media(user_id: uuid.UUID, project_id: uuid.UUID) -> int:
     return delete_prefix(project_prefix(user_id, project_id))
 
 
+def _user_prefixes(user_id: uuid.UUID) -> tuple[str, str]:
+    """Where a user's objects live: all their projects, and their uploaded sfx."""
+    return _key(USERS_PREFIX, user_id) + "/", _key(SFX_PREFIX, "users", user_id) + "/"
+
+
 def delete_user_media(user_id: uuid.UUID) -> int:
-    """Every object a user owns: all their projects and their uploaded sfx."""
-    return (delete_prefix(_key(USERS_PREFIX, user_id) + "/")
-            + delete_prefix(_key(SFX_PREFIX, "users", user_id) + "/"))
+    return sum(delete_prefix(p) for p in _user_prefixes(user_id))
+
+
+def export_links(user_id: uuid.UUID, ttl: int) -> list[dict]:
+    """Signed links to the files a user would want a copy of. Frames and waveforms are left
+    out: they're small images rebuilt from the source, and a project can have hundreds."""
+    out = []
+    for prefix in _user_prefixes(user_id):
+        for obj in list_prefix(prefix):
+            key = obj["Key"]
+            if "/frames/" in key or key.endswith("/waveform.png"):
+                continue
+            out.append({"file": key[len(prefix):], "bytes": int(obj.get("Size") or 0),
+                        "url": presign_get(key, ttl=ttl)})
+    return out

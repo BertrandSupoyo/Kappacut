@@ -58,7 +58,8 @@ export function Editor() {
   const qc = useQueryClient();
   const toast = useToast();
   const retry = useMutation({
-    mutationFn: () => jpost(`/api/projects/${id}/analyze`),
+    // { any_language: true } is "Analyze anyway": it skips the English check
+    mutationFn: (body: { any_language: true } | void) => jpost(`/api/projects/${id}/analyze`, body ?? undefined),
     onSuccess: () => {
       // a successful re-run clears the saved edits server-side; never re-apply the cached
       // ones to the new clips (they're keyed by clip number)
@@ -166,7 +167,18 @@ export function Editor() {
         </div>
       )}
 
-      {project.status === "failed" && (
+      {project.status === "failed" && project.job?.language && (
+        <div className="glass" style={{ padding: "var(--sp-5)", borderColor: "color-mix(in srgb, var(--warn) 40%, transparent)" }}>
+          <b>We stopped before analyzing this video.</b>
+          <p className="muted" style={{ fontSize: "var(--fs-sm)" }}>{project.error}</p>
+          <p className="muted" style={{ fontSize: "var(--fs-sm)" }}>If it is in English, or you'd like to try anyway, you can still analyze it.</p>
+          <button className="btn ghost" disabled={retry.isPending} onClick={() => retry.mutate({ any_language: true })}>
+            {retry.isPending ? "Starting…" : "Analyze anyway"}
+          </button>
+        </div>
+      )}
+
+      {project.status === "failed" && !project.job?.language && (
         <div className="glass" style={{ padding: "var(--sp-5)", borderColor: "color-mix(in srgb, var(--danger) 40%, transparent)" }}>
           <b style={{ color: "var(--danger)" }}>Analysis failed.</b>
           <p className="muted" style={{ fontSize: "var(--fs-sm)" }}>{project.error || "Something went wrong while analyzing."}</p>
@@ -179,10 +191,14 @@ export function Editor() {
       {project.status === "ready" && project.job?.status === "error" && (
         <div className="glass" role="status" style={{ padding: "var(--sp-3) var(--sp-4)", marginBottom: "var(--sp-4)", display: "flex", gap: "var(--sp-3)", alignItems: "center", flexWrap: "wrap", borderColor: "color-mix(in srgb, var(--danger) 40%, transparent)" }}>
           <span style={{ flex: "1 1 280px", fontSize: "var(--fs-sm)" }}>
-            <b style={{ color: "var(--danger)" }}>Re-analysis failed.</b>{" "}
+            <b style={{ color: "var(--danger)" }}>{project.job.language ? "Re-analysis stopped." : "Re-analysis failed."}</b>{" "}
             <span className="muted">{project.job.error || "Something went wrong."} Your previous clips are still here.</span>
           </span>
-          <button className="btn ghost" disabled={retry.isPending} onClick={() => retry.mutate()}>Try again</button>
+          {project.job.language ? (
+            <button className="btn ghost" disabled={retry.isPending} onClick={() => retry.mutate({ any_language: true })}>Analyze anyway</button>
+          ) : (
+            <button className="btn ghost" disabled={retry.isPending} onClick={() => retry.mutate()}>Try again</button>
+          )}
         </div>
       )}
 

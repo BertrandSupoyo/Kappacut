@@ -8,7 +8,7 @@ import asyncio
 import datetime as dt
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app import storage
 from app.config import settings
@@ -32,9 +32,24 @@ def _idle_before(days: int) -> dt.datetime:
     return dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
 
 
+async def purge_unverified() -> int:
+    """Delete accounts that never confirmed their email. They can't sign in, so they can't delete
+    themselves, and all we hold for them is an address someone may have mistyped. They can't own
+    anything: every project route needs a verified user."""
+    if settings.retention_unverified_days <= 0:
+        return 0
+    async with async_session_maker() as s:
+        res = await s.execute(delete(User).where(
+            User.is_verified.is_(False), User.is_superuser.is_(False),
+            User.created_at < _idle_before(settings.retention_unverified_days)))
+        await s.commit()
+    return res.rowcount or 0
+
+
 async def run_gc() -> dict:
+    unverified = await purge_unverified()
     if settings.retention_delete_days <= 0:
-        return {"disabled": True}
+        return {"disabled": True, "unverified": unverified}
 
     warned = deleted = skipped = objects = 0
     now = dt.datetime.now(dt.UTC)
@@ -82,6 +97,7 @@ async def run_gc() -> dict:
             deleted += 1
         await s.commit()
 
-    log.info("retention GC: warned=%d deleted=%d (%d objects) skipped=%d",
-             warned, deleted, objects, skipped)
-    return {"warned": warned, "deleted": deleted, "objects": objects, "skipped": skipped}
+    log.info("retention GC: warned=%d deleted=%d (%d objects) skipped=%d unverified=%d",
+             warned, deleted, objects, skipped, unverified)
+    return {"warned": warned, "deleted": deleted, "objects": objects, "skipped": skipped,
+            "unverified": unverified}

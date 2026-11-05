@@ -2,7 +2,11 @@
 
 Find short-form clips in long videos — transcribe with Groq Whisper, pick the best
 moments with an LLM (Groq free tier by default, Claude optionally), then reframe,
-caption, color-grade and render them. Self-hosted, multi-user, open signup.
+caption, color-grade and render them. Self-hosted, multi-user, with open or invite-only
+signup. English-language videos only for now: other languages are stopped before they use any
+minutes, and the user can choose to analyze them anyway.
+
+Before putting it online, read [DEPLOY.md](DEPLOY.md), including "Before you let anyone in".
 
 ## Architecture
 

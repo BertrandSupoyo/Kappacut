@@ -23,6 +23,7 @@ from app.config import settings
 from app.credits import CreditError
 from app.csrf import CSRFMiddleware
 from app.db import engine
+from app.launch import router as launch_router
 from app.projects import media_router, router as projects_router
 from app.quota import QuotaError
 from app.ratelimit import GlobalRateLimitMiddleware
@@ -127,6 +128,7 @@ async def health() -> JSONResponse:
 
 
 install_auth(app)
+app.include_router(launch_router)
 app.include_router(account_router)
 app.include_router(admin_router)
 app.include_router(training_router)

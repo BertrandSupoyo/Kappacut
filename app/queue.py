@@ -41,12 +41,3 @@ async def enqueue_analyze(job_id: uuid.UUID) -> str | None:
 
 async def enqueue_render(job_id: uuid.UUID) -> str | None:
     return await _enqueue("render_task", job_id)
-
-
-async def abort_job(arq_job_id: str) -> bool:
-    from arq.jobs import Job as ArqJob
-
-    try:
-        return await ArqJob(arq_job_id, await get_pool()).abort(timeout=5)
-    except Exception:  # noqa: BLE001
-        return False

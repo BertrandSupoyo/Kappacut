@@ -230,6 +230,9 @@ export function Projects() {
             <button className="btn" style={{ marginTop: "var(--sp-2)" }} onClick={() => fileInput.current?.click()}>
               Choose video…
             </button>
+            <p className="muted" style={{ fontSize: "var(--fs-xs)", margin: "var(--sp-2) 0 0" }}>
+              Kappacut works with English-language videos for now. Only upload videos you own or have permission to use.
+            </p>
           </div>
         </div>
       )}

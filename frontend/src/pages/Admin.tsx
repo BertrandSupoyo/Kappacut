@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, jget, jpost } from "@/api/client";
+import { api, jdelete, jget, jpost } from "@/api/client";
 import { useAuth } from "@/auth/AuthContext";
 import { useToast } from "@/components/Toast";
 import { fmtAgo } from "@/lib/format";
@@ -20,6 +20,7 @@ interface AdminUser {
   storage_cap_mb: number;
   minutes_override: number | null;
   storage_mb_override: number | null;
+  takedowns: number;
 }
 
 interface AdminJob {
@@ -29,6 +30,8 @@ interface AdminJob {
   pct: number;
   msg: string;
   error: string | null;
+  /** what really happened; `error` is the sentence the user saw */
+  detail: string | null;
   user: string;
   project: string | null;
   project_id: string | null;
@@ -67,7 +70,9 @@ export function Admin() {
           <Link to="/admin/training" className="btn ghost" style={{ marginLeft: "auto", padding: "6px 14px" }}>Training</Link>
         </div>
         <QueueSection />
+        <InvitesSection />
         <UsersSection />
+        <TakedownsSection />
       </div>
     </AdminOnly>
   );
@@ -119,8 +124,8 @@ function QueueSection() {
                     {j.project_id ? <Link to={`/app/p/${j.project_id}`}>{j.project ?? "—"}</Link> : "deleted"}
                   </td>
                   <td className="cell-clip">{j.user}</td>
-                  <td className="cell-clip" title={j.error ?? j.msg}>
-                    {j.status === "error" ? <span style={{ color: "var(--danger)" }}>{j.error}</span>
+                  <td className="cell-clip" title={j.detail ?? j.error ?? j.msg}>
+                    {j.status === "error" ? <span style={{ color: "var(--danger)" }}>{j.detail ?? j.error}</span>
                       : j.status === "done" ? "done"
                       : `${j.pct}% ${j.msg}`}
                   </td>
@@ -147,6 +152,187 @@ function QueueSection() {
   );
 }
 
+interface AdminInvite {
+  id: string;
+  email: string;
+  registered: boolean;
+  created_at: string;
+}
+
+function InvitesSection() {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [email, setEmail] = useState("");
+  const { data } = useQuery({
+    queryKey: ["admin", "invites"],
+    queryFn: () => jget<{ invite_only: boolean; invites: AdminInvite[] }>("/api/admin/invites"),
+  });
+  const refresh = () => qc.invalidateQueries({ queryKey: ["admin", "invites"] });
+  const add = useMutation({
+    mutationFn: () => jpost<{ created: boolean }>("/api/admin/invites", { email: email.trim() }),
+    onSuccess: (r) => {
+      refresh();
+      toast(r.created ? `Invited ${email.trim()}` : `${email.trim()} was already invited`);
+      setEmail("");
+    },
+    onError: () => toast("That doesn't look like an email address.", "error"),
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => jdelete(`/api/admin/invites/${id}`),
+    onSuccess: refresh,
+    onError: (e) => toast((e as Error).message || "Couldn't remove the invite.", "error"),
+  });
+  const invites = data?.invites ?? [];
+
+  return (
+    <section className="glass" style={{ padding: "var(--sp-4)" }} aria-labelledby="h-invites">
+      <div style={{ display: "flex", alignItems: "baseline", gap: "var(--sp-3)", flexWrap: "wrap", marginBottom: "var(--sp-3)" }}>
+        <h2 id="h-invites" style={{ fontSize: "var(--fs-lg)" }}>Invites</h2>
+        {data && (
+          <span className="muted" style={{ fontSize: "var(--fs-xs)" }}>
+            {data.invite_only
+              ? "Sign-up is invite-only: only these emails can register."
+              : "Sign-up is open to anyone. Set INVITE_ONLY=true to limit it to these emails."}
+          </span>
+        )}
+      </div>
+      <form
+        style={{ display: "flex", gap: "var(--sp-2)", flexWrap: "wrap", marginBottom: "var(--sp-3)" }}
+        onSubmit={(e) => { e.preventDefault(); if (email.trim()) add.mutate(); }}
+      >
+        <input
+          className="admin-input"
+          style={{ width: "min(320px, 100%)" }}
+          type="email"
+          aria-label="Email to invite"
+          placeholder="name@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+        <button className="btn ghost" style={{ padding: "4px 14px" }} disabled={!email.trim() || add.isPending}>Invite</button>
+      </form>
+      {invites.length > 0 && (
+        <div className="table-wrap">
+          <table className="admin-table" style={{ minWidth: 480 }}>
+            <thead>
+              <tr><th>Email</th><th>Status</th><th>Invited</th><th /></tr>
+            </thead>
+            <tbody>
+              {invites.map((i) => (
+                <tr key={i.id}>
+                  <td className="cell-clip">{i.email}</td>
+                  <td>{i.registered ? "Signed up" : <span className="muted">Not yet</span>}</td>
+                  <td className="muted">{fmtAgo(i.created_at)}</td>
+                  <td style={{ textAlign: "right" }}>
+                    <button className="btn ghost" style={{ padding: "2px 10px", fontSize: "var(--fs-2xs)" }} disabled={remove.isPending} onClick={() => remove.mutate(i.id)}>
+                      Remove
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+interface AdminTakedown {
+  id: string;
+  user_email: string;
+  project: string;
+  reference: string;
+  created_at: string;
+}
+
+function TakedownsSection() {
+  const { data } = useQuery({
+    queryKey: ["admin", "takedowns"],
+    queryFn: () => jget<{ takedowns: AdminTakedown[] }>("/api/admin/takedowns"),
+  });
+  const rows = data?.takedowns ?? [];
+  return (
+    <section className="glass" style={{ padding: "var(--sp-4)" }} aria-labelledby="h-takedowns">
+      <div style={{ display: "flex", alignItems: "baseline", gap: "var(--sp-3)", flexWrap: "wrap", marginBottom: "var(--sp-3)" }}>
+        <h2 id="h-takedowns" style={{ fontSize: "var(--fs-lg)" }}>Copyright removals</h2>
+        <span className="muted" style={{ fontSize: "var(--fs-xs)" }}>
+          To remove something, open Projects on its owner's row above. This record stays after the account is deleted.
+        </span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="muted" style={{ margin: 0, fontSize: "var(--fs-sm)" }}>None yet.</p>
+      ) : (
+        <div className="table-wrap">
+          <table className="admin-table" style={{ minWidth: 560 }}>
+            <thead>
+              <tr><th>When</th><th>Account</th><th>Project</th><th>Notice</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.id}>
+                  <td className="muted">{fmtAgo(t.created_at)}</td>
+                  <td className="cell-clip">{t.user_email}</td>
+                  <td className="cell-clip">{t.project}</td>
+                  <td className="cell-clip" title={t.reference}>{t.reference}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UserProjects({ user }: { user: AdminUser }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const { data } = useQuery({
+    queryKey: ["admin", "user-projects", user.id],
+    queryFn: () => jget<{ projects: { id: string; name: string; source_filename: string; status: string; created_at: string }[] }>(
+      `/api/admin/users/${user.id}/projects`,
+    ),
+  });
+  const takedown = useMutation({
+    mutationFn: ({ id, reference }: { id: string; reference: string }) =>
+      jpost<{ takedowns: number }>(`/api/admin/projects/${id}/takedown`, { reference }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["admin"] });
+      toast(`Removed. ${user.email} now has ${r.takedowns} removal${r.takedowns === 1 ? "" : "s"}, and has been emailed.`);
+    },
+    onError: (e) => toast((e as Error).message || "Couldn't remove the project.", "error"),
+  });
+  const projects = data?.projects ?? [];
+
+  if (!data) return <div className="spin" />;
+  if (!projects.length) return <span className="muted">No projects.</span>;
+  return (
+    <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+      {projects.map((p) => (
+        <li key={p.id} style={{ display: "flex", alignItems: "center", gap: "var(--sp-3)", flexWrap: "wrap" }}>
+          <span style={{ flex: "1 1 200px", minWidth: 0, overflowWrap: "anywhere" }}>
+            {p.name} <span className="muted">· {p.status} · {fmtAgo(p.created_at)}</span>
+          </span>
+          <button
+            className="btn danger"
+            style={{ padding: "2px 10px", fontSize: "var(--fs-2xs)" }}
+            disabled={takedown.isPending}
+            onClick={() => {
+              const reference = window.prompt(
+                `Remove "${p.name}" and all its clips after a copyright notice?\n\nThis can't be undone, and ${user.email} will be emailed. Which notice is this for? (who sent it, and when)`,
+              );
+              if (reference?.trim()) takedown.mutate({ id: p.id, reference: reference.trim() });
+            }}
+          >
+            Remove for copyright
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function UsersSection() {
   const { data } = useQuery({
     queryKey: ["admin", "users"],
@@ -162,7 +348,7 @@ function UsersSection() {
       <div className="table-wrap">
         <table className="admin-table">
           <thead>
-            <tr><th>Email</th><th>Projects</th><th>Minutes this month</th><th>Storage</th><th>Minutes cap</th><th>Storage cap (MB)</th><th /></tr>
+            <tr><th>Email</th><th>Projects</th><th>Minutes this month</th><th>Storage</th><th>Removals</th><th>Minutes cap</th><th>Storage cap (MB)</th><th /></tr>
           </thead>
           <tbody>
             {users.map((u) => <UserRow key={u.id} u={u} />)}
@@ -178,6 +364,7 @@ function UserRow({ u }: { u: AdminUser }) {
   const toast = useToast();
   const [minutes, setMinutes] = useState(u.minutes_override?.toString() ?? "");
   const [storage, setStorage] = useState(u.storage_mb_override?.toString() ?? "");
+  const [showProjects, setShowProjects] = useState(false);
   const dirty = minutes !== (u.minutes_override?.toString() ?? "") || storage !== (u.storage_mb_override?.toString() ?? "");
   const save = useMutation({
     mutationFn: () =>
@@ -202,15 +389,21 @@ function UserRow({ u }: { u: AdminUser }) {
   const valid = [minutes, storage].every((v) => !v.trim() || (/^\d+$/.test(v.trim()) && Number(v) > 0));
 
   return (
+    <>
     <tr>
       <td className="cell-clip">
         {u.email}
         {u.is_superuser && <span className="pill on" style={{ marginLeft: 6, minHeight: 0, padding: "0 6px" }}>admin</span>}
         {!u.is_verified && <span className="muted" style={{ marginLeft: 6, fontSize: "var(--fs-2xs)" }}>unverified</span>}
       </td>
-      <td>{u.projects}</td>
+      <td>
+        <button className="link-btn" aria-expanded={showProjects} onClick={() => setShowProjects((v) => !v)}>
+          {u.projects}{showProjects ? " ▴" : " ▾"}
+        </button>
+      </td>
       <td>{u.minutes_used}{u.unlimited ? <span className="muted"> · no limit</span> : ` / ${u.minutes_cap}`}</td>
       <td>{u.storage_mb}{u.unlimited ? <span className="muted"> MB · no limit</span> : ` / ${u.storage_cap_mb} MB`}</td>
+      <td style={u.takedowns ? { color: "var(--danger)" } : undefined}>{u.takedowns}</td>
       <td>
         <input
           className="admin-input"
@@ -250,5 +443,13 @@ function UserRow({ u }: { u: AdminUser }) {
         )}
       </td>
     </tr>
+    {showProjects && (
+      <tr>
+        <td colSpan={8} style={{ background: "var(--glass-2)" }}>
+          <UserProjects user={u} />
+        </td>
+      </tr>
+    )}
+    </>
   );
 }

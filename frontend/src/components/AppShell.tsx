@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useAuth } from "@/auth/AuthContext";
+import { SiteFooter } from "./SiteFooter";
 import { Wordmark } from "./Wordmark";
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -38,6 +39,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       <main className="wrap" style={{ flex: 1, paddingBottom: "var(--sp-6)" }}>
         {children}
       </main>
+      <SiteFooter />
     </div>
   );
 }

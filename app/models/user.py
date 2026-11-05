@@ -23,6 +23,11 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     quota_minutes_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     quota_storage_mb_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # which Terms this account agreed to, and when; NULL = made by the admin CLI, or before
+    # sign-up asked
+    terms_accepted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    terms_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

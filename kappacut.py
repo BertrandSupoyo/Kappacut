@@ -739,6 +739,65 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
     return segments
 
 
+# ---- which language is this video in? ------------------------------------------
+# Kappacut is English-only: transcribe() forces language="en", and the filler, reaction and
+# call-to-action rules are English word lists. Forced English on other speech gives a garbled
+# transcript and poor clips, so before spending the user's minutes Whisper hears three short
+# samples with no language forced. Three, spread out, because one could land on an intro or a
+# foreign-language clip inside an English video.
+LANGUAGE_SAMPLES = (0.2, 0.5, 0.8)        # how far through the video each sample starts
+LANGUAGE_SAMPLE_SECONDS = 20              # Groq bills at least 10 s per request; 60 s costs ~$0.0007
+
+
+def foreign_language(heard: list[str], samples: int) -> str | None:
+    """The non-English language most samples agree on, else None. `heard` is what Whisper said
+    for each sample that held speech. A wrong answer here stops an English speaker's video, so
+    uncertainty counts as English: a tie, or too few samples with speech (music, silence)."""
+    if len(heard) < min(2, samples):
+        return None
+    names = [h.strip().capitalize() for h in heard if h and h.strip()]
+    foreign = [n for n in names if n not in ("English", "En")]
+    if len(foreign) * 2 <= len(names):
+        return None
+    top = max(sorted(set(foreign)), key=foreign.count)
+    return top if len(top) > 2 else None    # a bare code ("Id") reads badly in a message: only names
+
+
+def detect_foreign_language(src: Path | str, cfg: dict) -> str | None:
+    """See foreign_language. `src` may be a signed URL: with -ss before -i ffmpeg fetches only
+    the sampled part, so this runs before a 2 GB download. A sample that fails is skipped, which
+    leaves the answer as "not sure": this check must never be why an analysis fails."""
+    import groq
+
+    client = groq.Groq()
+    duration = probe_duration(src)
+    long_enough = duration >= LANGUAGE_SAMPLE_SECONDS * len(LANGUAGE_SAMPLES)
+    starts = [duration * f for f in LANGUAGE_SAMPLES] if long_enough else [0.0]
+    heard: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="kappacut_lang_") as tmp:
+        for i, at in enumerate(starts):
+            _check_cancelled()
+            part = Path(tmp) / f"sample_{i}.mp3"
+            try:
+                run([FFMPEG, "-y", *_thread_args(), "-ss", f"{at:.2f}", "-i", str(src),
+                     "-t", str(LANGUAGE_SAMPLE_SECONDS), "-vn", "-ac", "1", "-ar", "16000",
+                     "-c:a", "libmp3lame", "-b:a", "48k", str(part)])
+                data = client.audio.transcriptions.create(
+                    file=(part.name, part.read_bytes()), model=GROQ_WHISPER,
+                    response_format="verbose_json")
+            except Cancelled:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"    language sample {i + 1} skipped: {type(e).__name__}", flush=True)
+                continue
+            data = data.model_dump() if hasattr(data, "model_dump") else dict(data)
+            speech = [s for s in data.get("segments") or []
+                      if not (_segment_action(s, cfg) or "").startswith("drop")]
+            if speech and data.get("language"):
+                heard.append(str(data["language"]))
+    return foreign_language(heard, len(starts))
+
+
 def as_timeline(segments: list[dict]) -> str:
     rows = []
     for s in segments:
