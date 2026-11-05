@@ -317,6 +317,41 @@ input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px;
 .hv-wave i.on { background: #f5f5f5; }
 .hv-pick { position: absolute; top: 4px; bottom: 14px; margin-left: 10px; border: 1px solid rgba(255,255,255,.5); border-radius: 4px; background: rgba(255,255,255,.06); }
 .hv-source-label { position: absolute; left: 12px; bottom: 3px; font-size: 9.5px; color: #737373; letter-spacing: .04em; }
+/* live caption preview (editor/CaptionOverlay.tsx). --cap-u is one pixel of the render's frame,
+   so every number below is the same one build_ass in pipeline.py uses. The render has no Arial
+   in its container and falls back to DejaVu Sans; Verdana is the nearest match on a desktop.
+   .86: libass sizes a font by ascent + descent, CSS by its em box. */
+.cap-layer {
+  --cap-u: calc(100cqw / var(--cap-frame));
+  position: absolute; inset: 0; z-index: 1; display: flex; justify-content: center;
+  padding-inline: calc(80 * var(--cap-u)); pointer-events: none;
+  font: 700 calc(var(--cap-size) * .86 * var(--cap-u)) / 1.164 "DejaVu Sans", Verdana, Geneva, sans-serif;
+}
+.cap-bottom { align-items: flex-end; padding-bottom: calc(120 * var(--cap-u)); }
+.cap-top { align-items: flex-start; padding-top: calc(120 * var(--cap-u)); }
+.cap-center { align-items: center; }
+.cap-line { width: 100%; text-align: center; text-wrap: balance; overflow-wrap: anywhere; }
+.cap-text {
+  -webkit-text-stroke: calc(2 * var(--cap-outline) * var(--cap-u)) var(--cap-stroke);
+  paint-order: stroke fill;
+}
+.cap-box .cap-text {
+  /* solid: libass paints a BorderStyle 3 box in the outline colour, not BackColour's alpha */
+  -webkit-text-stroke: 0; background: var(--cap-stroke);
+  padding: calc(var(--cap-outline) * var(--cap-u));
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+}
+.cap-hot { color: var(--cap-hot); font-size: 1.14em; }
+.cap-anim-soft { animation: cap-fade 60ms linear; }
+.cap-anim-fade { animation: cap-fade 150ms linear; }
+.cap-anim-pop { animation: cap-pop 130ms ease-out; }
+.cap-anim-bounce { animation: cap-bounce 175ms ease-out; }
+.cap-anim-slide { animation: cap-slide 170ms ease-out; }
+@keyframes cap-fade { from { opacity: 0; } }
+@keyframes cap-pop { from { opacity: 0; transform: scale(.55); } }
+@keyframes cap-bounce { from { opacity: 0; transform: scale(.7); } 55% { transform: scale(1.1); } }
+@keyframes cap-slide { from { opacity: 0; transform: translateY(calc(46 * var(--cap-u))); } }
+
 @keyframes hv-rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
 
 .landing-section { padding: clamp(40px, 7vw, 80px) 0 0; text-align: center; margin-inline: auto; }

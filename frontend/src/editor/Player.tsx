@@ -4,6 +4,7 @@ import { fmtDuration } from "@/lib/format";
 import { clipVisualStyle, clipLoopHandlers } from "./clipVisual";
 import { ColorGrade, gradeId } from "./colorGrade";
 import { faceAt, faceFrame } from "./types";
+import { CaptionOverlay } from "./CaptionOverlay";
 
 export function Player() {
   const projectId = useEditor((s) => s.projectId);
@@ -115,6 +116,7 @@ export function Player() {
           />
         )}
         {mode === "cropfill" && vertical ? <div style={fgWrapStyle}>{video}</div> : video}
+        {edit && <CaptionOverlay key={`${mode}-${vertical}`} video={vidRef} edit={edit} vertical={vertical} />}
       </div>
 
       <div className="transport" role="group" aria-label="Playback">
