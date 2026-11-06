@@ -37,7 +37,7 @@ def _refund(key: str, bucket: int, reserved: int, actual: int) -> None:
 
 
 def gate(est_tokens: int = 6000, model: str = "",
-         on_wait: Callable[[], None] | None = None) -> Callable[[int], None]:
+         on_wait: Callable[[], None] | None = None, max_wait: float = _MAX_WAIT_S) -> Callable[[int], None]:
     """Block until `est_tokens` fit in the current minute's Groq budget for `model`.
     Returns `settle(actual_tokens)`, to call with the reply's real usage.
 
@@ -51,7 +51,7 @@ def gate(est_tokens: int = 6000, model: str = "",
     """
     ceiling = max(1000, int(settings.groq_tokens_per_minute))
     est_tokens = max(1, min(int(est_tokens), ceiling))
-    deadline = time.monotonic() + _MAX_WAIT_S
+    deadline = time.monotonic() + max_wait
     told = False
     while True:
         bucket = int(time.time() // 60)
@@ -68,7 +68,7 @@ def gate(est_tokens: int = 6000, model: str = "",
             log.warning("groq gate bypassed: %s", e)
             return _noop
         if time.monotonic() >= deadline:
-            log.warning("groq gate: waited %ds, proceeding anyway", _MAX_WAIT_S)
+            log.warning("groq gate: waited %ds, proceeding anyway", max_wait)
             return _noop
         if on_wait and not told:          # say so once: a silent wait reads as "stuck"
             told = True

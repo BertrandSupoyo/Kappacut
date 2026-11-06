@@ -24,6 +24,7 @@ from app import groq_gate
 from app import jobs as jobs_mod
 from app.config import settings
 from app.db import async_session_maker, engine
+from app.health import WORKER_KEY
 from app.jobs import (FANOUT, MAX_ATTEMPTS, owner_worker, recover_queued, release_clip, render_key,
                       requeue, resume_render, retry_or_end_clip, run_analyze, run_render, run_render_clip)
 from app.models.job import Job
@@ -61,7 +62,7 @@ _RESTARTED = "Our server restarted while working on this. Please try again."
 
 
 def _hb_key(worker_id: str) -> str:
-    return f"kappacut:worker:{worker_id}"
+    return f"{WORKER_KEY}{worker_id}"
 
 
 async def _heartbeat(redis, worker_id: str) -> None:

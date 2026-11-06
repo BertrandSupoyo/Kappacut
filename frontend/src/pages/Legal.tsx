@@ -178,7 +178,8 @@ export function Privacy() {
             <li><b>Your account:</b> your email address, a scrambled form of your password, and the date you accepted our terms.</li>
             <li><b>What you upload:</b> your videos and any sound effects.</li>
             <li><b>What we make from it:</b> transcripts, suggested clips and their scores, your edits, rendered clips, thumbnails, preview frames and waveforms.</li>
-            <li><b>Your usage:</b> minutes transcribed, clips rendered, bytes uploaded and the jobs you've run, which is how your limits work.</li>
+            <li><b>Your usage:</b> minutes transcribed, clips rendered, bytes uploaded, the jobs you've run and how many messages you've sent the AI agent and AI editor, which is how your limits work.</li>
+            <li><b>What you type to the AI agent or AI editor:</b> we send it to our AI provider to get an answer, and we don't store it. The changes it makes are saved like any other edit.</li>
             <li><b>Technical data:</b> your IP address, which we use to limit repeated requests and hold for up to an hour. Our server logs can contain your email address and details of your jobs, and they're overwritten as they fill up.</li>
           </ul>
 

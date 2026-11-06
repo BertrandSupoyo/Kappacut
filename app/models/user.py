@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime as dt
 
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
-from sqlalchemy import DateTime, Integer, String, func
+from sqlalchemy import DateTime, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -27,6 +27,11 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     # sign-up asked
     terms_accepted_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     terms_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # set with is_active=False by Admin > Users, so the next admin can see when and why; the
+    # reason is what the person was told, and blank if the law or safety stopped us telling them
+    suspended_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suspended_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

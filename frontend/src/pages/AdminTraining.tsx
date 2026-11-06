@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { jget, jpost } from "@/api/client";
 import { useToast } from "@/components/Toast";
 import { fmtAgo, fmtDuration } from "@/lib/format";
-import { AdminOnly } from "./Admin";
 
 export interface Score {
   moments: number;
@@ -103,21 +102,18 @@ export function ScoreTiles({ score }: { score: Score }) {
 
 export function AdminTraining() {
   return (
-    <AdminOnly>
-      <div className="training" style={{ display: "flex", flexDirection: "column", gap: "var(--sp-5)", margin: "var(--sp-4) 0" }}>
-        <div>
-          <Link to="/admin" className="muted" style={{ fontSize: "var(--fs-sm)" }}>← Admin</Link>
-          <h1 style={{ fontSize: "var(--fs-2xl)", marginTop: "var(--sp-1)" }}>Training</h1>
-          <p className="muted" style={{ margin: "var(--sp-1) 0 0", fontSize: "var(--fs-sm)" }}>
-            Mark the good moments in a video, see how the AI compares, then train the score on what you marked.
-          </p>
+    <div className="training admin-page">
+      <header className="admin-head">
+        <div style={{ minWidth: 0 }}>
+          <h1>Training</h1>
+          <p className="muted">Mark the good moments in a video, see how the AI compares, then train the score on what you marked.</p>
         </div>
-        <ScoreSection />
-        <VideosSection />
-        <TrainSection />
-        <UsageSection />
-      </div>
-    </AdminOnly>
+      </header>
+      <ScoreSection />
+      <VideosSection />
+      <TrainSection />
+      <UsageSection />
+    </div>
   );
 }
 
@@ -134,7 +130,7 @@ function ScoreSection() {
     <section className="glass" style={{ padding: "var(--sp-4)" }} aria-labelledby="h-score">
       <h2 id="h-score" style={{ fontSize: "var(--fs-lg)", marginBottom: "var(--sp-3)" }}>AI score</h2>
       {error ? (
-        <p className="err" style={{ margin: 0 }}>{(error as Error).message}</p>
+        <p className="err" style={{ margin: 0 }}>{(error as Error).message || "Couldn't load the score. Please try again."}</p>
       ) : !data ? (
         <p className="muted" style={{ margin: 0 }}>Loading…</p>
       ) : data.score.videos === 0 ? (
@@ -177,7 +173,7 @@ function VideosSection() {
         </span>
       </div>
       {error ? (
-        <p className="err" style={{ margin: 0 }}>{(error as Error).message}</p>
+        <p className="err" style={{ margin: 0 }}>{(error as Error).message || "Couldn't load your videos. Please try again."}</p>
       ) : videos.length === 0 ? (
         <p className="muted" style={{ margin: 0 }}>
           Nothing to label yet. Upload a video in <Link to="/app">Projects</Link> and wait for its analysis to finish.

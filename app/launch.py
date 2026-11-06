@@ -29,6 +29,7 @@ def processors(cfg: dict) -> list[dict]:
          "gets": "Your email address and the messages we send you."},
         {"name": "Groq (United States)",
          "gets": "The audio from your video, to transcribe it, and the transcript, to pick clips. "
+                 "If you use the AI agent or AI editor, also what you type and the parts of the transcript it reads. "
                  "Groq says it doesn't keep this by default, apart from temporary logs of up to "
                  "30 days when it's troubleshooting or investigating abuse."},
     ]

@@ -278,7 +278,8 @@ async def recover_queued() -> int:
         if tries > MAX_ATTEMPTS:
             log.error("%s %s: never got running after %d re-queues", kind, job_id, MAX_ATTEMPTS)
             await _fail(job_id, "couldn't get this job started - please try again",
-                        project_id if kind == "analyze" else None)
+                        project_id if kind == "analyze" else None,
+                        detail=f"never got running after {MAX_ATTEMPTS} re-queues")
             continue
         task = "analyze_task" if kind == "analyze" else "render_task"
         arq_job = await redis.enqueue_job(task, str(job_id))
@@ -624,7 +625,8 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         q.put_nowait(None)
         drainer.cancel()
         if _timed_out(started):
-            await asyncio.shield(_fail(job_id, _timeout_msg(), project_id))
+            await asyncio.shield(_fail(job_id, _timeout_msg(), project_id,
+                                       detail=f"timed out after {settings.job_timeout_seconds}s"))
         raise
     except cf.Cancelled:                  # _watch_job: whoever ended the job already recorded why
         q.put_nowait(None)
@@ -993,7 +995,8 @@ async def run_render_clip(job_id: uuid.UUID, idx: int) -> None:
             # out of time once is out of time again: count the clip failed, don't retry it
             async def end() -> None:
                 if await release_clip(redis, job_id, idx, me):
-                    await clip_ended(job_id, total, idx, f"Clip {idx + 1}: {_timeout_msg()}")
+                    await clip_ended(job_id, total, idx, f"Clip {idx + 1}: {_timeout_msg()}",
+                                     detail=f"timed out after {settings.job_timeout_seconds}s")
 
             await asyncio.shield(end())
         raise

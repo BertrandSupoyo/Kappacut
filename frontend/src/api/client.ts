@@ -1,12 +1,20 @@
+/** What a person should read. The server's words only if someone wrote them for a person: a framework
+ * answers "Forbidden" or "LOGIN_BAD_CREDENTIALS", and a proxy sends a page of HTML. Those leave this empty,
+ * so each caller's own wording shows. The raw answer stays in `data`. */
+function readable(status: number, data: unknown): string {
+  if (status === 0) return "We couldn't reach Kappacut. Check your connection and try again.";
+  if (status === 401) return "You were signed out, so that didn't go through. Please try again.";
+  const detail = data && typeof data === "object" && "detail" in data ? data.detail : null;
+  if (typeof detail !== "string") return "";
+  return /^[A-Z0-9_]+$/.test(detail) || /^(?:[A-Z][a-z]+ ?)+$/.test(detail) ? "" : detail;
+}
+
 export class ApiError extends Error {
+  /** 0 means the request never got an answer */
   status: number;
   data: unknown;
   constructor(status: number, data: unknown) {
-    super(
-      (data && typeof data === "object" && "detail" in data && typeof data.detail === "string"
-        ? data.detail
-        : `HTTP ${status}`),
-    );
+    super(readable(status, data));
     this.status = status;
     this.data = data;
   }
@@ -30,7 +38,12 @@ export async function api<T = unknown>(path: string, opts: RequestInit = {}): Pr
     headers.set("Content-Type", "application/json");
   }
 
-  const res = await fetch(path, { ...opts, method, headers, credentials: "include" });
+  let res: Response;
+  try {
+    res = await fetch(path, { ...opts, method, headers, credentials: "include" });
+  } catch {
+    throw new ApiError(0, null);               // the browser's own words here are "Failed to fetch"
+  }
   if (res.status === 204) return undefined as T;
 
   const isJson = res.headers.get("content-type")?.includes("application/json");

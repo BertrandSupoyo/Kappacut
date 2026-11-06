@@ -112,6 +112,27 @@ async def send_takedown_notice(to: str, project_name: str, reference: str) -> No
         log.warning("takedown notice to %s failed: %s", to, e)
 
 
+async def send_suspension_notice(to: str, reason: str) -> None:
+    """The Terms promise to say why an account was suspended."""
+    contact = settings.support_email
+    body = (f"<p>Your Kappacut account has been suspended, so you can't sign in and any jobs you had "
+            f"running have been stopped.</p>"
+            f"<p>Reason: {html.escape(reason)}</p>"
+            + (f"<p>If you think this is a mistake, write to {html.escape(contact)}.</p>" if contact else ""))
+    try:
+        await send_email(to, "Kappacut: your account has been suspended", body, ignorable=False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("suspension notice to %s failed: %s", to, e)
+
+
+async def send_reinstated_notice(to: str) -> None:
+    body = "<p>Your Kappacut account is active again, and you can sign in as usual.</p>"
+    try:
+        await send_email(to, "Kappacut: your account is active again", body, ignorable=False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reinstated notice to %s failed: %s", to, e)
+
+
 async def send_retention_warning(to: str, project_name: str, days_left: int) -> None:
     # the name is whatever the user typed: escaped, it can't put links or markup in our mail
     body = (

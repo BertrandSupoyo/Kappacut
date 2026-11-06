@@ -48,7 +48,7 @@ function DeleteAccount() {
       nav("/");
       toast("Your account and everything in it have been deleted.");
     } catch (x) {
-      setErr(x instanceof ApiError && x.status !== 500 ? x.message : "Couldn't delete your account. Please try again.");
+      setErr((x instanceof ApiError && x.status !== 500 && x.message) || "Couldn't delete your account. Please try again.");
       setBusy(false);
     }
   }

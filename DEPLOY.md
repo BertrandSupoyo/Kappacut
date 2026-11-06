@@ -118,9 +118,10 @@ and sends data to companies in the US, so they matter before the first outside u
 - [ ] **Check `/privacy` lists who really gets data.** It builds the list from your settings, but
       `HOSTING_PROVIDER` is yours to set if you don't use netcup.
 - [ ] **Check that the address on `/copyright` gets read.** A takedown is on you to act on: in
-      **Admin > Users**, open the owner's Projects and use **Remove for copyright**, which
-      deletes the project, emails the owner and records it. The Removals column is your
-      repeat-infringer count; closing an account is the Delete button on the same row.
+      **Admin > Removals**, search for the video the notice names and use **Remove for
+      copyright**, which deletes the project, emails the owner and records it. The Overview
+      flags anyone with two or more removals, for your repeat-infringer policy. To act on
+      that, open the account in **Admin > Users** and suspend or delete it.
 
 ## 4. Upgrades
 
@@ -240,13 +241,34 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
 
 ## 8. Admin
 
-Superusers get `/api/admin/*`: `GET /users` (list + per-user usage), `GET /users/{id}/projects`,
-`POST /users/{id}/quota` (`{minutes, storage_mb}` overrides), `DELETE /projects/{id}`, `POST
+Superusers get a dashboard at `/admin`:
+
+| Section | What it's for |
+|---|---|
+| **Overview** | Whether the database, queue, workers and disk are healthy, and what needs you. Also users, usage, failures and storage, with the last 14 days as charts. Refreshes every 10 seconds. |
+| **Jobs** | Every analysis and render: filter, search, see the real error under Details, and Cancel. |
+| **Users** | Search, filter and sort accounts. Click an email to change its limits, see its projects, or suspend or delete it. |
+| **Invites** | Who may sign up while `INVITE_ONLY=true`. |
+| **Removals** | Find a project from a copyright notice, remove it, and keep the record. |
+| **Training** | Label videos and train the score weights (see the README). |
+
+**Failed** means something went wrong, and there's a raw error to read. **Stopped** means a job
+ended on purpose: cancelled, refused, or its project was removed. The failure numbers on the
+Overview only count Failed.
+
+**Suspend** blocks sign-in and every signed-in request straight away, stops the account's jobs and
+keeps its files. The reason you type is emailed to them, as the Terms promise. Leave it empty only
+if the law or safety stops you telling them: no email is sent, then or on reinstating.
+
+The same things are available under `/api/admin/*`: `GET /overview`, `GET /users`, `GET
+/users/{id}/projects`, `POST /users/{id}/quota` (`{minutes, storage_mb}` overrides), `POST
+/users/{id}/suspend` (`{reason}`), `POST /users/{id}/reinstate`, `DELETE /users/{id}`, `GET /jobs`,
+`POST /jobs/{id}/cancel`, `GET /projects?q=`, `DELETE /projects/{id}`, `POST
 /projects/{id}/takedown` (`{reference}`), `GET /takedowns`, `GET`/`POST /invites`, `DELETE
-/invites/{id}`, `POST /jobs/{id}/cancel`, `GET /queue`.
+/invites/{id}`, `GET /queue`.
 
 **Cancel** stops the job within about 2 seconds: its task watches the job row and kills its
 ffmpeg. A call to a model that's already under way finishes first, and nothing further is sent.
 
 A failed job shows the user a plain sentence. What really happened is in the job's
-`error_detail`, shown in the Queue table on the Admin page.
+`error_detail`, shown under Details in **Admin > Jobs**.

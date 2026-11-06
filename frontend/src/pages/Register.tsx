@@ -25,7 +25,7 @@ export function Register() {
     } catch (x) {
       const detail = x instanceof ApiError && x.data && typeof x.data === "object" && "detail" in x.data ? x.data.detail : null;
       if (detail === "REGISTER_USER_ALREADY_EXISTS") setErr("That email is already registered.");
-      else if (x instanceof ApiError && x.status === 403) setErr(x.message);
+      else if (x instanceof ApiError && x.status === 403) setErr(x.message || "Could not create the account.");
       else if (x instanceof ApiError && x.status === 429) setErr("Too many sign-ups from here. Try again later.");
       else if (x instanceof ApiError && x.status === 400 && typeof detail === "string") setErr(detail);
       else setErr("Could not create the account.");

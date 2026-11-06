@@ -66,7 +66,7 @@ export function AdminLabel() {
       <div className="training" style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4)", margin: "var(--sp-4) 0" }}>
         <Link to="/admin/training" className="muted" style={{ fontSize: "var(--fs-sm)" }}>← Training</Link>
         {error ? (
-          <p className="err">{(error as Error).message}</p>
+          <p className="err">{(error as Error).message || "Couldn't load this video. Please try again."}</p>
         ) : !data ? (
           <p className="muted">Loading…</p>
         ) : (

@@ -8,8 +8,14 @@ import { Verify } from "./pages/Verify";
 import { Forgot } from "./pages/Forgot";
 import { Reset } from "./pages/Reset";
 import { Projects } from "./pages/Projects";
+import { AgentPage } from "./pages/Agent";
 import { Account } from "./pages/Account";
 import { Admin } from "./pages/Admin";
+import { AdminOverview } from "./pages/admin/Overview";
+import { AdminJobs } from "./pages/admin/Jobs";
+import { AdminUsers } from "./pages/admin/Users";
+import { AdminInvites } from "./pages/admin/Invites";
+import { AdminRemovals } from "./pages/admin/Removals";
 import { AdminTraining } from "./pages/AdminTraining";
 import { AdminLabel } from "./pages/AdminLabel";
 import { Editor } from "./pages/Editor";
@@ -34,6 +40,16 @@ export function App() {
           <RequireVerified>
             <AppShell>
               <Projects />
+            </AppShell>
+          </RequireVerified>
+        }
+      />
+      <Route
+        path="/app/agent"
+        element={
+          <RequireVerified>
+            <AppShell>
+              <AgentPage />
             </AppShell>
           </RequireVerified>
         }
@@ -67,17 +83,14 @@ export function App() {
             </AppShell>
           </RequireVerified>
         }
-      />
-      <Route
-        path="/admin/training"
-        element={
-          <RequireVerified>
-            <AppShell>
-              <AdminTraining />
-            </AppShell>
-          </RequireVerified>
-        }
-      />
+      >
+        <Route index element={<AdminOverview />} />
+        <Route path="jobs" element={<AdminJobs />} />
+        <Route path="users" element={<AdminUsers />} />
+        <Route path="invites" element={<AdminInvites />} />
+        <Route path="removals" element={<AdminRemovals />} />
+        <Route path="training" element={<AdminTraining />} />
+      </Route>
       <Route
         path="/admin/training/:id"
         element={

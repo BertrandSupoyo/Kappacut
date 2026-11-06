@@ -12,6 +12,7 @@ import { Timeline } from "@/editor/Timeline";
 import { ClipRail, StageHeader } from "@/editor/ClipList";
 import { ClipCard } from "@/editor/ClipCard";
 import { Inspector } from "@/editor/Inspector";
+import { AgentPanel } from "@/editor/AgentPanel";
 import { RenderButton, RenderOutputs, RenderSync, SaveStatus, useKeptRanges } from "@/editor/RenderPanel";
 
 type ViewMode = "review" | "edit";
@@ -27,6 +28,7 @@ export function Editor() {
     setFilter("all");
   }, [id]);
   const setActive = useEditor((s) => s.setActive);
+  const activeIdx = useEditor((s) => s.activeIdx);
   function editClip(idx: number) {
     setActive(idx);
     setView("edit");
@@ -212,6 +214,12 @@ export function Editor() {
       )}
 
       {hasClips && view === "review" && (
+        <div style={{ marginBottom: "var(--sp-4)" }}>
+          <AgentPanel openClip={null} onOpenClip={editClip} />
+        </div>
+      )}
+
+      {hasClips && view === "review" && (
         <ReviewView
           filter={filter}
           setFilter={setFilter}
@@ -234,6 +242,7 @@ export function Editor() {
             <Timeline />
           </div>
           <div className="ed-side">
+            <AgentPanel openClip={activeIdx} onOpenClip={setActive} />
             <Inspector sfx={sfxData?.sfx ?? []} />
             <RenderOutputs />
           </div>

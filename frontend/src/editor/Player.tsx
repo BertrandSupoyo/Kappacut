@@ -6,7 +6,8 @@ import { ColorGrade, gradeId } from "./colorGrade";
 import { faceAt, faceFrame } from "./types";
 import { CaptionOverlay } from "./CaptionOverlay";
 
-export function Player() {
+/** `compact` is for watching, where the clip's start and end can't be set: the agent page's preview. */
+export function Player({ compact = false, onVideoError }: { compact?: boolean; onVideoError?: () => void }) {
   const projectId = useEditor((s) => s.projectId);
   const activeIdx = useEditor((s) => s.activeIdx);
   const edit = useEditor((s) => s.edits[s.activeIdx]);
@@ -89,12 +90,15 @@ export function Player() {
       ref={vidRef}
       data-main=""
       src={`/media/${projectId}/source`}
+      // phones often show nothing at all until a video plays
+      poster={compact ? `/media/${projectId}/frame.jpg?t=${Math.floor(start)}` : undefined}
       style={innerStyle}
       preload="metadata"
       muted={muted}
       onPlay={() => setPlaying(true)}
       onPause={() => setPlaying(false)}
       onTimeUpdate={onTime}
+      onError={onVideoError}
       playsInline
     />
   );
@@ -102,7 +106,7 @@ export function Player() {
   return (
     <div>
       <ColorGrade id={gid} color={edit?.color} />
-      <div style={cropStyle}>
+      <div style={compact && vertical ? { ...cropStyle, maxWidth: "min(210px, 40vh)" } : cropStyle}>
         {blurFill && (
           <video
             src={`/media/${projectId}/source`}
@@ -131,12 +135,16 @@ export function Player() {
           {fmtDuration(Math.max(0, playhead - start))} / {fmtDuration(end - start)}
         </span>
         <span style={{ display: "flex", gap: "var(--sp-2)", marginLeft: "auto", flexWrap: "wrap" }}>
-          <button className="btn ghost" onClick={() => markIn(playhead)} title="Set the clip's start to the playhead (I)">
-            Set start <kbd>I</kbd>
-          </button>
-          <button className="btn ghost" onClick={() => markOut(playhead)} title="Set the clip's end to the playhead (O)">
-            Set end <kbd>O</kbd>
-          </button>
+          {!compact && (
+            <>
+              <button className="btn ghost" onClick={() => markIn(playhead)} title="Set the clip's start to the playhead (I)">
+                Set start <kbd>I</kbd>
+              </button>
+              <button className="btn ghost" onClick={() => markOut(playhead)} title="Set the clip's end to the playhead (O)">
+                Set end <kbd>O</kbd>
+              </button>
+            </>
+          )}
           <button className="btn ghost icon" onClick={() => setMuted((m) => !m)} aria-label={muted ? "Unmute" : "Mute"} aria-pressed={muted}>
             {muted ? (
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden><path d="M11 5L6 9H3v6h3l5 4z" /><path d="M22 9l-6 6M16 9l6 6" /></svg>

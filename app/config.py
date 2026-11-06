@@ -25,7 +25,7 @@ _DEV_SECRETS = {
 _DEV_HOSTS = {"", "localhost", "127.0.0.1", "::1", "minio", "mailhog", "mailpit"}
 # The date of the current Terms and Privacy Policy text (frontend/src/pages/Legal.tsx). Each
 # new account records the version it accepted, so change this whenever that text changes.
-TERMS_VERSION = "2026-11-05"
+TERMS_VERSION = "2026-11-06"
 # Who runs this deployment. The legal pages print these, so a public deploy needs them all.
 _LEGAL_FIELDS = {
     "support_email": "the address on the legal pages and in error messages",
@@ -74,7 +74,7 @@ class Settings(BaseSettings):
     verification_token_secret: str = "dev-insecure-change-me-2"
     reset_password_token_secret: str = "dev-insecure-change-me-3"
     cookie_secure: bool = False
-    access_token_ttl_seconds: int = 60 * 60  # 1h
+    access_token_ttl_seconds: int = 3 * 60 * 60  # 3h
 
     # --- email (Phase 2) ------------------------------------------------
     smtp_host: str = "localhost"
@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     # until one (e.g. AI thumbnails) opts in. A caller may pass its own `cap` to
     # check_credits() instead of this shared default once it wants a feature-specific limit.
     credit_daily_cap_default: int = 5
+
+    # --- the AI editor (app/agent.py). Re-run tests/agent_eval.py before changing the model.
+    agent_model: str = "openai/gpt-oss-120b"
+    agent_daily_cap: int = 50             # messages per user per day; admins have no cap
 
     # --- worker / retention (Phase 4 / 5) ----------------------------
     worker_concurrency: int = 2

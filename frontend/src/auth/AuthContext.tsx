@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { jget, jpost } from "@/api/client";
 import type { User } from "@/api/types";
@@ -6,6 +6,8 @@ import type { User } from "@/api/types";
 interface AuthValue {
   user: User | null;
   loading: boolean;
+  /** this person's session ran out, as opposed to never having signed in or signing out */
+  expired: boolean;
   refresh: () => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -13,6 +15,7 @@ interface AuthValue {
 const Ctx = createContext<AuthValue>({
   user: null,
   loading: true,
+  expired: false,
   refresh: async () => {},
   logout: async () => {},
 });
@@ -20,10 +23,22 @@ const Ctx = createContext<AuthValue>({
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+  const [expired, setExpired] = useState(false);
+  // Who this tab last belonged to. The chat, the open project and cached lists stay in memory so that
+  // someone whose session ran out can carry on. They must never reach anyone else, and loading the page
+  // again is what clears all of them at once, including any added later.
+  const owner = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      setUser(await jget<User>("/api/users/me"));
+      const me = await jget<User>("/api/users/me");
+      if (owner.current && owner.current !== me.id) {
+        window.location.replace("/app");
+        return;
+      }
+      owner.current = me.id;
+      setExpired(false);
+      setUser(me);
     } catch {
       setUser(null);
     } finally {
@@ -33,7 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(async () => {
     await jpost("/api/auth/logout").catch(() => {});
-    setUser(null);
+    window.location.replace("/");
   }, []);
 
   useEffect(() => {
@@ -41,12 +56,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [refresh]);
 
   useEffect(() => {
-    const onExpired = () => setUser(null);
+    const onExpired = () => {
+      if (owner.current) setExpired(true);
+      setUser(null);
+    };
     window.addEventListener("auth:expired", onExpired);
     return () => window.removeEventListener("auth:expired", onExpired);
   }, []);
 
-  const value = useMemo(() => ({ user, loading, refresh, logout }), [user, loading, refresh, logout]);
+  const value = useMemo(() => ({ user, loading, expired, refresh, logout }), [user, loading, expired, refresh, logout]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
