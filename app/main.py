@@ -10,24 +10,34 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+import logging
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text
 
 from app.account import router as account_router
 from app.admin import router as admin_router
+from app.agent import page_router as agent_page_router, router as agent_router
 from app.auth.routes import install_auth
 from app.config import settings
 from app.credits import CreditError
 from app.csrf import CSRFMiddleware
 from app.db import engine
+from app.health import check_system
+from app.launch import router as launch_router
 from app.projects import media_router, router as projects_router
 from app.quota import QuotaError
 from app.ratelimit import GlobalRateLimitMiddleware
 from app.sfx import router as sfx_router
+from app.training import router as training_router
 from app.uploads import router as uploads_router
+
+# uvicorn only sets up its own loggers, so the app's info lines went nowhere in this process. Only
+# ours: the root logger stays quiet, or every request's URL would be logged by the HTTP clients.
+_app_log = logging.getLogger("kappacut")
+_app_log.setLevel(logging.INFO)
+_app_log.addHandler(logging.StreamHandler())
 
 
 @contextlib.asynccontextmanager
@@ -78,56 +88,17 @@ async def _credit_handler(_: Request, exc: CreditError) -> JSONResponse:
 
 @app.get("/api/health")
 async def health() -> JSONResponse:
-    import shutil
-    import tempfile
-
-    db_ok = redis_ok = False
-    queue_depth = 0
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
-            queue_depth = int(
-                (await conn.execute(
-                    text("SELECT count(*) FROM jobs WHERE status in ('queued','running')")
-                )).scalar_one()
-            )
-        db_ok = True
-    except Exception:
-        pass
-    try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(settings.redis_url)
-        redis_ok = bool(await r.ping())
-        await r.aclose()
-    except Exception:
-        pass
-
-    disk_free_pct = 100.0
-    try:
-        # scratch space, not a media volume — see quota.assert_disk_ok
-        du = shutil.disk_usage(tempfile.gettempdir())
-        disk_free_pct = round(du.free / du.total * 100, 1)
-    except Exception:
-        pass
-
-    disk_ok = disk_free_pct >= settings.disk_min_free_pct
-    ok = db_ok and redis_ok and disk_ok
-    return JSONResponse(
-        {
-            "ok": ok,
-            "db": db_ok,
-            "redis": redis_ok,
-            "disk_free_pct": disk_free_pct,
-            "disk_ok": disk_ok,
-            "queue_depth": queue_depth,
-        },
-        status_code=200 if ok else 503,
-    )
+    status = await check_system()
+    return JSONResponse(status, status_code=200 if status["ok"] else 503)
 
 
 install_auth(app)
+app.include_router(launch_router)
 app.include_router(account_router)
 app.include_router(admin_router)
+app.include_router(training_router)
+app.include_router(agent_router)
+app.include_router(agent_page_router)
 app.include_router(projects_router)
 app.include_router(media_router)
 app.include_router(sfx_router)

@@ -34,7 +34,8 @@ class Job(Base):
     progress_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     progress_msg: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     stage: Mapped[str] = mapped_column(String(255), nullable=False, default="")
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)     # written for the user
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)  # what really happened; admins only
     arq_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # which worker process took it (app.worker heartbeat key); lets a starting worker tell
     # its dead predecessor's jobs from ones a live sibling is still running
@@ -69,6 +70,9 @@ class RenderOutput(Base):
     captions: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sfx_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # app.jobs.clip_fingerprint of what produced this file: a later render of the same range
+    # with the same settings reuses it instead of cutting it again. NULL for older rows.
+    fingerprint: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

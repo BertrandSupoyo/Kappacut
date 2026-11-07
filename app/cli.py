@@ -3,6 +3,8 @@
   python -m app.cli create-superuser --email you@example.com --password ...
   python -m app.cli run-gc
   python -m app.cli eval-picks [--user you@example.com] [--json]
+  python -m app.cli eval-labels
+  python -m app.cli train-weights
 """
 from __future__ import annotations
 
@@ -66,6 +68,22 @@ async def _eval_picks(user: str | None, as_json: bool) -> None:
         print(format_report(rep))
 
 
+async def _eval_labels() -> None:
+    from app.evaluate import build_moment_report, format_moment_report
+
+    async with async_session_maker() as session:
+        print(format_moment_report(await build_moment_report(session)))
+
+
+async def _train_weights() -> None:
+    from app.evaluate import load_labels
+    from app.train_weights import format_result, load_videos, train
+
+    async with async_session_maker() as session:
+        videos = await load_videos(session, await load_labels(session))
+    print(format_result(train(videos)))
+
+
 def _migrate_media(dry_run: bool) -> None:
     """One-shot copy of the old local media volume into the bucket (PLAN-v2.md Phase A).
 
@@ -122,6 +140,8 @@ def main() -> None:
     ev = sub.add_parser("eval-picks", help="score the AI's clip picks against what users kept, trimmed and rendered")
     ev.add_argument("--user", help="only this user's projects (email)")
     ev.add_argument("--json", action="store_true", help="machine-readable output")
+    sub.add_parser("eval-labels", help="score the AI's clip picks against moments marked by hand")
+    sub.add_parser("train-weights", help="learn the score weights and test them on unseen videos; changes nothing")
     args = ap.parse_args()
 
     async def _run() -> None:
@@ -134,6 +154,10 @@ def main() -> None:
                 _migrate_media(args.dry_run)
             elif args.cmd == "eval-picks":
                 await _eval_picks(args.user, args.json)
+            elif args.cmd == "eval-labels":
+                await _eval_labels()
+            elif args.cmd == "train-weights":
+                await _train_weights()
         finally:
             with contextlib.suppress(Exception):
                 await engine.dispose()

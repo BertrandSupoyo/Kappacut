@@ -8,6 +8,7 @@ Everything heavy is delegated to kappacut.py; this file is orchestration only.
 from __future__ import annotations
 
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Callable
 
@@ -147,15 +148,19 @@ def _analyze(video_path: Path, cfg: dict, on_progress: ProgressCB) -> dict:
 
 # ---------------------------------------------------------------- captions
 
+# Named outright: "Arial" isn't installed, so it meant whatever fontconfig preferred, which changes as fonts are
+# added. libass falls back glyph by glyph for scripts DejaVu lacks (see the Dockerfile for why those fonts are there).
 CAP_STYLES: dict[str, dict] = {
     #                fontname       size  bold  primary        outline_col     box?  outline shadow  highlight
-    "clean": dict(font="Arial",       size=52, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=1, outline=2.4, shadow=0, hl="&H0033F0FF"),
-    "bold":  dict(font="Arial",       size=62, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=1, outline=4.0, shadow=1, hl="&H0033F0FF"),
-    "box":   dict(font="Arial",       size=50, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=3, outline=8.0, shadow=0, hl="&H0033F0FF"),
-    "pop":   dict(font="Arial Black", size=68, bold=-1, primary="&H0033F0FF", oc="&H00101010", box=1, outline=5.0, shadow=1, hl="&H00FFFFFF"),
+    "clean": dict(font="DejaVu Sans", size=52, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=1, outline=2.4, shadow=0, hl="&H0033F0FF"),
+    "bold":  dict(font="DejaVu Sans", size=62, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=1, outline=4.0, shadow=1, hl="&H0033F0FF"),
+    "box":   dict(font="DejaVu Sans", size=50, bold=-1, primary="&H00FFFFFF", oc="&H00000000", box=3, outline=8.0, shadow=0, hl="&H0033F0FF"),
+    "pop":   dict(font="DejaVu Sans", size=68, bold=-1, primary="&H0033F0FF", oc="&H00101010", box=1, outline=5.0, shadow=1, hl="&H00FFFFFF"),
 }
 _ALIGN = {"bottom": 2, "center": 5, "top": 8}
 _KAR_MAX_WORDS, _KAR_MAX_SPAN = 5, 2.6
+_KAR_MAX_CHARS = 10                      # the same limit in a script with no spaces between words
+_SENTENCE_END = ".!?\u3002\uff01\uff1f\u061f\u06d4\u0964"       # and the full stops of other scripts
 
 
 def _ass_ts(t: float) -> str:
@@ -195,13 +200,51 @@ def _clean_txt(t: str, upper: bool) -> str:
     return t.upper() if upper else t
 
 
+def _no_spaces(words: list[dict]) -> bool:
+    return any(cf.NO_SPACE_RE.search(w["w"]) for w in words)
+
+
+def _fit_line(text: str, size: int, frame_width: int) -> str:
+    """libass only wraps at spaces, so a line in a script without them ran off the frame. Breaks
+    it where it would, at a space if the line has one, and never before a mark or closing
+    punctuation. Text with spaces between its words is left to libass, as before."""
+    if not cf.NO_SPACE_RE.search(text):
+        return text
+    room = (frame_width - 160) / max(size, 1)           # in wide characters; MarginL and MarginR are 80
+
+    def width(ch: str) -> float:
+        if unicodedata.category(ch)[0] == "M":
+            return 0.0
+        return 1.0 if unicodedata.east_asian_width(ch) in "WF" else 0.55
+
+    out: list[str] = []
+    used, space = 0.0, -1
+    for ch in text:
+        kind = unicodedata.category(ch)
+        if used + width(ch) > room and kind[0] != "M" and kind not in ("Pe", "Pf", "Po"):
+            if space >= 0:                               # go back to the last space on this line
+                rest = out[space + 1:]
+                out[space:] = ["\\N", *rest]
+                used = sum(width(c) for c in rest)
+            else:
+                out.append("\\N")
+                used = 0.0
+            space = -1
+        if ch == " ":
+            space = len(out)
+        out.append(ch)
+        used += width(ch)
+    return "".join(out)
+
+
 def _chunk_words(ws: list[dict]) -> list[list[dict]]:
     ws = sorted(ws, key=lambda w: w["start"])
     groups, cur = [], []
     for w in ws:
         cur.append(w)
-        full = len(cur) >= _KAR_MAX_WORDS or w["end"] - cur[0]["start"] > _KAR_MAX_SPAN
-        if full or (w["w"][-1:] in ".!?" and len(cur) >= 3):
+        many = sum(len(x["w"]) for x in cur) >= _KAR_MAX_CHARS if _no_spaces(cur) else len(cur) >= _KAR_MAX_WORDS
+        full = many or w["end"] - cur[0]["start"] > _KAR_MAX_SPAN
+        if full or (w["w"][-1:] in _SENTENCE_END and (len(cur) >= 3 or _no_spaces(cur))):
             groups.append(cur)
             cur = []
     if cur:
@@ -290,9 +333,9 @@ def build_ass(lines: list[dict], style: str, position: str, size: float,
                     for j, ww in enumerate(g):
                         t = _clean_txt(ww["w"], upper)
                         parts.append(f"{{\\c{st['hl']}\\b1\\fscx114\\fscy114}}{t}{{\\r}}" if j == i else t)
-                    rows.append(dlg(a, b, " ".join(parts)))
+                    rows.append(dlg(a, b, ("" if _no_spaces(g) else " ").join(parts)))
         else:
-            txt = _clean_txt(ln.get("text"), upper)
+            txt = _fit_line(_clean_txt(ln.get("text"), upper), fs, play_x)
             if txt:
                 rows.append(dlg(ln["start"], ln["end"], txt))
 
@@ -302,9 +345,19 @@ def build_ass(lines: list[dict], style: str, position: str, size: float,
 
 # ---------------------------------------------------------------- render
 
+def clip_filename(r: dict, i: int) -> str:
+    """The file name render_one gives range `r` as clip number `i` (1-based)."""
+    vertical = bool(r.get("vertical"))
+    crop = r.get("crop") if vertical else None
+    _cm = crop.get("mode") if isinstance(crop, dict) else None
+    vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
+            else "_vertical" if vertical else "")
+    return f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
+
+
 def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
                segments: list[dict] | None = None, sfx_dir: Path | None = None,
-               dur: float | None = None) -> dict | None:
+               dur: float | None = None, probe: dict | None = None) -> dict | None:
     """Cut range `r` as clip number `i` (1-based, it names the file) into out_dir. One call
     per clip: app.jobs runs each as its own queue task. `r`:
     {"start", "end", "vertical", "label", "crop": {"mode","px","py","zoom","blur"}|null,
@@ -317,24 +370,24 @@ def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
     mode "fill" -> full video centred, blurred copy (sigma `blur`) fills the top/bottom bars.
 
     `video` may be a local path or an http(s) URL — ffmpeg seeks a URL with range
-    requests, so a per-clip worker needn't download the whole source. Returns the clip
+    requests, so a per-clip worker needn't download the whole source. `probe` is
+    kappacut.probe_video's result for `video`, when the caller already has it; with it no
+    ffprobe runs here. `cfg["max_fps"]` > 0 caps the output frame rate. Returns the clip
     record, or None when the range is under a second once clamped to the video.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    probe = probe or {}
     if dur is None:
-        dur = cf.probe_duration(video)
+        dur = float(probe.get("duration") or 0.0) or cf.probe_duration(video)
     start = max(0.0, float(r["start"]))
     end = min(dur, float(r["end"]))
     if end - start < 1.0:
         return None
     vertical = bool(r.get("vertical"))
     crop = r.get("crop") if vertical else None
-    _cm = crop.get("mode") if isinstance(crop, dict) else None
-    vtag = ("_fill" if _cm == "fill" else "_subject" if _cm == "cropfill"
-            else "_vertical" if vertical else "")
     stem = f"{i:02d}_{cf.slugify(r.get('label') or 'clip')}"
-    name = f"{stem}{vtag}{'_cc' if r.get('captions') else ''}.mp4"
+    name = clip_filename(r, i)
 
     subs = None
     cap = r.get("captions")
@@ -348,7 +401,10 @@ def render_one(video: Path | str, r: dict, i: int, cfg: dict, out_dir: Path,
                              anim=cap.get("anim", "none"))
 
     cf.cut_clip(video, start, end, out_dir / name, vertical, subs=subs, crop=crop,
-                loudnorm=cfg.get("loudnorm", True), color=r.get("color"))
+                loudnorm=cfg.get("loudnorm", True), color=r.get("color"),
+                src_height=probe["height"] if probe.get("height") else None,
+                src_fps=probe["fps"] if probe.get("fps") else None,
+                max_fps=int(cfg.get("max_fps") or 0))
 
     sfx = [s for s in (r.get("sfx") or []) if isinstance(s, dict) and s.get("file")]
     if sfx and sfx_dir is not None:

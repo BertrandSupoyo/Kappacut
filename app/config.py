@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -18,6 +19,19 @@ _DEV_SECRETS = {
     "jwt_secret": "dev-insecure-change-me",
     "verification_token_secret": "dev-insecure-change-me-2",
     "reset_password_token_secret": "dev-insecure-change-me-3",
+}
+# Hosts that only exist on a dev machine or inside the dev compose network
+# (compose.override.yaml's S3 mock is the `minio` service, its Mailpit the `mailhog` one).
+_DEV_HOSTS = {"", "localhost", "127.0.0.1", "::1", "minio", "mailhog", "mailpit"}
+# The date of the current Terms and Privacy Policy text (frontend/src/pages/Legal.tsx). Each
+# new account records the version it accepted, so change this whenever that text changes.
+TERMS_VERSION = "2026-11-06"
+# Who runs this deployment. The legal pages print these, so a public deploy needs them all.
+_LEGAL_FIELDS = {
+    "support_email": "the address on the legal pages and in error messages",
+    "legal_name": "the person or company running this service",
+    "legal_address": "the postal address on the legal pages",
+    "legal_jurisdiction": "the law the Terms are governed by",
 }
 
 
@@ -60,7 +74,7 @@ class Settings(BaseSettings):
     verification_token_secret: str = "dev-insecure-change-me-2"
     reset_password_token_secret: str = "dev-insecure-change-me-3"
     cookie_secure: bool = False
-    access_token_ttl_seconds: int = 60 * 60  # 1h
+    access_token_ttl_seconds: int = 3 * 60 * 60  # 3h
 
     # --- email (Phase 2) ------------------------------------------------
     smtp_host: str = "localhost"
@@ -98,6 +112,10 @@ class Settings(BaseSettings):
     # check_credits() instead of this shared default once it wants a feature-specific limit.
     credit_daily_cap_default: int = 5
 
+    # --- the AI editor (app/agent.py). Re-run tests/agent_eval.py before changing the model.
+    agent_model: str = "openai/gpt-oss-120b"
+    agent_daily_cap: int = 50             # messages per user per day; admins have no cap
+
     # --- worker / retention (Phase 4 / 5) ----------------------------
     worker_concurrency: int = 2
     # 0 = let ffmpeg auto-detect (fine for one job at a time). Once WORKER_CONCURRENCY > 1,
@@ -112,6 +130,10 @@ class Settings(BaseSettings):
     # Longest single clip a render may cut. The editor's trim handles can stretch a clip to
     # the whole video; without a cap one "clip" could be an hours-long encode.
     render_max_clip_seconds: int = 600
+    # Output frame-rate cap. A 60 fps source (most game streams) is cut at 30: crop, scale,
+    # captions and x264 then handle half the frames, roughly a third less CPU per clip.
+    # 0 keeps every source at its own rate.
+    render_max_fps: int = 30
     # Sources up to this size are downloaded whole by each clip task; bigger ones are read
     # by ffmpeg straight from the bucket with range requests (only the cut part travels).
     render_local_source_max_bytes: int = 256 * 1024**2
@@ -120,6 +142,21 @@ class Settings(BaseSettings):
     groq_tokens_per_minute: int = 8000       # shared-key TPM budget (free tier)
     retention_warn_days: int = 30
     retention_delete_days: int = 37  # 0 disables
+    retention_unverified_days: int = 14   # accounts that never confirmed their email; 0 disables
+    backup_keep: int = 7                  # nightly database dumps kept (compose reads the same variable)
+
+    # --- launch (legal pages, support, who may sign up) ------------------
+    support_email: str = ""
+    copyright_email: str = ""             # takedown notices; empty = support_email
+    legal_name: str = ""
+    legal_address: str = ""
+    legal_jurisdiction: str = ""
+    legal_eu_representative: str = ""     # only if you need one under GDPR Art. 27
+    hosting_provider: str = "netcup (Germany or Austria)"   # named in the Privacy Policy
+    # Keeps the "draft" banner off the legal pages. Set it once a lawyer has checked them.
+    legal_reviewed: bool = False
+    # Only emails an admin has invited can register (Admin > Invites).
+    invite_only: bool = False
 
     # --- ops (Phase 8) ------------------------------------------------
     # nightly pg_dump is a dedicated compose service (`backup`), not app code
@@ -173,6 +210,28 @@ class Settings(BaseSettings):
         for field in ("s3_bucket", "s3_endpoint_url", "s3_access_key_id", "s3_secret_access_key"):
             if not getattr(self, field):
                 problems.append(f"{field.upper()} is unset — media has nowhere to live")
+        # .env.example's dev block points S3_* at the compose S3 mock, which only exists in
+        # compose.override.yaml: copied to a server unchanged, every upload fails
+        if urlsplit(self.s3_endpoint_url).hostname in _DEV_HOSTS:
+            problems.append(
+                f"S3_ENDPOINT_URL is {self.s3_endpoint_url!r}, the dev S3 mock — point it at "
+                "R2 (https://<account-id>.r2.cloudflarestorage.com)"
+            )
+        # Mail to localhost / Mailpit is accepted and dropped, so signup "works" and nobody
+        # ever receives the verification link. Nothing else would surface that.
+        if (self.smtp_host or "").lower() in _DEV_HOSTS:
+            problems.append(
+                f"SMTP_HOST is {self.smtp_host!r} — verification and reset emails would never "
+                "arrive; set your provider's host (e.g. smtp.resend.com) and SMTP_USER/PASSWORD"
+            )
+        if "@localhost" in self.smtp_from.lower():
+            problems.append("SMTP_FROM still sends from @localhost — use an address on your domain")
+        # every analysis transcribes through Groq, with or without the Anthropic picker
+        if not self.groq_api_key:
+            problems.append("GROQ_API_KEY is unset — every analysis would fail at transcription")
+        for field, what in _LEGAL_FIELDS.items():
+            if not getattr(self, field).strip():
+                problems.append(f"{field.upper()} is unset — {what}")
 
         if problems:
             raise RuntimeError(

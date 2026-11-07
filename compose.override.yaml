@@ -59,6 +59,10 @@ services:
       SMTP_PORT: "1025"
     volumes:
       - ./app:/srv/app
+      # _wait_for_schema compares the database to these: with only the image's copy, a new
+      # migration goes unnoticed and clip tasks fail on the missing column instead
+      - ./alembic:/srv/alembic
+      - ./alembic.ini:/srv/alembic.ini
       - ./kappacut.py:/srv/kappacut.py
       - ./pipeline.py:/srv/pipeline.py
       - ./kappacut.toml:/srv/kappacut.toml

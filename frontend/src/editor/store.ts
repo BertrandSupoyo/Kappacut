@@ -17,6 +17,26 @@ interface SavedState {
   edits: Record<number, ClipEdit>;
 }
 
+/** One field of one clip's edit, as the AI editor changed it. */
+export interface AgentOp {
+  clip: number;
+  /** e.g. "caption.style" */
+  path: string;
+  value: unknown;
+}
+
+export interface AgentTurn {
+  id: number;
+  role: "user" | "assistant";
+  text: string;
+  changes?: { clip: number; title: string; items: string[] }[];
+  /** how to put back what this answer changed */
+  undo?: AgentOp[];
+  undone?: boolean;
+  /** the request failed, so this is an error message and not part of the conversation */
+  failed?: boolean;
+}
+
 interface EditorState {
   projectId: string;
   clips: Clip[];
@@ -53,7 +73,17 @@ interface EditorState {
   addSfx: (i: number, sfx: PlacedSfx) => void;
   removeSfx: (i: number, at: number, file: string) => void;
   keptRanges: () => Array<Record<string, unknown>>;
+
+  agentChat: AgentTurn[];
+  addAgentTurn: (turn: Omit<AgentTurn, "id">) => void;
+  clearAgentChat: () => void;
+  /** Applies them as one change and returns what would put them back. Field by field, so anything
+   * else changed on the clip while the AI was working stays as it is. */
+  applyAgentOps: (ops: AgentOp[]) => AgentOp[];
+  undoAgentTurn: (id: number) => void;
 }
+
+let agentTurnId = 0;
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingSave: (() => void) | null = null;
@@ -99,6 +129,7 @@ export const useEditor = create<EditorState>((set, get) => ({
   rendering: false,
   renderProgress: null,
   setRender: (p) => set(p),
+  agentChat: [],
 
   init: ({ projectId, clips, segments, duration, saved }) => {
     flushSave();
@@ -122,7 +153,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       playhead: clips[saved?.activeIdx ?? 0]?.start_seconds ?? 0,
       saveStatus: saved ? "saved" : "idle",
       // a render belongs to the project it was started on
-      ...(projectId !== get().projectId ? { rendering: false, renderProgress: null } : {}),
+      ...(projectId !== get().projectId ? { rendering: false, renderProgress: null, agentChat: [] } : {}),
     });
   },
 
@@ -208,5 +239,35 @@ export const useEditor = create<EditorState>((set, get) => ({
           ],
         };
       });
+  },
+
+  addAgentTurn: (turn) => set({ agentChat: [...get().agentChat, { ...turn, id: ++agentTurnId }] }),
+  clearAgentChat: () => set({ agentChat: [] }),
+
+  applyAgentOps: (ops) => {
+    const { clips, edits } = get();
+    const next = { ...edits };
+    const undo: AgentOp[] = [];
+    for (const { clip, path, value } of ops) {
+      if (!clips[clip]) continue;                 // re-analyzed since the question was asked
+      const edit = structuredClone(next[clip] ?? defaultEdit(clips[clip]));
+      const keys = path.split(".");
+      const last = keys.pop() as string;
+      let target = edit as unknown as Record<string, unknown>;
+      for (const key of keys) target = target[key] as Record<string, unknown>;
+      undo.unshift({ clip, path, value: target[last] });
+      target[last] = value;
+      next[clip] = edit;
+    }
+    set({ edits: next });
+    scheduleSave(get, set);
+    return undo;
+  },
+
+  undoAgentTurn: (id) => {
+    const turn = get().agentChat.find((t) => t.id === id);
+    if (!turn?.undo || turn.undone) return;
+    get().applyAgentOps(turn.undo);
+    set({ agentChat: get().agentChat.map((t) => (t.id === id ? { ...t, undone: true } : t)) });
   },
 }));

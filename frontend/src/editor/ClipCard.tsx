@@ -2,6 +2,7 @@ import { useId, useRef, useState, type SyntheticEvent } from "react";
 import { useEditor } from "./store";
 import { clipVisualStyle, clipLoopHandlers } from "./clipVisual";
 import { ColorGrade, gradeId } from "./colorGrade";
+import { CaptionOverlay } from "./CaptionOverlay";
 import { fmtDuration } from "@/lib/format";
 
 export function ClipCard({ index, onEdit }: { index: number; onEdit: (i: number) => void }) {
@@ -72,6 +73,7 @@ export function ClipCard({ index, onEdit }: { index: number; onEdit: (i: number)
             />
           )}
           {mode === "cropfill" && vertical ? <div style={fgWrapStyle}>{video}</div> : video}
+          <CaptionOverlay key={`${mode}-${vertical}`} video={ref} edit={edit} vertical={vertical} />
         </div>
         <button
           className={`clip-play${playing ? " is-playing" : ""}`}

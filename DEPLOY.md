@@ -5,7 +5,12 @@ Single VPS, Docker Compose. Services: `caddy` (TLS + reverse proxy + built SPA),
 
 ## 1. Provision the box
 
-- 2+ vCPU, 4+ GB RAM, 40+ GB disk (media grows fast — see retention below).
+- 4+ dedicated cores, 8+ GB RAM, 40+ GB disk. Media lives in R2 (step 2), so the disk only
+  holds Docker images, Postgres and the worker's scratch copies of sources. See
+  "Capacity notes" for why dedicated cores matter more than the vCPU count.
+- Pick the location for your users: every 1–2 GB source upload travels that link. Launching
+  for Europe and the US, the cheapest choice is netcup's **"No preference, Europe"**, which
+  puts the server in Vienna or Nuremberg, whichever has room. See "Capacity notes" for prices.
 - Install Docker Engine + the compose plugin.
 - Point an `A` (and `AAAA`) DNS record for your domain at the box.
 - Open ports 80 and 443.
@@ -29,7 +34,41 @@ openssl rand -hex 32   # -> RESET_PASSWORD_TOKEN_SECRET
 ```
 
 Set `DOMAIN`, `ACME_EMAIL`, `PUBLIC_BASE_URL=https://<domain>`, `COOKIE_SECURE=true`,
-`ENVIRONMENT=prod`, `GROQ_API_KEY`, and the `SMTP_*` block for your email provider.
+`ENVIRONMENT=prod`, `GROQ_API_KEY`, and:
+
+- `HTTP_PORT=80` and `HTTPS_PORT=443`. Left at the dev defaults (8000/8443), Let's Encrypt
+  can't reach Caddy and the site never gets a certificate.
+- The `S3_*` block, pointed at R2 (below). The dev values point at the compose S3 mock,
+  which doesn't exist in prod.
+- The `SMTP_*` block for a real provider. Resend's free plan (3,000 emails/month, 100/day)
+  is enough to start: `SMTP_HOST=smtp.resend.com`, `SMTP_PORT=465`, `SMTP_TLS=true`,
+  `SMTP_USER=resend`, `SMTP_PASSWORD=<API key>`, `SMTP_FROM` on your verified domain.
+- A paid (Developer) Groq key. It has no monthly fee, but the free tier stops at 8 hours of
+  audio and ~200K picker tokens per model per day — roughly 3–4 hours of video a day.
+- `SUPPORT_EMAIL`, `LEGAL_NAME`, `LEGAL_ADDRESS` and `LEGAL_JURISDICTION`. These are printed
+  on `/terms`, `/privacy` and `/copyright`, so use real details. See "Before you let anyone in".
+- `INVITE_ONLY=true` for a private test: only emails added in **Admin > Invites** can sign up.
+
+Once the deploy looks public, web and worker refuse to boot while any of these is still a
+dev value (dev secrets, the S3 mock, localhost/Mailpit SMTP, no Groq key) or a legal detail is
+missing, and print which.
+
+### R2 bucket
+
+1. Cloudflare dashboard → R2 → Create bucket. Location hint: **Western Europe (WEUR)**, next to
+   the server. A hint is best effort, not a guarantee; R2's separate EU jurisdiction setting is
+   the guarantee, if a lawyer says you need one, and it can only be chosen when creating a bucket.
+2. R2 → Manage API tokens → Create token with **Object Read & Write**, scoped to this bucket.
+   Put its Access Key ID / Secret in `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`, and
+   `https://<account-id>.r2.cloudflarestorage.com` in `S3_ENDPOINT_URL` (`S3_REGION=auto`).
+   Keep that endpoint: presigned URLs only work on it, not on a custom domain.
+3. Bucket → Settings → Object lifecycle rules:
+   - prefix `uploads/`: delete objects after 1 day (tusd's staging area; the app copies a
+     finished upload out of it);
+   - abort incomplete multipart uploads after 1 day.
+
+No CORS rule is needed: the browser only loads media through `<video>`, `<img>` and CSS,
+following the app's redirects to signed URLs.
 
 ## 3. First boot
 
@@ -52,8 +91,37 @@ docker compose -f compose.yaml exec web python -m app.cli create-superuser \
   --email you@example.com --password '<pick-a-strong-one>'
 ```
 
-Verify: open `https://<domain>`, register a throwaway account, click the verification
-email, sign in, upload a short clip, watch it analyze, render one, download it.
+Verify: open `https://<domain>`, register a throwaway account (with `INVITE_ONLY=true`, invite
+its email in **Admin > Invites** first), click the verification email, sign in, upload a short
+clip, watch it analyze, render one, download it.
+
+### Before you let anyone in
+
+The code does its part, but these steps are yours. Kappacut stores videos other people upload
+and sends data to companies in the US, so they matter before the first outside user.
+
+- [ ] **Have a lawyer check `/terms`, `/privacy` and `/copyright`.** They're drafts and show a
+      "draft" banner until you set `LEGAL_REVIEWED=true`. Ask about: the age limit (16), the
+      governing law, whether you need an EU/UK representative (GDPR Art. 27,
+      `LEGAL_EU_REPRESENTATIVE`), the rules in your own country, and takedowns: **Remove for
+      copyright** deletes the files for good, while the DMCA counter-notice process expects
+      removed material to be restorable, so ask whether it should hide them for a while instead.
+- [ ] **Register a DMCA agent** at the [US Copyright Office](https://www.copyright.gov/dmca-directory/)
+      if you take US users: it's a condition of safe-harbor protection, costs $6 and expires
+      after three years. The name, address and email must match `/copyright`
+      (`COPYRIGHT_EMAIL` if it isn't `SUPPORT_EMAIL`).
+- [ ] **Accept each provider's data processing terms** (Groq, Cloudflare, your email provider,
+      netcup). `/privacy` says data leaving the EU relies on their safeguards.
+- [ ] **Turn off Groq's temporary logging if you can:** Groq's Data Controls settings have an
+      opt-out for the logs it may keep for up to 30 days. `/privacy` describes the default, so
+      change that line (`app/launch.py`) if you opt out.
+- [ ] **Check `/privacy` lists who really gets data.** It builds the list from your settings, but
+      `HOSTING_PROVIDER` is yours to set if you don't use netcup.
+- [ ] **Check that the address on `/copyright` gets read.** A takedown is on you to act on: in
+      **Admin > Removals**, search for the video the notice names and use **Remove for
+      copyright**, which deletes the project, emails the owner and records it. The Overview
+      flags anyone with two or more removals, for your repeat-infringer policy. To act on
+      that, open the account in **Admin > Users** and suspend or delete it.
 
 ## 4. Upgrades
 
@@ -93,8 +161,9 @@ docker compose -f compose.yaml exec backup ls -lh /backups
   rclone/rclone sync /b remote:kappacut-backups
 ```
 
-Media (`kappacut_media`) is large; either `restic`/`rclone` it weekly the same way, or
-accept that a disk loss means users re-upload (the DB rows survive, sources don't).
+Media lives in R2, not on this box, so a disk loss costs only the database. If you want a
+second copy of the media too, `rclone sync` the bucket to another provider on the same cron. The `kappacut_media` volume only matters until
+`app.cli migrate-media` has run on an old install.
 
 ### Restore Postgres
 
@@ -123,10 +192,21 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
 - **Pick a dedicated-vCPU box, not burstable/shared.** ffmpeg is CPU-bound; shared vCPUs
   (e.g. plain DigitalOcean Droplets, AWS `t`-series) throttle hard once a render runs a
   while, and that throttling is *inconsistent* — the same clip renders at different speeds
-  depending on what else the host is doing, which users will notice. Hetzner's `CCX` line
-  (dedicated vCPU) is the recommended default: **CCX23 (4 vCPU / 16 GB)** comfortably
-  covers ~1,000 users with light-to-moderate concurrent activity; go **CCX33 (8 vCPU)** if
-  renders start queueing at peak hours.
+  depending on what else the host is doing, which users will notice. Avoid CPU-credit plans
+  too (Hostinger KVM: full speed for ~3 h, then capped at 30%).
+  Prices checked 2026-11-05, excl. VAT: netcup Root Server G12.5 is the cheapest dedicated
+  core. **RS 1000 (4 cores / 8 GB)** is €18.26/month on a 12-month term (€21 monthly); go
+  **RS 2000 (8 cores / 16 GB)** (€34.20) once renders queue at peak hours. Those are the
+  "No preference, Europe" prices. netcup's site shows them with your country's VAT (€21.73 and
+  €25 at Germany's 19%). Naming a location costs more: about €2.34/month for Nuremberg, Vienna
+  or Manassas (USA) on RS 1000's 24-month term, and about €13 for Singapore. Those surcharges
+  come from a third party (netcupvoucher.com, 2026-09-23), since netcup's page lists none, so
+  check the order form. Upgrades are in place but there are no downgrades, so choose the
+  location on the first order. Hetzner CCX23 now costs €85.99 (it was €31.49 before the June
+  2026 price change).
+  Size for the peak, not the month: a render costs ~1.67 CPU-s per second of clip, so 30
+  users rendering 6 × 30 s clips at once need ~150 CPU-minutes. That is ~50 min of queue
+  for the last of them on 3 usable cores, ~21 min on 7.
 - **Set `WORKER_CONCURRENCY` and `FFMPEG_THREADS` together — this is what actually makes
   the app feel the same for every user.** Left unset, every concurrent ffmpeg process
   auto-detects and grabs *every* core; two renders at once already means two processes
@@ -137,8 +217,11 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
 
   | Box | `WORKER_CONCURRENCY` | `FFMPEG_THREADS` |
   |---|---|---|
-  | CCX23 (4 vCPU) | 3 | 1 |
-  | CCX33 (8 vCPU) | 3 | 2 |
+  | 4 cores (RS 1000, CCX23) | 3 | 1 |
+  | 8 cores (RS 2000, CCX33) | 3 | 2 |
+
+  `RENDER_PARALLEL` (default 3) can't go above `WORKER_CONCURRENCY`: at the default of 2, a
+  render only ever cuts two clips at a time.
 
   This gives every job a fixed, equal slice regardless of load — job N+1 waits in the arq
   queue (roughly FIFO) rather than slowing down jobs already running. Uncomment the
@@ -154,11 +237,41 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
   *analysis*.** At 8,000 tokens/minute (free tier) roughly one pick call fits per minute;
   raise `GROQ_TOKENS_PER_MINUTE` to match a paid Groq tier once real usage approaches that.
 - Retention GC (`RETENTION_DELETE_DAYS`, default 37) deletes idle projects + their media.
-  Lower it if the disk fills; set to 0 only if you have plenty of space.
+  Lower it if the disk fills; set to 0 only if you have plenty of space. It also removes
+  accounts that never confirmed their email (`RETENTION_UNVERIFIED_DAYS`, default 14). Both are
+  quoted on `/privacy`, which reads the values you set.
 - `docker compose -f compose.yaml exec worker python -m app.cli run-gc` runs it on demand.
 
 ## 8. Admin
 
-Superusers get `/api/admin/*`: `GET /users` (list + per-user usage), `POST
-/users/{id}/quota` (`{minutes, storage_mb}` overrides), `DELETE /projects/{id}`, `POST
-/jobs/{id}/cancel`, `GET /queue`.
+Superusers get a dashboard at `/admin`:
+
+| Section | What it's for |
+|---|---|
+| **Overview** | Whether the database, queue, workers and disk are healthy, and what needs you. Also users, usage, failures and storage, with the last 14 days as charts. Refreshes every 10 seconds. |
+| **Jobs** | Every analysis and render: filter, search, see the real error under Details, and Cancel. |
+| **Users** | Search, filter and sort accounts. Click an email to change its limits, see its projects, or suspend or delete it. |
+| **Invites** | Who may sign up while `INVITE_ONLY=true`. |
+| **Removals** | Find a project from a copyright notice, remove it, and keep the record. |
+| **Training** | Label videos and train the score weights (see the README). |
+
+**Failed** means something went wrong, and there's a raw error to read. **Stopped** means a job
+ended on purpose: cancelled, refused, or its project was removed. The failure numbers on the
+Overview only count Failed.
+
+**Suspend** blocks sign-in and every signed-in request straight away, stops the account's jobs and
+keeps its files. The reason you type is emailed to them, as the Terms promise. Leave it empty only
+if the law or safety stops you telling them: no email is sent, then or on reinstating.
+
+The same things are available under `/api/admin/*`: `GET /overview`, `GET /users`, `GET
+/users/{id}/projects`, `POST /users/{id}/quota` (`{minutes, storage_mb}` overrides), `POST
+/users/{id}/suspend` (`{reason}`), `POST /users/{id}/reinstate`, `DELETE /users/{id}`, `GET /jobs`,
+`POST /jobs/{id}/cancel`, `GET /projects?q=`, `DELETE /projects/{id}`, `POST
+/projects/{id}/takedown` (`{reference}`), `GET /takedowns`, `GET`/`POST /invites`, `DELETE
+/invites/{id}`, `GET /queue`.
+
+**Cancel** stops the job within about 2 seconds: its task watches the job row and kills its
+ffmpeg. A call to a model that's already under way finishes first, and nothing further is sent.
+
+A failed job shows the user a plain sentence. What really happened is in the job's
+`error_detail`, shown under Details in **Admin > Jobs**.

@@ -484,7 +484,7 @@ def test_presets_come_from_the_shared_file():
 
 
 def test_render_applies_exactly_the_preview_matrix():
-    """Push a known colour through the real lut3d and compare with the matrix maths the
+    """Push a known colour through the real filter and compare with the matrix maths the
     editor's SVG filter uses. Skips without ffmpeg."""
     if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
         print("    (skipped: ffmpeg not installed)")
@@ -506,6 +506,31 @@ def test_render_applies_exactly_the_preview_matrix():
     with tempfile.TemporaryDirectory() as d:
         got = first_pixel(cf._color_chain(look, Path(d) / "g.cube"))
     assert all(abs(g - w) <= 1.5 for g, w in zip(got, want)), (got, [round(w, 1) for w in want])
+
+
+def test_every_preset_takes_the_fast_filter():
+    with tempfile.TemporaryDirectory() as d:
+        for preset in set(cf._color_presets()) - {"none"}:
+            cube = Path(d) / f"{preset}.cube"
+            chain = cf._color_chain({"preset": preset, "b": 0, "c": 1, "s": 1}, cube)
+            assert "colorchannelmixer" in chain and not cube.exists(), preset
+
+
+def test_strong_sliders_still_render():
+    """ffmpeg refuses a colorchannelmixer value above 2, and the sliders can ask for more.
+    Those looks must fall back on the LUT, not fail the render. Skips without ffmpeg."""
+    look = {"preset": "punchy", "b": 0.4, "c": 1.8, "s": 2.0}
+    assert max(abs(v) for row in cf.color_matrix(look) for v in row) > cf.MIXER_MAX_GAIN
+    with tempfile.TemporaryDirectory() as d:
+        cube = Path(d) / "strong.cube"
+        chain = cf._color_chain(look, cube)
+        assert "lut3d" in chain and cube.exists()
+        if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+            print("    (skipped: ffmpeg not installed)")
+            return
+        p = subprocess.run([cf.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=0x668C4D:s=16x16:d=0.1", "-vf", chain,
+                            "-frames:v", "1", "-f", "null", "-"], capture_output=True)
+        assert p.returncode == 0, p.stderr[-300:]
 
 
 def test_captions_wrap_inside_the_frame():
@@ -919,6 +944,53 @@ def test_a_cancelled_job_stops_its_running_processes():
     assert "test-cancel" not in cf._CANCELLED and "test-cancel" not in cf._ACTIVE_SCOPES
     cf.cancel_scope("test-cancel")                      # after the scope ended: a no-op
     assert "test-cancel" not in cf._CANCELLED
+
+
+def test_has_audio_tells_a_picture_only_file_from_one_with_sound():
+    if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+        print("    (skipped: ffmpeg not installed)")
+        return
+    picture = ["-f", "lavfi", "-i", "testsrc=size=160x90:rate=5:duration=1"]
+    sound = ["-f", "lavfi", "-i", "sine=frequency=440:duration=1"]
+    with tempfile.TemporaryDirectory() as d:
+        silent, voiced = Path(d) / "silent.mp4", Path(d) / "voiced.mp4"
+        subprocess.run([cf.FFMPEG, "-v", "error", "-y", *picture, str(silent)], check=True)
+        subprocess.run([cf.FFMPEG, "-v", "error", "-y", *picture, *sound, "-shortest", str(voiced)], check=True)
+        assert cf.has_audio(silent) is False
+        assert cf.has_audio(voiced) is True
+
+
+SIGNED = "https://acct.r2.cloudflarestorage.com/kappacut/users/u/source.mp4?X-Amz-Signature=SECRETSIG&X-Amz-Credential=SECRETKEY"
+
+
+def _failure_of(*cmd: str) -> str:
+    try:
+        cf.run(list(cmd))
+    except RuntimeError as e:
+        return str(e)
+    raise AssertionError("the command was meant to fail")
+
+
+def test_a_failed_command_never_shows_a_signed_url():
+    # how ffmpeg reports a source it can't open
+    msg = _failure_of(sys.executable, "-c",
+                      f"import sys; sys.stderr.write(\"{SIGNED}: Server returned 403 Forbidden\\n\"); sys.exit(1)")
+    assert "SECRET" not in msg and "X-Amz" not in msg
+    assert "<url>" in msg and "Server returned 403" in msg           # the useful part stays
+
+
+def test_a_signed_url_cut_by_the_stderr_limit_stays_hidden():
+    # the URL straddles the 1000-character tail, so only its query string survives the cut
+    tail = " " + "x" * (999 - len(SIGNED) // 2)
+    msg = _failure_of(sys.executable, "-c",
+                      f"import sys; sys.stderr.write({SIGNED + tail!r}); sys.exit(1)")
+    assert "SECRET" not in msg and "X-Amz" not in msg
+
+
+def test_a_url_in_the_command_itself_is_hidden_too():
+    # the web process's waveform command has `-i <url>` inside the first four arguments
+    msg = _failure_of(sys.executable, "-c", "import sys; sys.exit(1)", SIGNED)
+    assert "SECRET" not in msg
 
 
 if __name__ == "__main__":

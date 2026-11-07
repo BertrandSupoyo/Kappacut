@@ -1,3 +1,10 @@
+export function fmtBytes(bytes: number): string {
+  if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024)} KB`;
+  if (bytes < 1024 ** 3) return `${Math.round(bytes / 1024 ** 2)} MB`;
+  const gb = bytes / 1024 ** 3;
+  return gb < 1024 ? `${gb.toFixed(1)} GB` : `${(gb / 1024).toFixed(1)} TB`;
+}
+
 export function fmtDuration(s: number): string {
   s = Math.max(0, Math.round(s));
   const h = Math.floor(s / 3600);

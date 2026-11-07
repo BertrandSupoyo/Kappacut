@@ -467,8 +467,8 @@ async def retry_analyze(
 
     p.status = "queued"
     p.error = None
-    job = Job(user_id=user.id, project_id=p.id, kind="analyze", status="queued",
-              payload=analyze_payload(p))
+    payload = analyze_payload(p)
+    job = Job(user_id=user.id, project_id=p.id, kind="analyze", status="queued", payload=payload)
     session.add(job)
     await session.commit()
     job.arq_job_id = await enqueue_analyze(job.id)
@@ -527,10 +527,13 @@ async def start_render(
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    from app.jobs import count_to_render  # local import: jobs pulls in the whole pipeline
+
     p = await _owned(project_id, user, session)
     ranges = _validate_ranges((body or {}).get("ranges"))
     await _guard_enqueue(session, user)
-    await check_quota(session, user, "render", count=len(ranges))
+    # clips that match a stored render are reused, not cut, and don't count
+    await check_quota(session, user, "render", count=await count_to_render(session, p, ranges))
 
     job = Job(user_id=user.id, project_id=p.id, kind="render", status="queued",
               payload={"ranges": ranges})
@@ -692,7 +695,7 @@ async def _derive(key: str, src_key: str, build: list, what: str) -> None:
     try:
         await run_in_threadpool(work)
     except Exception:  # noqa: BLE001
-        # logged, not returned: ffmpeg's error text can carry the signed source URL
+        # logged, not returned: ffmpeg's error text means nothing to the person looking at it
         log.exception("%s failed for %s", what, src_key)
         raise HTTPException(500, f"couldn't make the {what}")
 

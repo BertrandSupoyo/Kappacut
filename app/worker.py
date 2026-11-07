@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import uuid
+from pathlib import Path
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -23,8 +24,9 @@ from app import groq_gate
 from app import jobs as jobs_mod
 from app.config import settings
 from app.db import async_session_maker, engine
-from app.jobs import (FANOUT, MAX_ATTEMPTS, render_key, requeue, resume_render,
-                      retry_or_end_clip, run_analyze, run_render, run_render_clip)
+from app.health import WORKER_KEY
+from app.jobs import (FANOUT, MAX_ATTEMPTS, owner_worker, recover_queued, release_clip, render_key,
+                      requeue, resume_render, retry_or_end_clip, run_analyze, run_render, run_render_clip)
 from app.models.job import Job
 from app.models.project import Analysis, Project
 from app.retention import run_gc
@@ -56,10 +58,11 @@ async def retention_gc(ctx: dict) -> None:
 # replacing while it finishes its job) and must be left alone.
 HEARTBEAT_TTL = 45          # three missed beats: a live worker never lapses by accident
 HEARTBEAT_EVERY = 15
+_RESTARTED = "Our server restarted while working on this. Please try again."
 
 
 def _hb_key(worker_id: str) -> str:
-    return f"kappacut:worker:{worker_id}"
+    return f"{WORKER_KEY}{worker_id}"
 
 
 async def _heartbeat(redis, worker_id: str) -> None:
@@ -79,6 +82,10 @@ async def sweep_orphans(ctx: dict) -> None:
     when no worker restarts afterwards.
     """
     redis = ctx["redis"]
+    try:
+        await recover_queued()
+    except Exception:  # noqa: BLE001 — the running jobs below still need their sweep
+        log.warning("couldn't check queued jobs against the queue", exc_info=True)
     async with async_session_maker() as s:
         running = (await s.execute(
             select(Job.id, Job.project_id, Job.worker_id, Job.kind).where(Job.status == "running")
@@ -98,15 +105,19 @@ async def sweep_orphans(ctx: dict) -> None:
                 # MAX_ATTEMPTS). The job itself isn't orphaned.
                 owners = render_key(jid, "owners")
                 held = await redis.hgetall(owners)
-                for idx, w in held.items():
+                for idx, owner in held.items():
                     idx = int(idx.decode() if isinstance(idx, bytes) else idx)
-                    w = w.decode() if isinstance(w, bytes) else w
-                    # hdel is the claim: neither a concurrent sweep nor the clip itself (if
-                    # it was only slow, not dead) can end the same clip a second time
-                    if not await redis.exists(_hb_key(w)) and await redis.hdel(owners, str(idx)):
+                    owner = owner.decode() if isinstance(owner, bytes) else owner
+                    w = owner_worker(owner)
+                    # releasing exactly the hold we saw is the claim: neither a concurrent
+                    # sweep nor the clip itself (if only slow, not dead) can end the clip a
+                    # second time, and a retry that took it over since keeps its hold
+                    if not await redis.exists(_hb_key(w)) and await release_clip(redis, jid, idx, owner):
                         log.warning("render %s: clip %d lost with worker %s", jid, idx + 1, w)
-                        await retry_or_end_clip(jid, await total_of(jid), idx,
-                                                f"clip {idx + 1}: worker stopped mid-clip")
+                        await retry_or_end_clip(
+                            jid, await total_of(jid), idx,
+                            f"Clip {idx + 1}: our server restarted while cutting it. Please render it again.",
+                            f"clip {idx + 1}: worker {w} stopped mid-clip")
                 # Nothing held and nothing happened for a whole job timeout: the chain broke
                 # where no owner was recorded (a clip task lost before claiming its slot).
                 # Pick it back up from the clips that never ended.
@@ -124,7 +135,8 @@ async def sweep_orphans(ctx: dict) -> None:
         orphaned = {pid for _, pid in dead}
         res = await s.execute(
             update(Job).where(Job.id.in_([jid for jid, _ in dead]), Job.status == "running")
-            .values(status="error", error=f"worker restarted (gave up after {MAX_ATTEMPTS} attempts)")
+            .values(status="error", error=_RESTARTED,
+                    error_detail=f"worker restarted (gave up after {MAX_ATTEMPTS} attempts)")
         )
         # The job row is only half the state. A project whose analyze job died still reads
         # 'analyzing', and the SPA polls that forever with no error to show — so fail the
@@ -142,7 +154,7 @@ async def sweep_orphans(ctx: dict) -> None:
                         .values(status="ready", error=None))
         stuck = (await s.execute(
             update(Project).where(*stranded, ~has_analysis)
-            .values(status="failed", error="worker restarted")
+            .values(status="failed", error=_RESTARTED)
         )).rowcount or 0
         await s.commit()
     if res.rowcount:
@@ -150,23 +162,48 @@ async def sweep_orphans(ctx: dict) -> None:
                     res.rowcount, stuck)
 
 
-async def _wait_for_schema(poll_s: float = 2.0, log_every: int = 15) -> None:
-    """Block until migrations have created the tables startup touches.
+def _migrations() -> tuple[str | None, set[str]]:
+    """(newest migration this code ships, every revision it knows); (None, set()) when the
+    alembic files aren't next to the app, which leaves only the table check below."""
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
 
-    `alembic upgrade head` is a manual step run after `compose up`, so on a fresh DB the
-    worker can boot first. Querying `jobs` then raises inside arq's startup hook, and under
-    `--watch` that leaves a live container with no worker loop — jobs queue forever.
+        root = Path(__file__).resolve().parent.parent
+        cfg = Config(str(root / "alembic.ini"))
+        cfg.set_main_option("script_location", str(root / "alembic"))
+        script = ScriptDirectory.from_config(cfg)
+        return script.get_current_head(), {r.revision for r in script.walk_revisions()}
+    except Exception:  # noqa: BLE001
+        log.warning("couldn't read the alembic scripts; only checking that tables exist", exc_info=True)
+        return None, set()
+
+
+async def _wait_for_schema(poll_s: float = 2.0, log_every: int = 15) -> None:
+    """Block until the database has every migration this code needs.
+
+    `alembic upgrade head` is a manual step run after `compose up`, so the worker can boot
+    first: on a fresh DB with no tables, or after an upgrade with a column still missing.
+    Querying then raises inside arq's startup hook - a crash loop, or under `--watch` a live
+    container with no worker loop, jobs queuing forever.
     """
+    head, known = await asyncio.to_thread(_migrations)
     for attempt in itertools.count(1):
         async with engine.connect() as conn:
             missing = (await conn.execute(text(
                 "SELECT to_regclass('jobs') IS NULL OR to_regclass('projects') IS NULL"
             ))).scalar()
-        if not missing:
+            current = None
+            if not missing and head and (await conn.execute(
+                    text("SELECT to_regclass('alembic_version') IS NOT NULL"))).scalar():
+                current = (await conn.execute(text("SELECT version_num FROM alembic_version"))).scalar()
+        # a revision this code doesn't know is newer than it (a rollback in progress): go on
+        behind = bool(head) and current != head and (current is None or current in known)
+        if not missing and not behind:
             return
         if attempt == 1 or attempt % log_every == 0:
-            log.warning("waiting for migrations (jobs/projects tables missing) — "
-                        "run `alembic upgrade head`")
+            log.warning("waiting for migrations (database at %s, this code needs %s) — "
+                        "run `alembic upgrade head`", current or "no tables", head or "its tables")
         await asyncio.sleep(poll_s)
 
 

@@ -86,7 +86,9 @@ async def monthly_minutes(session: AsyncSession, user_id) -> float:
             UsageEvent.created_at >= _month_start(),
         )
     )
-    return round((secs or 0) / 60, 2)
+    # float: Postgres sums a bigint as numeric, so this is a Decimal, which raises when added to
+    # a float. That failed every analysis after a free user's first; admins never get that far.
+    return round(float(secs or 0) / 60, 2)
 
 
 async def storage_bytes(session: AsyncSession, user_id) -> int:

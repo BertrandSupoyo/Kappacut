@@ -1,7 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
-import { jget } from "@/api/client";
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ApiError, jget, jpost } from "@/api/client";
+import { usePublicConfig } from "@/api/config";
 import type { Usage } from "@/api/types";
 import { useAuth } from "@/auth/AuthContext";
+import { useToast } from "@/components/Toast";
 
 function Meter({ label, used, cap, unit, unlimited }: { label: string; used: number; cap: number; unit?: string; unlimited?: boolean }) {
   const pct = !unlimited && cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
@@ -23,8 +27,61 @@ function Meter({ label, used, cap, unit, unlimited }: { label: string; used: num
   );
 }
 
+function DeleteAccount() {
+  const { refresh } = useAuth();
+  const nav = useNavigate();
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    setErr("");
+    setBusy(true);
+    try {
+      await jpost("/api/users/me/delete", { password });
+      qc.clear();
+      await refresh();
+      nav("/");
+      toast("Your account and everything in it have been deleted.");
+    } catch (x) {
+      setErr((x instanceof ApiError && x.status !== 500 && x.message) || "Couldn't delete your account. Please try again.");
+      setBusy(false);
+    }
+  }
+
+  if (!open) {
+    return <button className="btn danger" style={{ padding: "8px 14px" }} onClick={() => setOpen(true)}>Delete my account</button>;
+  }
+  return (
+    <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: "var(--sp-3)" }}>
+      <p style={{ margin: 0, fontSize: "var(--fs-sm)" }}>
+        This permanently deletes your account, projects, videos and clips, and stops anything still running. It can't be
+        undone, so download anything you want to keep first.
+      </p>
+      <div className="field">
+        <label htmlFor="del-pw">Your password</label>
+        <input id="del-pw" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+      </div>
+      {err && <div className="err" role="alert">{err}</div>}
+      <div style={{ display: "flex", gap: "var(--sp-2)", flexWrap: "wrap" }}>
+        <button className="btn danger" disabled={busy || !password} style={{ padding: "8px 14px" }}>
+          {busy ? "Deleting…" : "Delete everything"}
+        </button>
+        <button type="button" className="btn ghost" disabled={busy} style={{ padding: "8px 14px" }} onClick={() => { setOpen(false); setPassword(""); setErr(""); }}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
 export function Account() {
   const { user } = useAuth();
+  const cfg = usePublicConfig();
   const { data } = useQuery({ queryKey: ["usage"], queryFn: () => jget<Usage>("/api/users/me/usage") });
 
   return (
@@ -54,6 +111,33 @@ export function Account() {
       <div style={{ marginTop: "var(--sp-6)" }}>
         <a href="/forgot" className="btn ghost" style={{ padding: "8px 14px" }}>Change password</a>
       </div>
+
+      <section className="glass" style={{ padding: "var(--sp-4)", marginTop: "var(--sp-5)" }} aria-labelledby="h-data">
+        <h2 id="h-data" style={{ fontSize: "var(--fs-lg)", marginBottom: "var(--sp-2)" }}>Your data</h2>
+        <p className="muted" style={{ fontSize: "var(--fs-sm)", marginTop: 0 }}>
+          Download a file with your account details, transcripts, clips and edits, plus links to your videos that work for
+          24 hours. Anyone with those links can download the files, so keep it private. See our{" "}
+          <Link to="/privacy">Privacy Policy</Link>.
+        </p>
+        <a href="/api/users/me/export" download className="btn ghost" style={{ padding: "8px 14px" }}>Download my data</a>
+      </section>
+
+      <section className="glass" style={{ padding: "var(--sp-4)", marginTop: "var(--sp-4)" }} aria-labelledby="h-delete">
+        <h2 id="h-delete" style={{ fontSize: "var(--fs-lg)", marginBottom: "var(--sp-3)" }}>Delete your account</h2>
+        {user?.is_superuser ? (
+          <p className="muted" style={{ fontSize: "var(--fs-sm)", margin: 0 }}>
+            Admin accounts can't be deleted here. Remove the admin role first.
+          </p>
+        ) : (
+          <DeleteAccount />
+        )}
+      </section>
+
+      {cfg?.support_email && (
+        <p className="muted" style={{ fontSize: "var(--fs-sm)", marginTop: "var(--sp-5)" }}>
+          Need help? Email <a href={`mailto:${cfg.support_email}`}>{cfg.support_email}</a>.
+        </p>
+      )}
     </div>
   );
 }

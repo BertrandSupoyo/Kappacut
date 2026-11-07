@@ -97,6 +97,47 @@ def test_off_switches_stay_off():
     assert out["sfx"] == []
 
 
+def test_a_redis_outage_at_enqueue_doesnt_fail_the_request():
+    """The job row is already committed by then; app.jobs.recover_queued queues it later."""
+    import asyncio
+    import uuid
+
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from app import queue
+
+    class Pool:
+        def __init__(self, exc):
+            self.exc = exc
+
+        async def enqueue_job(self, *_a, **_k):
+            raise self.exc
+
+    real = queue.get_pool
+    try:
+        for exc in (RedisConnectionError("down"), ConnectionRefusedError("down"), TimeoutError("slow")):
+            async def down(pool=Pool(exc)):
+                return pool
+
+            queue.get_pool = down
+            assert asyncio.run(queue.enqueue_render(uuid.uuid4())) is None
+            assert asyncio.run(queue.enqueue_analyze(uuid.uuid4())) is None
+
+        # a bug in the call isn't an outage: it must still surface
+        async def buggy():
+            return Pool(TypeError("bad call"))
+
+        queue.get_pool = buggy
+        try:
+            asyncio.run(queue.enqueue_render(uuid.uuid4()))
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("a TypeError was swallowed")
+    finally:
+        queue.get_pool = real
+
+
 def test_admin_quota_override():
     assert _override("", "minutes") is None and _override(0, "minutes") is None
     assert _override(" 120 ", "minutes") == 120

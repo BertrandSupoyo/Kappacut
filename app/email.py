@@ -22,9 +22,10 @@ _SHELL = """\
               background:linear-gradient(96deg,#5f4ee0,#0c8b99);-webkit-background-clip:text;
               background-clip:text;color:transparent">Kappacut</div>
   <div style="margin-top:16px">{body}</div>
-  <p style="margin-top:28px;font-size:12px;color:#8b8797">
-    If you didn't request this, you can ignore this email.</p>
+  {footer}
 </div>"""
+_IGNORE_ME = """<p style="margin-top:28px;font-size:12px;color:#8b8797">
+    If you didn't request this, you can ignore this email.</p>"""
 
 
 def _button(href: str, label: str) -> str:
@@ -36,13 +37,15 @@ def _button(href: str, label: str) -> str:
     )
 
 
-async def send_email(to: str, subject: str, html_body: str) -> None:
+async def send_email(to: str, subject: str, html_body: str, *, ignorable: bool = True) -> None:
+    """`ignorable=False` for mail about something that happens whether they asked or not: "you
+    can ignore this" would be wrong under a deletion warning or a copyright removal."""
     msg = EmailMessage()
     msg["From"] = settings.smtp_from
     msg["To"] = to
     msg["Subject"] = subject
     msg.set_content("This message needs an HTML-capable email client.")
-    msg.add_alternative(_SHELL.format(body=html_body), subtype="html")
+    msg.add_alternative(_SHELL.format(body=html_body, footer=_IGNORE_ME if ignorable else ""), subtype="html")
 
     await aiosmtplib.send(
         msg,
@@ -82,6 +85,54 @@ async def send_reset_email(to: str, token: str) -> None:
         log.warning("reset email to %s failed: %s", to, e)
 
 
+async def send_invite_email(to: str) -> None:
+    link = f"{settings.public_base_url.rstrip('/')}/register"
+    body = ("<p>You're invited to try Kappacut, which finds the best moments in a long video and "
+            "cuts them into short clips. Sign up with this email address:</p>"
+            + _button(link, "Create your account"))
+    try:
+        await send_email(to, "You're invited to Kappacut", body)
+    except Exception as e:  # noqa: BLE001 — the invite stands; the admin can tell them another way
+        log.warning("invite email to %s failed: %s", to, e)
+
+
+async def send_takedown_notice(to: str, project_name: str, reference: str) -> None:
+    """Sent when a project is removed for copyright: they have to be told, and told how to
+    dispute it. The name and reference are escaped for the same reason as below."""
+    contact = settings.copyright_email or settings.support_email
+    body = (f"<p>We received a copyright notice about your project "
+            f"<b>{html.escape(project_name)}</b>, and we've removed it and its clips.</p>"
+            f"<p>Notice reference: {html.escape(reference)}</p>"
+            f"<p>If you own this material or have permission to use it, you can send a counter-notice. "
+            f"See our <a href=\"{settings.public_base_url.rstrip('/')}/copyright\">copyright page</a>"
+            + (f" or write to {html.escape(contact)}" if contact else "") + ".</p>")
+    try:
+        await send_email(to, "Kappacut: a project was removed after a copyright notice", body, ignorable=False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("takedown notice to %s failed: %s", to, e)
+
+
+async def send_suspension_notice(to: str, reason: str) -> None:
+    """The Terms promise to say why an account was suspended."""
+    contact = settings.support_email
+    body = (f"<p>Your Kappacut account has been suspended, so you can't sign in and any jobs you had "
+            f"running have been stopped.</p>"
+            f"<p>Reason: {html.escape(reason)}</p>"
+            + (f"<p>If you think this is a mistake, write to {html.escape(contact)}.</p>" if contact else ""))
+    try:
+        await send_email(to, "Kappacut: your account has been suspended", body, ignorable=False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("suspension notice to %s failed: %s", to, e)
+
+
+async def send_reinstated_notice(to: str) -> None:
+    body = "<p>Your Kappacut account is active again, and you can sign in as usual.</p>"
+    try:
+        await send_email(to, "Kappacut: your account is active again", body, ignorable=False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reinstated notice to %s failed: %s", to, e)
+
+
 async def send_retention_warning(to: str, project_name: str, days_left: int) -> None:
     # the name is whatever the user typed: escaped, it can't put links or markup in our mail
     body = (
@@ -92,6 +143,6 @@ async def send_retention_warning(to: str, project_name: str, days_left: int) -> 
     )
     try:
         subject_name = " ".join(project_name.split())   # no line breaks in a mail header
-        await send_email(to, f"Kappacut: “{subject_name}” expires soon", body)
+        await send_email(to, f"Kappacut: “{subject_name}” expires soon", body, ignorable=False)
     except Exception as e:  # noqa: BLE001
         log.warning("retention warning to %s failed: %s", to, e)

@@ -55,7 +55,7 @@ export function clipVisualStyle(
   color: ClipEdit["color"] | undefined,
   gradeId?: string,
 ): ClipVisual {
-  // the same matrix the render bakes into its lut3d; "none" when the look is neutral
+  // the same matrix the render applies; "none" when the look is neutral
   const grade = gradeId && colorMatrix(color) ? `url(#${gradeId})` : "none";
   const vertical = look?.vertical ?? false;
   const mode = look?.mode ?? "crop";
@@ -77,7 +77,14 @@ export function clipVisualStyle(
         background: "#000",
         boxShadow: "0 0 0 1px var(--border), var(--elev-2)",
       }
-    : { borderRadius: "var(--r-md)", overflow: "hidden", background: "#000" };
+    : {
+        borderRadius: "var(--r-md)",
+        overflow: "hidden",
+        background: "#000",
+        // the caption overlay is positioned in this frame and sized in cqw of it
+        position: "relative",
+        containerType: "inline-size",
+      };
 
   // The render's gblur sigma is in 1080px-wide output pixels; this frame is ~230-320px wide,
   // so the same number as CSS px blurred the preview 3-4x harder than the real clip.

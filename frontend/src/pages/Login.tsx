@@ -5,7 +5,7 @@ import { useAuth } from "@/auth/AuthContext";
 import { AuthLayout } from "./AuthLayout";
 
 export function Login() {
-  const { user, loading, refresh } = useAuth();
+  const { user, loading, expired, refresh } = useAuth();
   const nav = useNavigate();
   const loc = useLocation() as { state?: { from?: string } };
   const [params] = useSearchParams();
@@ -51,6 +51,11 @@ export function Login() {
       {justVerified && (
         <p style={{ color: "var(--success)", fontSize: "var(--fs-sm)", textAlign: "center", marginTop: 0 }}>
           Email verified — sign in to continue.
+        </p>
+      )}
+      {expired && (
+        <p className="muted" role="status" style={{ fontSize: "var(--fs-sm)", textAlign: "center", marginTop: 0 }}>
+          Your session ended. Sign in to carry on where you left off.
         </p>
       )}
       <form onSubmit={submit} style={{ display: "flex", flexDirection: "column", gap: "var(--sp-4)" }}>

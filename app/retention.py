@@ -8,7 +8,7 @@ import asyncio
 import datetime as dt
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app import storage
 from app.config import settings
@@ -16,6 +16,7 @@ from app.db import async_session_maker
 from app.email import send_retention_warning
 from app.models.job import Job
 from app.models.project import Project
+from app.models.training import VideoLabel
 from app.models.user import User
 
 log = logging.getLogger("kappacut.retention")
@@ -31,13 +32,31 @@ def _idle_before(days: int) -> dt.datetime:
     return dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
 
 
+async def purge_unverified() -> int:
+    """Delete accounts that never confirmed their email. They can't sign in, so they can't delete
+    themselves, and all we hold for them is an address someone may have mistyped. They can't own
+    anything: every project route needs a verified user."""
+    if settings.retention_unverified_days <= 0:
+        return 0
+    async with async_session_maker() as s:
+        res = await s.execute(delete(User).where(
+            User.is_verified.is_(False), User.is_superuser.is_(False),
+            User.created_at < _idle_before(settings.retention_unverified_days)))
+        await s.commit()
+    return res.rowcount or 0
+
+
 async def run_gc() -> dict:
+    unverified = await purge_unverified()
     if settings.retention_delete_days <= 0:
-        return {"disabled": True}
+        return {"disabled": True, "unverified": unverified}
 
     warned = deleted = skipped = objects = 0
     now = dt.datetime.now(dt.UTC)
     idle = func.coalesce(Project.last_opened_at, Project.created_at)
+    # a finished label is hours of someone's work and the training set; a project nobody opens
+    # again is normal for one, and deleting it would quietly shrink what the score is based on
+    unlabelled = Project.id.not_in(select(VideoLabel.project_id).where(VideoLabel.done))
 
     async with async_session_maker() as s:
         # 1) warn — past the warn line but not yet past the delete line
@@ -46,6 +65,7 @@ async def run_gc() -> dict:
                 idle < _idle_before(settings.retention_warn_days),
                 idle >= _idle_before(settings.retention_delete_days),
                 Project.retention_warned_at.is_(None),
+                unlabelled,
             )
         )).scalars().all()
         for p in to_warn:
@@ -61,7 +81,7 @@ async def run_gc() -> dict:
 
         # 2) delete
         to_delete = (await s.execute(
-            select(Project).where(idle < _idle_before(settings.retention_delete_days))
+            select(Project).where(idle < _idle_before(settings.retention_delete_days), unlabelled)
         )).scalars().all()
         for p in to_delete:
             active = await s.scalar(
@@ -77,6 +97,7 @@ async def run_gc() -> dict:
             deleted += 1
         await s.commit()
 
-    log.info("retention GC: warned=%d deleted=%d (%d objects) skipped=%d",
-             warned, deleted, objects, skipped)
-    return {"warned": warned, "deleted": deleted, "objects": objects, "skipped": skipped}
+    log.info("retention GC: warned=%d deleted=%d (%d objects) skipped=%d unverified=%d",
+             warned, deleted, objects, skipped, unverified)
+    return {"warned": warned, "deleted": deleted, "objects": objects, "skipped": skipped,
+            "unverified": unverified}

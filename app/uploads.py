@@ -29,7 +29,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +139,14 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
     except (ValueError, TypeError):
         return _reject(400, "Missing projectId metadata.")
 
+    # One post-finish per project at a time (held until commit). tusd retries a hook that
+    # errored or timed out, possibly while the first delivery is still copying: both would
+    # adopt the upload and queue an analysis each. Taken before the project is read, so a
+    # delivery that waited here sees what the first one committed.
+    if hook_type == "post-finish":
+        await session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                              {"k": f"upload:{project_id}"})
+
     project = await session.get(Project, project_id)
     if project is None or project.user_id != user.id:
         return _reject(404, "Project not found.")
@@ -172,31 +180,51 @@ async def tusd_hook(request: Request, session: AsyncSession = Depends(get_sessio
 
         # `Size` is caller-supplied; the object in the bucket is the only honest number
         size = await run_in_threadpool(storage.size_of, staged)
+        adopted = None                            # a source an earlier delivery already copied in
         if not size:
-            log.error("post-finish: upload object %s is missing or empty", staged)
-            # say so on the project, rather than leave it on "uploading" forever
-            return await _abandon(session, project, staged,
-                                  "The upload didn't arrive in one piece - try again.")
+            # Gone doesn't mean lost: an earlier delivery of this hook moves the object to the
+            # project's source, and tusd redelivers a post-finish that errored.
+            found = await run_in_threadpool(storage.find_source, user.id, project.id)
+            found_size = await run_in_threadpool(storage.size_of, found) if found else 0
+            # "uploading" is only ever a project's first upload, so any source it has is this
+            # one; otherwise a size the project hasn't recorded means a replaced source.
+            if found_size and (project.status == "uploading" or found_size != project.source_bytes):
+                log.warning("post-finish for %s: finishing an earlier delivery's import", project_id)
+                adopted, size = found, found_size
+            elif project.status == "uploading":
+                log.error("post-finish: upload object %s is missing or empty", staged)
+                # say so on the project, rather than leave it on "uploading" forever
+                return await _abandon(session, project, staged,
+                                      "The upload didn't arrive in one piece - try again.")
+            else:
+                # a replay of a hook that already did its work: the project has moved on
+                # (it may have clips by now), and nothing here may mark it failed
+                log.warning("post-finish ignored for %s: replay, project is %s", project_id, project.status)
+                await _discard(staged)
+                return _ACK
 
         # pre-create checked these, but that call can simply be skipped — re-check here,
         # where the worker time and the Groq budget actually get spent.
         if await _one_active_job(session, user.id):
-            return await _abandon(session, project, staged, "You already have a job running.")
+            return await _abandon(session, project, adopted or staged, "You already have a job running.")
         try:
             await check_quota(session, user, "analyze")
             await check_quota(session, user, "upload", extra_bytes=size)
         except QuotaError as e:
-            return await _abandon(session, project, staged, f"You've hit your {e.limit} limit.")
+            return await _abandon(session, project, adopted or staged, f"You've hit your {e.limit} limit.")
 
-        # an unvetted extension would name the object; fall back to the one create_project
-        # already validated against VIDEO_EXTS
-        ext = Path(meta.get("filename") or "").suffix.lower()
-        if ext not in VIDEO_EXTS:
-            ext = project.source_ext if project.source_ext in VIDEO_EXTS else ".mp4"
-        # server-side copy, then drop the upload object — no bytes through this process
-        source = storage.source_key(user.id, project.id, ext)
-        await run_in_threadpool(storage.copy, staged, source)
-        await _discard(staged)
+        if adopted:
+            source, ext = adopted, Path(adopted).suffix.lower()
+        else:
+            # an unvetted extension would name the object; fall back to the one create_project
+            # already validated against VIDEO_EXTS
+            ext = Path(meta.get("filename") or "").suffix.lower()
+            if ext not in VIDEO_EXTS:
+                ext = project.source_ext if project.source_ext in VIDEO_EXTS else ".mp4"
+            # server-side copy, then drop the upload object — no bytes through this process
+            source = storage.source_key(user.id, project.id, ext)
+            await run_in_threadpool(storage.copy, staged, source)
+            await _discard(staged)
         await clear_stale_source(user.id, project.id, source)
 
         project.source_ext = ext

@@ -4,7 +4,7 @@ import presetsJson from "./colorPresets.json";
  * The editor half of the shared colour grade. Mirrors kappacut.color_matrix step for step:
  * presets from colorPresets.json (the one definition both sides read), then the sliders,
  * composed into a 3x4 affine matrix on gamma-encoded RGB. The render applies the same matrix
- * as an ffmpeg lut3d; here it is an SVG feColorMatrix with color-interpolation-filters="sRGB"
+ * with ffmpeg's colorchannelmixer; here it is an SVG feColorMatrix with color-interpolation-filters="sRGB"
  * (the SVG default, linearRGB, would not match ffmpeg's gamma-encoded maths).
  */
 type Row = [number, number, number, number];

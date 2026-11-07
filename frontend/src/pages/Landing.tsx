@@ -1,6 +1,8 @@
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { usePublicConfig } from "@/api/config";
 import { useAuth } from "@/auth/AuthContext";
+import { SiteFooter } from "@/components/SiteFooter";
 import { Wordmark } from "@/components/Wordmark";
 
 const icon = (d: ReactNode) => (
@@ -19,12 +21,13 @@ const FEATURES = [
   { i: icon(<><path d="M4 6h16M4 12h10M4 18h7" /></>), t: "Transcript-first picking", d: "Whisper transcribes the whole thing; the picker works from the words, not guesses. Repetitive hallucinations and dead air are dropped before scoring." },
   { i: icon(<><path d="M12 3l2.6 5.6 6.1.7-4.5 4.2 1.2 6L12 16.6 6.6 19.5l1.2-6-4.5-4.2 6.1-.7z" /></>), t: "A reason for every clip", d: "Each pick comes with its hook, its payoff line, a 0–100 score and a one-line why — so you can skim the shortlist instead of watching all of it." },
   { i: icon(<><rect x="7" y="2" width="10" height="20" rx="2" /><path d="M10 17h4" /></>), t: "9:16 that follows the face", d: "Reframe to vertical with a face-tracking crop or a blurred fill, pick a caption style and colour, drop in whooshes and impacts." },
-  { i: icon(<><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>), t: "Your library stays yours", d: "Projects, analyses and rendered clips live in your account. Only the audio is sent out for transcription." },
+  { i: icon(<><rect x="4" y="11" width="16" height="10" rx="2" /><path d="M8 11V7a4 4 0 0 1 8 0v4" /></>), t: "Your library stays yours", d: "Projects, analyses and rendered clips stay private to your account, and you can download or delete all of it at any time." },
 ];
 
 const FAQ = [
   ["Is it free?", "Yes. The free plan covers 60 minutes of transcription a month, 2 GB per file, and keeps your projects for about a month of inactivity."],
-  ["What leaves my machine?", "The extracted audio goes to Groq for transcription and the transcript text is sent to the model that picks moments. Your video file and rendered clips stay in your account."],
+  ["Which languages does it work with?", "Most spoken languages, and it works out which one by itself. English has been tested the most, so check the captions and clips before you post in another language."],
+  ["Where does my video go?", "It's stored privately in your account. The audio goes to Groq for transcription, and the transcript goes to the model that picks moments. The Privacy Policy lists everyone who handles your data."],
   ["How long does a video take?", "A few minutes for a typical stream VOD — most of it is transcription. You watch the progress live."],
   ["Can I bring my own clips to caption?", "Right now Kappacut starts from one uploaded source per project. Multi-source stitching isn't in yet."],
 ];
@@ -71,8 +74,9 @@ function HeroVisual() {
 
 export function Landing() {
   const { user } = useAuth();
+  const cfg = usePublicConfig();
   const appHref = user ? "/app" : "/register";
-  const cta = user ? "Open the app" : "Get started — it's free";
+  const cta = user ? "Open the app" : cfg?.invite_only ? "Sign up with your invite" : "Get started — it's free";
 
   return (
     <div className="landing">
@@ -108,7 +112,7 @@ export function Landing() {
           <a className="btn ghost btn-lg" href="#how">How it works</a>
         </div>
         <p className="muted" style={{ fontSize: "var(--fs-xs)", marginTop: "var(--sp-4)" }}>
-          Free plan · 60 min/month · no card
+          {cfg?.invite_only && "Private test, invite only · "}Free plan · 60 min/month · no card · most languages
         </p>
         <HeroVisual />
       </section>
@@ -167,9 +171,9 @@ export function Landing() {
         </div>
       </section>
 
-      <footer className="wrap" style={{ padding: "var(--sp-6) 0", textAlign: "center", color: "var(--text-mut)", fontSize: "var(--fs-xs)" }}>
-        <Wordmark size={14} /> — self-hosted, open signup.
-      </footer>
+      <div style={{ paddingTop: "var(--sp-5)" }}>
+        <SiteFooter />
+      </div>
     </div>
   );
 }
