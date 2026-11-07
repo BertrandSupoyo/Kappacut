@@ -16,8 +16,12 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONPATH=/srv
 
+# The fonts are what captions in any language are drawn with: without them, libass draws
+# Chinese, Japanese, Korean, Thai, Hindi and the rest as empty boxes, with no error anywhere.
+# DejaVu is named because captions use it first, for the look they've always had, and it
+# stops being installed by itself once other fonts are.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg curl \
+ && apt-get install -y --no-install-recommends ffmpeg curl fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

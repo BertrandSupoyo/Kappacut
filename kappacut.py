@@ -420,11 +420,12 @@ def _aspect_ratio(s: str) -> float:
 # Presets live in frontend/src/editor/colorPresets.json (copied next to this file as
 # color_presets.json in the image). Both sides turn preset + sliders into the same 3x4
 # affine matrix on gamma-encoded RGB: the editor applies it as an SVG feColorMatrix, the
-# render as an ffmpeg lut3d. The old version defined the presets twice - CSS filters vs
-# colortemperature/curves/eq - and every preset rendered differently from its preview.
+# render with ffmpeg's colorchannelmixer. The old version defined the presets twice - CSS
+# filters vs colortemperature/curves/eq - and every preset rendered differently from its preview.
 
 _LUMA = (0.2126, 0.7152, 0.0722)          # the weights SVG/CSS saturate() uses
 _IDENTITY = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0))
+MIXER_MAX_GAIN = 2.0                      # ffmpeg refuses a colorchannelmixer value past this
 
 
 @functools.lru_cache(maxsize=1)
@@ -480,9 +481,9 @@ def color_matrix(color: dict | None) -> tuple:
 
 
 def _write_cube(m: tuple, path: Path, n: int = 17) -> Path:
-    """The matrix as an n^3 .cube LUT for ffmpeg's lut3d. An affine map is reproduced
-    exactly by trilinear interpolation, and the result is clamped once at the end - as the
-    SVG filter does - rather than between chained filters (which clipped highlights)."""
+    """The matrix as an n^3 .cube LUT for ffmpeg's lut3d, for sliders the mixer can't take.
+    Trilinear interpolation reproduces an affine map, except in the cells a clamp runs
+    through, where it lands up to about 7 levels off."""
     rows = [f"LUT_3D_SIZE {n}"]
     for bi in range(n):                                   # .cube order: red varies fastest
         for gi in range(n):
@@ -497,10 +498,18 @@ def _write_cube(m: tuple, path: Path, n: int = 17) -> Path:
 
 def _color_chain(color: dict | None, cube: Path | None = None) -> str:
     """ffmpeg filter fragment for a colour look; '' when nothing is set. Needs a `cube`
-    path to write the LUT to whenever there is something to apply."""
+    path, for the LUT that strong sliders fall back on, whenever there is something to apply.
+
+    colorchannelmixer does the matrix's own sums in integers, and measured 15-45% off the
+    whole render against lut3d's float lookups. Its alpha column carries the offset, since
+    rgba comes out of yuv opaque (1.0). The result is clamped once, at the end, as the SVG
+    filter does, rather than between chained filters (which clipped highlights)."""
     m = color_matrix(color)
     if m == _IDENTITY or cube is None:
         return ""
+    if max(abs(v) for row in m for v in row) <= MIXER_MAX_GAIN:
+        gains = ":".join(f"{out}{src}={v:.5f}" for out, row in zip("rgb", m) for src, v in zip("rgba", row))
+        return f"format=rgba,colorchannelmixer={gains}"
     _write_cube(m, cube)
     path = cube.resolve().as_posix().replace(":", "\\:")   # a Windows drive colon splits filter args
     return f"lut3d=file='{path}':interp=trilinear"
@@ -523,11 +532,16 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
         crop = {"px": float(crop)}
     crop = crop or {}
     mode = crop.get("mode", "crop") if vertical else None
-    sub_chain = f",subtitles={subs.name}" if subs is not None else ""
+    # "ass", because only it can turn on full shaping. With the "subtitles" filter's simple shaper,
+    # Arabic came out as empty boxes, and Bengali, Tamil and Khmer with their vowels in the wrong place.
+    burn = f"ass={subs.name}:shaping=complex" if subs is not None else ""
+    sub_chain = f",{burn}" if burn else ""
     cwd = str(subs.parent) if subs is not None else None
     out_arg = str(out.resolve()) if subs is not None else str(out)
     col = _color_chain(color, out.with_suffix(".cube"))
-    col_vf = f",{col}" if col else ""                 # colour grade goes before subtitles, never on the text
+    # Colour grade goes before subtitles, never on the text. Straight back to yuv420p after
+    # it, so captions and the encoder don't pay for carrying the rest of the chain in RGB.
+    col_vf = f",{col},format=yuv420p" if col else ""
 
     fc = None                                     # -filter_complex string (fill mode only)
     ow, oh = vertical_size(src_height or 0) if vertical else (0, 0)
@@ -535,7 +549,7 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
         vf = pre + r"scale=-2:min(1080\,ih)" + col_vf + sub_chain   # only downscale, never upscale
     elif mode in ("fill", "cropfill"):            # blurred copy fills the bars; foreground = whole frame or a crop
         blur = max(2.0, min(80.0, float(crop.get("blur", 24))))
-        sub_fc = f";[v]subtitles={subs.name}[vout]" if subs is not None else ""
+        sub_fc = f";[v]{burn}[vout]" if burn else ""
         map_v = "[vout]" if subs is not None else "[v]"
         # The fill is blurred at 1/4 size (sigma/4) and scaled back up: it looks the same
         # once blurred, and full-res gblur was ~60% of a fill clip's render time. `blur` is
@@ -546,7 +560,7 @@ def cut_clip(video: Path, start: float, end: float, out: Path, vertical: bool,
               # x0.94 like the preview's brightness(.94); eq's brightness would *subtract*
               f"gblur=sigma={sigma:.2f},colorchannelmixer=rr=0.94:gg=0.94:bb=0.94,"
               f"eq=saturation=1.12,scale={ow}:{oh}:flags=bilinear[bg]")
-        col_fg = f",{col}" if col else ""             # grade the framed subject, leave the blurred bars alone
+        col_fg = col_vf                               # grade the framed subject, leave the blurred bars alone
         if mode == "cropfill":                    # subject you framed, blurred fill behind it
             z = max(1.0, min(4.0, float(crop.get("zoom", 1.0))))
             px = max(0.0, min(1.0, float(crop.get("px", 0.5))))
@@ -629,6 +643,37 @@ def grab_frame(video: Path, at: float, out: Path) -> None:
          "-vf", "scale=640:-2", str(out)])
 
 
+# ------------------------------------------------------------------ text in any language
+# Chinese, Japanese, Thai, Lao, Burmese and Khmer put no spaces between words, so text.split()
+# called a whole line one word: every line over 5 s was cut short as a held "ahhh", and pacing
+# scored as if nobody spoke. Korean and the rest use spaces and need nothing special.
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"     # kana and Han
+_SEA = "\u0e00-\u0e7f\u0e80-\u0eff\u1000-\u109f\u1780-\u17ff"     # Thai, Lao, Burmese, Khmer
+_CJK_RE = re.compile(f"[{_CJK}]")
+_SEA_RE = re.compile(f"[{_SEA}]")
+NO_SPACE_RE = re.compile(f"[{_CJK}{_SEA}]")
+
+
+def word_count(text: str | None) -> int:
+    """About how many words `text` holds, in any script. For text written with spaces this is
+    exactly len(text.split()). Without them, it's characters at a typical length per word."""
+    text = text or ""
+    spaced = sum(1 for w in text.split() if not NO_SPACE_RE.search(w))
+    return spaced + (len(_CJK_RE.findall(text)) + 1) // 2 + (len(_SEA_RE.findall(text)) + 4) // 5
+
+
+def _tokens(text: str) -> list[str]:
+    """Lower-case words without punctuation. In a script without spaces, each character."""
+    out: list[str] = []
+    for w in text.split():
+        t = re.sub(r"[^\w']", "", w.lower())
+        if NO_SPACE_RE.search(t):
+            out.extend(t)
+        elif t:
+            out.append(t)
+    return out
+
+
 # ------------------------------------------------------------------ transcription (Groq Whisper)
 
 _ONOMATOPOEIA = {"ah", "ahh", "ahhh", "aaa", "aaah", "argh", "agh", "ugh", "grr", "rah",
@@ -645,7 +690,7 @@ def _segment_action(s: dict, cfg: dict) -> str | None:
     """Rule-based triage for a Whisper segment. Returns "drop", "compress", or None.
     Uses only fields Whisper already returns - no ML."""
     text = (s.get("text") or "").strip()
-    toks = [t for t in (re.sub(r"[^\w']", "", w.lower()) for w in text.split()) if t]
+    toks = _tokens(text)
     dur = float(s.get("end", 0)) - float(s.get("start", 0))
     if not toks:
         return "drop:empty"
@@ -669,6 +714,9 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
 
     client = groq.Groq()
     want_words = bool(cfg.get("word_timestamps"))
+    # One language for the whole video, so an intro or a song can't send a chunk off into another
+    language = cfg["language"] = detect_language(mp3, cfg)      # the picker and judge are told too
+    print(f"    language: {language or 'not sure, each part decides for itself'}", flush=True)
     segments: list[dict] = []
     all_words: list[dict] = []
     dropped: dict[str, int] = {}
@@ -678,7 +726,9 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
         if len(chunks) > 1:
             print(f"    transcribing chunk {n}/{len(chunks)} ...", flush=True)
         kwargs = dict(file=(part.name, part.read_bytes()), model=GROQ_WHISPER,
-                      response_format="verbose_json", language="en")
+                      response_format="verbose_json")
+        if language:
+            kwargs["language"] = language
         if want_words:
             kwargs["timestamp_granularities"] = ["segment", "word"]
         limited = hiccups = 0
@@ -692,6 +742,9 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
                     hiccups += 1
                     print(f"    whisper connection problem ({type(e).__name__}) - retrying in {wait}s ...", flush=True)
                     time.sleep(wait)
+                    continue
+                if getattr(e, "status_code", None) == 400 and kwargs.pop("language", None):
+                    language = None                  # one it doesn't take: let Whisper listen for itself
                     continue
                 if getattr(e, "status_code", None) not in (429, 413) or limited == 3:
                     raise
@@ -740,33 +793,68 @@ def transcribe(mp3: Path, workdir: Path, cfg: dict) -> list[dict]:
 
 
 # ---- which language is this video in? ------------------------------------------
-# Kappacut is English-only: transcribe() forces language="en", and the filler, reaction and
-# call-to-action rules are English word lists. Forced English on other speech gives a garbled
-# transcript and poor clips, so before spending the user's minutes Whisper hears three short
-# samples with no language forced. Three, spread out, because one could land on an intro or a
-# foreign-language clip inside an English video.
+# Whisper hears three short samples with no language set, and the whole video is then
+# transcribed in the one most of them agree on. Three, spread out, because one could land on an
+# intro or a clip in another language. An English video gets "en" and stays exactly as it was.
 LANGUAGE_SAMPLES = (0.2, 0.5, 0.8)        # how far through the video each sample starts
 LANGUAGE_SAMPLE_SECONDS = 20              # Groq bills at least 10 s per request; 60 s costs ~$0.0007
 
+# what Whisper's verbose_json calls a language, and the code its `language` setting takes
+WHISPER_LANGUAGES = {
+    "afrikaans": "af", "albanian": "sq", "amharic": "am", "arabic": "ar", "armenian": "hy", "assamese": "as",
+    "azerbaijani": "az", "bashkir": "ba", "basque": "eu", "belarusian": "be", "bengali": "bn", "bosnian": "bs",
+    "breton": "br", "bulgarian": "bg", "burmese": "my", "cantonese": "yue", "castilian": "es", "catalan": "ca",
+    "chinese": "zh", "croatian": "hr", "czech": "cs", "danish": "da", "dutch": "nl", "english": "en",
+    "estonian": "et", "faroese": "fo", "finnish": "fi", "flemish": "nl", "french": "fr", "galician": "gl",
+    "georgian": "ka", "german": "de", "greek": "el", "gujarati": "gu", "haitian": "ht", "haitian creole": "ht",
+    "hausa": "ha", "hawaiian": "haw", "hebrew": "he", "hindi": "hi", "hungarian": "hu", "icelandic": "is",
+    "indonesian": "id", "italian": "it", "japanese": "ja", "javanese": "jw", "kannada": "kn", "kazakh": "kk",
+    "khmer": "km", "korean": "ko", "lao": "lo", "latin": "la", "latvian": "lv", "lingala": "ln",
+    "lithuanian": "lt", "luxembourgish": "lb", "macedonian": "mk", "malagasy": "mg", "malay": "ms",
+    "malayalam": "ml", "maltese": "mt", "mandarin": "zh", "maori": "mi", "marathi": "mr", "moldavian": "ro",
+    "moldovan": "ro", "mongolian": "mn", "myanmar": "my", "nepali": "ne", "norwegian": "no", "nynorsk": "nn",
+    "occitan": "oc", "panjabi": "pa", "pashto": "ps", "persian": "fa", "polish": "pl", "portuguese": "pt",
+    "punjabi": "pa", "pushto": "ps", "romanian": "ro", "russian": "ru", "sanskrit": "sa", "serbian": "sr",
+    "shona": "sn", "sindhi": "sd", "sinhala": "si", "sinhalese": "si", "slovak": "sk", "slovenian": "sl",
+    "somali": "so", "spanish": "es", "sundanese": "su", "swahili": "sw", "swedish": "sv", "tagalog": "tl",
+    "tajik": "tg", "tamil": "ta", "tatar": "tt", "telugu": "te", "thai": "th", "tibetan": "bo", "turkish": "tr",
+    "turkmen": "tk", "ukrainian": "uk", "urdu": "ur", "uzbek": "uz", "valencian": "ca", "vietnamese": "vi",
+    "welsh": "cy", "yiddish": "yi", "yoruba": "yo",
+}
 
-def foreign_language(heard: list[str], samples: int) -> str | None:
-    """The non-English language most samples agree on, else None. `heard` is what Whisper said
-    for each sample that held speech. A wrong answer here stops an English speaker's video, so
-    uncertainty counts as English: a tie, or too few samples with speech (music, silence)."""
+
+# the same list, code to name, for telling the models what the video is in
+_LANGUAGE_ALIASES = {"castilian", "flemish", "haitian creole", "mandarin", "moldavian", "moldovan", "myanmar",
+                     "panjabi", "pushto", "sinhalese", "valencian"}
+LANGUAGE_NAMES = {code: name.capitalize() for name, code in WHISPER_LANGUAGES.items() if name not in _LANGUAGE_ALIASES}
+
+
+def language_code(heard: str) -> str | None:
+    """Whisper's name for a language, as the code its `language` setting takes. Some replies are
+    already a code. Anything else is None, and Whisper listens for itself."""
+    name = (heard or "").strip().lower()
+    if name in WHISPER_LANGUAGES:
+        return WHISPER_LANGUAGES[name]
+    return name if name in WHISPER_LANGUAGES.values() else None
+
+
+def dominant_language(heard: list[str], samples: int) -> str | None:
+    """The code of the language most samples agree on, else None. `heard` is what Whisper said for
+    each sample that held speech. Not sure (a tie, or too few samples with speech, as with music
+    or silence) leaves Whisper to decide part by part, rather than forcing a wrong language."""
     if len(heard) < min(2, samples):
         return None
-    names = [h.strip().capitalize() for h in heard if h and h.strip()]
-    foreign = [n for n in names if n not in ("English", "En")]
-    if len(foreign) * 2 <= len(names):
+    codes = [language_code(h) for h in heard]
+    known = sorted({c for c in codes if c})
+    if not known:
         return None
-    top = max(sorted(set(foreign)), key=foreign.count)
-    return top if len(top) > 2 else None    # a bare code ("Id") reads badly in a message: only names
+    top = max(known, key=codes.count)
+    return top if codes.count(top) * 2 > len(codes) else None
 
 
-def detect_foreign_language(src: Path | str, cfg: dict) -> str | None:
-    """See foreign_language. `src` may be a signed URL: with -ss before -i ffmpeg fetches only
-    the sampled part, so this runs before a 2 GB download. A sample that fails is skipped, which
-    leaves the answer as "not sure": this check must never be why an analysis fails."""
+def detect_language(src: Path | str, cfg: dict) -> str | None:
+    """See dominant_language. A sample that fails is skipped, which leaves the answer as "not
+    sure": this check must never be why an analysis fails."""
     import groq
 
     client = groq.Groq()
@@ -795,7 +883,7 @@ def detect_foreign_language(src: Path | str, cfg: dict) -> str | None:
                       if not (_segment_action(s, cfg) or "").startswith("drop")]
             if speech and data.get("language"):
                 heard.append(str(data["language"]))
-    return foreign_language(heard, len(starts))
+    return dominant_language(heard, len(starts))
 
 
 def as_timeline(segments: list[dict]) -> str:
@@ -883,7 +971,10 @@ PICKER_BRIEF = (
     "around the coherent dialogue only.\n"
     "- Keep clips tight around the moment; do not pad with unrelated talk before or after.\n"
     "- `score` (1-10) should reward: instant hook, a spike in energy near the payoff, a line "
-    "worth quoting, and zero setup needed. A calm-but-clear moment tops out around 6."
+    "worth quoting, and zero setup needed. A calm-but-clear moment tops out around 6.\n"
+    "- The transcript can be in any language. Judge it as a native speaker would, and treat filler "
+    "and greetings in that language the same way. Write title, hook and why in the transcript's "
+    "language. Copy quote and any lines exactly as they're written there, never translated."
 )
 
 
@@ -986,7 +1077,7 @@ def _speech_span(c: Clip, segments: list[dict]):
     if not hits:
         return None
     return (min(s["start"] for s in hits), max(s["end"] for s in hits),
-            sum(len(s["text"].split()) for s in hits))
+            sum(word_count(s["text"]) for s in hits))
 
 
 def _quiet(a: float, b: float, loud: list[float] | None) -> bool:
@@ -1016,10 +1107,10 @@ def _trim_to_dense_block(c: Clip, segments: list[dict], cfg: dict,
         else:
             cur.append(s)
     blocks.append(cur)
-    real = [b for b in blocks if sum(len(x["text"].split()) for x in b) >= 3]
+    real = [b for b in blocks if sum(word_count(x["text"]) for x in b) >= 3]
     if len(real) < 2:                    # tiny trailing fragments are not "another moment"
         return
-    best = max(real, key=lambda b: sum(len(x["text"].split()) for x in b))
+    best = max(real, key=lambda b: sum(word_count(x["text"]) for x in b))
     c.start_seconds = max(c.start_seconds, best[0]["start"] - cfg["lead_seconds"] - 0.5)
     c.end_seconds = min(c.end_seconds, best[-1]["end"] + cfg["tail_seconds"] + 0.5)
 
@@ -1107,7 +1198,7 @@ def _nonoverlap(clips: list[Clip], k: int) -> list[Clip]:
 def _match_line(line: str, segments: list[dict], lo: float, hi: float) -> dict | None:
     """The first segment starting in [lo, hi] whose text is (or contains) `line`."""
     want = _norm_line(line)
-    if len(want) <= 8:
+    if _too_short_to_match(want):
         return None
     for s in segments:
         if lo <= s["start"] <= hi:
@@ -1168,7 +1259,7 @@ def _trim_cta(c: Clip, segments: list[dict], cfg: dict) -> None:
         c.start_seconds = max(c.start_seconds, hits[i]["start"] - cfg["lead_seconds"])
     if j < len(hits):
         c.end_seconds = min(c.end_seconds, hits[j - 1]["end"] + cfg["tail_seconds"])
-    words = [(len(s["text"].split()), _is_cta(s["text"])) for s in hits[i:j]]
+    words = [(word_count(s["text"]), _is_cta(s["text"])) for s in hits[i:j]]
     total = sum(n for n, _ in words) or 1
     if sum(n for n, cta in words if cta) / total > 0.3:
         c.score = max(1.0, c.score - 2.0)
@@ -1221,7 +1312,7 @@ def _react_weight(segments: list[dict], k: int) -> float:
     """How much segment k looks like a reaction: an exclamation counts fully, a short line
     standing alone between pauses counts half ("How bad is it?")."""
     s = segments[k]
-    words = len(s["text"].split())
+    words = word_count(s["text"])
     if _STRETCHED_RE.search(s["text"]) or (words <= 10 and _REACT_RE.search(s["text"])):
         return 1.0
     if words <= 5:
@@ -1256,7 +1347,7 @@ def _reaction_candidates(segments: list[dict], loud: list[float] | None, cfg: di
             if w[k]:
                 events += w[k]
                 last = k
-            elif k == last + 1 and len(segments[k]["text"].split()) <= 12:
+            elif k == last + 1 and word_count(segments[k]["text"]) <= 12:
                 last = k                         # the verdict right after the last reaction
             k += 1
         end = segments[last]["end"]
@@ -1677,7 +1768,7 @@ def score_breakdown(c: "Clip", segments: list[dict], loud: list[float] | None,
     if conf:
         lp = sum(v * d for v, d in conf) / max(sum(d for _, d in conf), 0.1)
         clarity = max(0.0, min(1.0, (lp + 1.0) / 0.8))        # -1.0 mumbled … -0.2 crisp
-    wps = sum(len(s["text"].split()) for s in hits) / length
+    wps = sum(word_count(s["text"]) for s in hits) / length
     rate = 1.0 if 2.0 <= wps <= 3.6 else max(0.0, min(1.0, wps / 2.0)) if wps < 2.0 else max(0.5, 1 - (wps - 3.6) / 3)
     if c._source == "reaction":
         rate = max(rate, 0.75)              # words per second doesn't measure a reaction beat
@@ -1688,7 +1779,7 @@ def score_breakdown(c: "Clip", segments: list[dict], loud: list[float] | None,
     a, b = c.start_seconds, c.start_seconds + OPEN_SECONDS
     first = min((max(s["start"], a) for s in hits), default=c.end_seconds)
     prompt = 1.0 if first - a <= 0.8 else max(0.0, 1 - (first - a - 0.8) / 2.2)    # 3 s of nothing -> 0
-    open_words = sum(len(s["text"].split()) * (min(s["end"], b) - max(s["start"], a)) / max(s["end"] - s["start"], 0.1)
+    open_words = sum(word_count(s["text"]) * (min(s["end"], b) - max(s["start"], a)) / max(s["end"] - s["start"], 0.1)
                      for s in hits if s["start"] < b and s["end"] > a)
     density = max(0.0, min(1.0, open_words / OPEN_SECONDS / 2.0))
     if c._source == "reaction":
@@ -1807,6 +1898,11 @@ def _steer_line(cfg: dict) -> str:
     """Combined video-category + editor-taste steering text injected into both the Stage 1
     picker prompts and the Stage 2 verify prompt. Either half is optional."""
     parts = []
+    name = LANGUAGE_NAMES.get(cfg.get("language") or "")
+    if name and name != "English":
+        # the general rule in the brief isn't enough: asked in the abstract, titles for an
+        # Indonesian video came back in English
+        parts.append(f"This video is in {name}. Write every title, hook and why in {name}, not in English.")
     if cfg.get("category") and cfg["category"] != "general":
         parts.append(f"Video category: {cfg['category']}.")
     prof = cfg.get("profile") or {}
@@ -1840,8 +1936,29 @@ _STOP = set("the and that this with have just like what about there they them th
             "been when here because think".split())
 
 
+def _letter_runs(text: str) -> list[str]:
+    """Runs of letters and their marks, in any script. Apostrophes stay, as in "don't"."""
+    runs, cur = [], []
+    for ch in text:
+        if ch == "'" or unicodedata.category(ch)[0] in "LM":
+            cur.append(ch)
+        elif cur:
+            runs.append("".join(cur))
+            cur = []
+    if cur:
+        runs.append("".join(cur))
+    return runs
+
+
 def _content_words(segs: list[dict]) -> set[str]:
-    return {w for s in segs for w in re.findall(r"[a-z']{4,}", s["text"].lower()) if w not in _STOP}
+    words: set[str] = set()
+    for s in segs:
+        for w in _letter_runs(s["text"].lower()):
+            if NO_SPACE_RE.search(w):                   # no word boundaries: pairs of characters
+                words.update(w[i:i + 2] for i in range(len(w) - 1))
+            elif len(w) >= 4 and w not in _STOP:
+                words.add(w)
+    return words
 
 
 def _cut_score(segments: list[dict], k: int) -> float:
@@ -2154,21 +2271,28 @@ def find_clips(segments: list[dict], cfg: dict, loud: list[float] | None = None)
 
 
 def _norm_line(t: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", (t or "").lower()).strip()
+    # letters and digits of any script: a-z only left a line of Japanese empty, so every hook
+    # "matched" every payoff, and the payoff was thrown away as a repeat of the hook
+    return re.sub(r"[^\w ]|_", "", (t or "").lower()).strip()
+
+
+def _too_short_to_match(norm: str) -> bool:
+    """A few words can sit inside many lines. In a script without spaces, a few characters are that."""
+    return len(norm) <= (3 if NO_SPACE_RE.search(norm) else 8)
 
 
 def _snap_to_lines(c: Clip, segments: list[dict]) -> None:
     """Pull an edge to the exact segment carrying the model's hook_line / payoff_line.
     Purely additive - silently does nothing when there's no match."""
     h = _norm_line(c.hook_line)
-    if len(h) > 8:
+    if not _too_short_to_match(h):
         for s in segments:
             st = _norm_line(s["text"])
             if st and (h in st or st in h) and abs(s["start"] - c.start_seconds) < 10:
                 c.start_seconds = s["start"]
                 break
     p = _norm_line(c.payoff_line)
-    if len(p) > 8:
+    if not _too_short_to_match(p):
         for s in reversed(segments):
             st = _norm_line(s["text"])
             if st and (p in st or st in p) and abs(s["end"] - c.end_seconds) < 10:
@@ -2233,13 +2357,14 @@ _VERIFY_BRIEF = (
     "3) TIGHTEN it - start_seconds = the first line that grabs: drop leading filler, greetings and "
     "slow build-up; pull in a [ctx] line only when the clip is unclear without it. end_seconds = "
     "just after the payoff / final reaction. Use the exact Ns timestamps shown. Copy hook_line and "
-    "payoff_line verbatim. Label beat_type: reaction | fail | bit | story | quote | hot_take | "
+    "payoff_line verbatim, in the transcript's language, never translated. Label beat_type: reaction | fail | bit | story | quote | hot_take | "
     "argument | reveal | wholesome | moment. Label hook_type - what the first line does: claim | "
     "question | conflict | reveal | reaction | confession | story | none.\n"
     "Some clips are REACTION beats (eating, playing, watching): few words, long pauses, short "
     "lines like \"Oh!\" or \"Dang.\" There the reaction itself is the payoff - score arc and trend on "
     "the build-up and the reaction, not on how much is said. A call to action (subscribe, like, "
-    "thanks for watching, a sponsor) is never the hook or the payoff.\n"
+    "thanks for watching, a sponsor), in any language, is never the hook or the payoff. The "
+    "transcript can be in any language: judge it as a native speaker would.\n"
     "Set keep=false ONLY when the clip is genuinely broken - garbled speech-to-text word-salad, OR "
     "it ends before any payoff, OR it staples two unrelated moments together - and give a one-line "
     "`reason`. If you cannot name a concrete flaw, keep=true. Most clips are keep=true.\n\n"

@@ -51,8 +51,16 @@ _COMMON = frozenset("a an and are at be but by did do for from he her him his i 
                     "so that the their them they this to us was we were what when where who with you your".split())
 
 
+_CJK_RUN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+
+
 def _keywords(text: str) -> list[str]:
-    return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w not in _COMMON]
+    """The words of `text`, in any script. Chinese and Japanese have no spaces to find them by, so
+    pairs of characters stand in for words."""
+    text = text.lower()
+    pairs = [run[i:i + 2] for run in _CJK_RUN.findall(text) for i in range(max(len(run) - 1, 1))]
+    words = re.findall(r"(?:[\w']|[\u0300-\u036f\u0591-\u05c7\u0610-\u061a\u064b-\u065f\u0900-\u0dff\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff])+", _CJK_RUN.sub(" ", text))
+    return [w for w in words if w not in _COMMON] + pairs
 
 
 def _same_word(a: str, b: str) -> bool:

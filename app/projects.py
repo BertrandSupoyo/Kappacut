@@ -11,7 +11,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import func, select, text
@@ -344,8 +344,6 @@ async def get_project(
             "status": job.status, "pct": job.progress_pct,
             "msg": job.progress_msg, "error": job.error,
             "requested": (job.result or {}).get("requested"),
-            # set when the job stopped because this isn't English: the editor offers "Analyze anyway"
-            "language": (job.result or {}).get("language"),
         },
         "analysis": None if analysis is None else {
             "segments": analysis.segments, "clips": analysis.clips,
@@ -449,7 +447,6 @@ async def analyze_events(
 @router.post("/{project_id}/analyze")
 async def retry_analyze(
     project_id: uuid.UUID,
-    body: dict | None = Body(default=None),
     user: User = Depends(current_verified_user),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
@@ -459,9 +456,6 @@ async def retry_analyze(
     Same gates as the upload path; no usage is recorded here — transcription minutes are
     only charged when an analysis succeeds. A successful re-run replaces the clips and
     clears the saved edits (they're keyed by clip index); a failed one leaves both alone.
-
-    {"any_language": true} is "Analyze anyway": the language check can be wrong, and the user
-    hearing the video gets the last word.
     """
     p = await _owned(project_id, user, session)
     if p.status not in ("failed", "ready"):
@@ -474,8 +468,6 @@ async def retry_analyze(
     p.status = "queued"
     p.error = None
     payload = analyze_payload(p)
-    if (body or {}).get("any_language") is True:
-        payload = {**(payload or {}), "any_language": True}
     job = Job(user_id=user.id, project_id=p.id, kind="analyze", status="queued", payload=payload)
     session.add(job)
     await session.commit()

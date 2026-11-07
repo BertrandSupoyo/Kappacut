@@ -28,8 +28,6 @@ export interface JobState {
   error: string | null;
   /** the "How many clips" choice, when one was made (a maximum, not a quota) */
   requested?: number | null;
-  /** set when the job stopped because the video isn't in English: its language */
-  language?: string | null;
 }
 
 export interface Clip {

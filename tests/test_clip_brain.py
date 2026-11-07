@@ -484,7 +484,7 @@ def test_presets_come_from_the_shared_file():
 
 
 def test_render_applies_exactly_the_preview_matrix():
-    """Push a known colour through the real lut3d and compare with the matrix maths the
+    """Push a known colour through the real filter and compare with the matrix maths the
     editor's SVG filter uses. Skips without ffmpeg."""
     if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
         print("    (skipped: ffmpeg not installed)")
@@ -506,6 +506,31 @@ def test_render_applies_exactly_the_preview_matrix():
     with tempfile.TemporaryDirectory() as d:
         got = first_pixel(cf._color_chain(look, Path(d) / "g.cube"))
     assert all(abs(g - w) <= 1.5 for g, w in zip(got, want)), (got, [round(w, 1) for w in want])
+
+
+def test_every_preset_takes_the_fast_filter():
+    with tempfile.TemporaryDirectory() as d:
+        for preset in set(cf._color_presets()) - {"none"}:
+            cube = Path(d) / f"{preset}.cube"
+            chain = cf._color_chain({"preset": preset, "b": 0, "c": 1, "s": 1}, cube)
+            assert "colorchannelmixer" in chain and not cube.exists(), preset
+
+
+def test_strong_sliders_still_render():
+    """ffmpeg refuses a colorchannelmixer value above 2, and the sliders can ask for more.
+    Those looks must fall back on the LUT, not fail the render. Skips without ffmpeg."""
+    look = {"preset": "punchy", "b": 0.4, "c": 1.8, "s": 2.0}
+    assert max(abs(v) for row in cf.color_matrix(look) for v in row) > cf.MIXER_MAX_GAIN
+    with tempfile.TemporaryDirectory() as d:
+        cube = Path(d) / "strong.cube"
+        chain = cf._color_chain(look, cube)
+        assert "lut3d" in chain and cube.exists()
+        if not shutil.which(cf.FFMPEG) and not Path(cf.FFMPEG).exists():
+            print("    (skipped: ffmpeg not installed)")
+            return
+        p = subprocess.run([cf.FFMPEG, "-v", "error", "-f", "lavfi", "-i", "color=c=0x668C4D:s=16x16:d=0.1", "-vf", chain,
+                            "-frames:v", "1", "-f", "null", "-"], capture_output=True)
+        assert p.returncode == 0, p.stderr[-300:]
 
 
 def test_captions_wrap_inside_the_frame():

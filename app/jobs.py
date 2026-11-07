@@ -463,23 +463,6 @@ async def _no_audio(src_key: str) -> bool:
         return False
 
 
-def not_english_msg(language: str) -> str:
-    return (f"This video sounds like it's in {language}. Kappacut only works with English for now, "
-            "so the clips and captions would be poor. None of your minutes were used.")
-
-
-async def _other_language(job_id: uuid.UUID, src_key: str) -> str | None:
-    """The language this video is in, if it's clearly not English. Fails open, like the two
-    checks above: a Groq or storage hiccup here leaves the decision to the analysis itself."""
-    await _set_job(job_id, progress_pct=1, progress_msg="Checking the language")
-    try:
-        return await _in_thread(f"language:{job_id}", cf.detect_foreign_language,
-                                storage.presign_internal(src_key, ttl=600), pipeline.get_cfg())
-    except Exception:  # noqa: BLE001
-        log.warning("couldn't check the language of %s", src_key, exc_info=True)
-        return None
-
-
 async def run_analyze(job_id: uuid.UUID) -> None:
     started = time.monotonic()
     scope = f"analyze:{job_id}"
@@ -505,12 +488,9 @@ async def run_analyze(job_id: uuid.UUID) -> None:
     try:
         attempt = await _begin_attempt(job_id)
         src_key = await asyncio.to_thread(storage.find_source, user_id, project_id)
-        refusal = language = None
+        refusal = None
         if src_key:
             refusal = NO_AUDIO_MSG if await _no_audio(src_key) else await _minutes_short(user_id, src_key)
-        # the first attempt has already answered this for any retry; "Analyze anyway" skips it
-        if src_key and not refusal and attempt == 1 and not job_payload.get("any_language"):
-            language = await _other_language(job_id, src_key)
     except Exception as e:  # noqa: BLE001
         # outside the main try below: without this a storage or DB blip here left the row
         # 'running' under a live worker, which the sweep never reclaims
@@ -522,11 +502,6 @@ async def run_analyze(job_id: uuid.UUID) -> None:
         return
     if refusal:
         await _fail(job_id, refusal, project_id)
-        return
-    if language:
-        # the editor offers "Analyze anyway" when it sees this on the job
-        await _set_job(job_id, result={"language": language})
-        await _fail(job_id, not_english_msg(language), project_id)
         return
     # ended during those checks: don't fetch a 2 GB video for nothing
     if not await _set_job(job_id, progress_pct=2, progress_msg="Fetching your video"):
@@ -736,7 +711,7 @@ async def release_clip(redis, job_id: uuid.UUID | str, idx: int, owner: str) -> 
 
 # Bump whenever cut_clip / render_one produce different bytes from the same inputs, so
 # clips stored by the old code are cut again rather than reused.
-RENDER_FP_VERSION = 1
+RENDER_FP_VERSION = 2
 
 
 def render_cfg() -> dict:

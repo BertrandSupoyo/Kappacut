@@ -26,7 +26,7 @@ const FEATURES = [
 
 const FAQ = [
   ["Is it free?", "Yes. The free plan covers 60 minutes of transcription a month, 2 GB per file, and keeps your projects for about a month of inactivity."],
-  ["Which languages does it work with?", "English, for now. If a video sounds like it's in another language, Kappacut stops before using any of your minutes and asks whether you want to analyze it anyway. The clips and captions are likely to be poor if you do."],
+  ["Which languages does it work with?", "Most spoken languages, and it works out which one by itself. English has been tested the most, so check the captions and clips before you post in another language."],
   ["Where does my video go?", "It's stored privately in your account. The audio goes to Groq for transcription, and the transcript goes to the model that picks moments. The Privacy Policy lists everyone who handles your data."],
   ["How long does a video take?", "A few minutes for a typical stream VOD — most of it is transcription. You watch the progress live."],
   ["Can I bring my own clips to caption?", "Right now Kappacut starts from one uploaded source per project. Multi-source stitching isn't in yet."],
@@ -112,7 +112,7 @@ export function Landing() {
           <a className="btn ghost btn-lg" href="#how">How it works</a>
         </div>
         <p className="muted" style={{ fontSize: "var(--fs-xs)", marginTop: "var(--sp-4)" }}>
-          {cfg?.invite_only && "Private test, invite only · "}Free plan · 60 min/month · no card · English-language videos
+          {cfg?.invite_only && "Private test, invite only · "}Free plan · 60 min/month · no card · most languages
         </p>
         <HeroVisual />
       </section>

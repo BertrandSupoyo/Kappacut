@@ -80,10 +80,10 @@ export function Terms() {
             you haven't agreed to.
           </p>
 
-          <h2>4. English only, for now</h2>
+          <h2>4. Languages</h2>
           <p>
-            Kappacut is built for English-speaking videos. A video in another language may be stopped before analysis,
-            and if you choose to analyze it anyway, the clips and captions are likely to be poor.
+            Kappacut works with most spoken languages. How good the transcripts, clips and captions are varies by language,
+            and English has been tested the most, so check them before you post.
           </p>
 
           <h2>5. Your content</h2>

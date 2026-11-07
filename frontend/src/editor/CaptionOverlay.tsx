@@ -74,11 +74,11 @@ export function CaptionOverlay({
   return (
     <div className={`cap-layer cap-${position}${st.box ? " cap-box" : ""}`} style={vars} aria-hidden>
       {/* a new key restarts the entrance; karaoke keeps one key per group of words */}
-      <div key={cue.key} className={`cap-line cap-anim-${entrance}`}>
+      <div key={cue.key} className={`cap-line cap-anim-${entrance}`} dir="auto">
         <span className="cap-text">
           {cue.words.map((w, i) => (
             <span key={i}>
-              {i > 0 && " "}
+              {i > 0 && cue.spaced && " "}
               {i === cue.hot ? <b className="cap-hot">{w}</b> : w}
             </span>
           ))}

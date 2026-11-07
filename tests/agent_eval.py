@@ -312,7 +312,7 @@ def no_human_claim(v: V):
 # CLIPS. Found in a real run: the model passed "kept", and the card contradicted its own reply.
 LATE_BEST = [{**c, "virality": score} for c, score in zip(CLIPS, (38, 55, 81, 42, 74, 66))]
 ANALYZING = {"name": "Product demo", "status": "analyzing", "error": None}
-FAILED = {"name": "Lecture recording", "status": "failed", "error": "This video sounds like it's in Spanish, and Kappacut works with English-language videos for now."}
+FAILED = {"name": "Lecture recording", "status": "failed", "error": "We couldn't read the audio in this video, so it might be damaged."}
 NO_CLIPS = {"name": "Product demo", "status": "ready", "error": None}
 
 
@@ -329,7 +329,7 @@ PAGE_CASES = [
     Case("best isn't clip 1: a ranking", "Rank these for me.", [card_starts(3, 5, 6), no_changes], "order", mode="page", clips=LATE_BEST),
     Case("best is already skipped", "Which of the ones I kept should I post first?", [card_starts(5), not_on_card(3), no_changes], "order", mode="page", clips=LATE_BEST, edits={"2": {"keep": False}}),
     Case("still analyzing", "Which clips should I post?", [says("analyz", "processing", "finish", "done"), doesnt_say("pick a project", "pick one", "select a project"), not_offered("clips")], "waiting", mode="desk", project=ANALYZING),
-    Case("it failed", "Why can't I see any clips?", [says("spanish", "english"), says("try again", "retry", "re-analy", "analyze anyway", "another", "different"), not_offered("clips")], "waiting", mode="desk", project=FAILED),
+    Case("it failed", "Why can't I see any clips?", [says("audio", "damaged", "read"), says("try again", "retry", "re-analy", "another", "different"), not_offered("clips")], "waiting", mode="desk", project=FAILED),
     Case("nothing found", "Which clips should I post?", [says("no clips", "couldn't find", "didn't find", "found no", "any clips", "didn't turn up"), doesnt_say("still analyzing", "isn't ready", "pick a project")], "waiting", mode="desk", project=NO_CLIPS),
     # moved here from PAGE_HOLDOUT: their misses led to changes, so they no longer count as unseen
     Case("what failed", "did any of my videos fail?", [says("lecture")], "desk", mode="desk"),
@@ -393,6 +393,7 @@ PAGE_CASES = [
     Case("a clip feels boring", "clip 1 feels a bit boring to me", [short(60), no_changes, says("clip"), no_human_claim], "voice", mode="page"),
     Case("nervous", "my last video flopped and i'm nervous about posting this one", [short(60), no_changes, no_promise, says("clip", "start", "post"), no_human_claim], "voice", mode="page"),
     Case("will it go viral", "will this go viral?", [short(50), no_changes, no_promise, no_human_claim], "voice", mode="page"),
+    Case("another language", "does it work with spanish videos?", [says("yes", "does", "works", "can"), doesnt_say("only english", "only works with english", "english-only", "not supported", "analyze anyway"), short(50)], "languages", mode="desk"),
     Case("where to watch", "where can I watch this clip?", [says("preview"), no_changes, short(50)], "preview", mode="page"),
     Case("see a clip", "show me clip 3", [says("preview"), no_changes, short(50)], "preview", mode="page"),
 ]
@@ -531,6 +532,7 @@ PAGE_HOLDOUT = [
     Case("reels time limit", "whats the time limit on instagram reels", [short(50), says("check", "change", "current", "latest", "help")], "voice", mode="desk"),
     Case("bad at this", "i feel like im bad at this", [short(50), no_changes, no_human_claim, says("you")], "voice", mode="page"),
     # Written with the preview, before its line went into the prompt, and never used to change it.
+    Case("my video's language", "can i upload a video in japanese", [says("yes", "can", "works"), doesnt_say("only english", "only works with english", "english-only", "not supported", "analyze anyway")], "languages", mode="desk"),
     Case("how does it look", "can i see what clip 4 looks like before i render it", [says("preview"), no_changes, no_render_claim], "preview", mode="page"),
 ]
 

@@ -28,7 +28,7 @@ export interface ChatTurn {
   /** the request failed: an error message, not part of the conversation */
   failed?: boolean;
   /** analysis stopped: offer to run it again */
-  retry?: "language" | "failed";
+  retry?: boolean;
   /** clips have rendered: link to them */
   rendered?: boolean;
 }

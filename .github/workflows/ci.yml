@@ -59,6 +59,7 @@ jobs:
       - run: python tests/test_launch.py
       - run: python tests/test_admin.py
       - run: python tests/test_agent.py
+      - run: python tests/test_languages.py
 
   frontend:
     runs-on: ubuntu-latest

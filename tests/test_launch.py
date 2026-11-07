@@ -1,5 +1,5 @@
 """The launch rules that the database and browser don't check: who may sign up, what a person
-is told when a job fails, how a job gets stopped, and which language counts as "not English".
+is told when a job fails, and how a job gets stopped.
 
 Same convention as the other tests: plain functions, bare asserts, runs as
 `python tests/test_launch.py` or under pytest. No database, no bucket, no AI calls.
@@ -30,29 +30,6 @@ from app.launch import processors  # noqa: E402
 
 FFMPEG_ERROR = ("command failed: ffmpeg -y -i <url> ...\n"
                 "[mov,mp4 @ 0x55] moov atom not found\n/tmp/kappacut_render_x/source.mp4: Invalid data")
-
-
-# --- which language counts as "not English"
-
-def test_samples_agreeing_on_another_language_are_named():
-    assert cf.foreign_language(["Spanish", "Spanish", "Spanish"], 3) == "Spanish"
-    assert cf.foreign_language(["Spanish", "Spanish", "English"], 3) == "Spanish"
-    assert cf.foreign_language(["indonesian", "indonesian"], 3) == "Indonesian"     # any casing
-
-
-def test_a_short_video_can_be_judged_on_its_one_sample():
-    assert cf.foreign_language(["German"], 1) == "German"
-    assert cf.foreign_language([], 1) is None
-
-
-def test_english_and_uncertainty_never_stop_a_video():
-    assert cf.foreign_language(["English", "English", "English"], 3) is None
-    assert cf.foreign_language(["English", "english", "Spanish"], 3) is None        # a foreign clip inside
-    assert cf.foreign_language(["English", "Spanish"], 3) is None                   # a tie
-    assert cf.foreign_language(["Spanish"], 3) is None                              # one sample in three had speech
-    assert cf.foreign_language([], 3) is None                                       # music or silence
-    assert cf.foreign_language(["en", "en"], 3) is None                             # a code, not a name
-    assert cf.foreign_language(["id", "id", "id"], 3) is None                       # not worth a confusing message
 
 
 # --- a free user's minutes
@@ -126,11 +103,6 @@ def test_failures_a_retry_can_fix_say_so():
 
 def test_a_message_already_written_for_people_stays():
     assert jobs.explain(_quota_error(), "analyze") == "Groq's daily limit is used up. Try again in ~12 min."
-
-
-def test_the_language_message_says_what_happened_to_their_minutes():
-    msg = jobs.not_english_msg("Spanish")
-    assert "Spanish" in msg and "English" in msg and "minutes" in msg
 
 
 # --- stopping a job

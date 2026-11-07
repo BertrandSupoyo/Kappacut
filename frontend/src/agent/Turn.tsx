@@ -25,7 +25,7 @@ export function Turn({ turn, live, canUndo, onChoice, onRetry, projectId }: {
   live: boolean;
   canUndo: boolean;
   onChoice: (text: string) => void;
-  onRetry: (language: boolean) => void;
+  onRetry: () => void;
   projectId: string | null;
 }) {
   const applyOps = useEditor((s) => s.applyAgentOps);
@@ -102,10 +102,10 @@ export function Turn({ turn, live, canUndo, onChoice, onRetry, projectId }: {
             className="btn ghost small turn-undo"
             onClick={() => {
               update(turn.id, { answered: true });
-              onRetry(turn.retry === "language");
+              onRetry();
             }}
           >
-            {turn.retry === "language" ? "Analyze anyway" : "Try again"}
+            Try again
           </button>
         )}
 

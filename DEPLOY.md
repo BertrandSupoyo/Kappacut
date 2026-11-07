@@ -220,6 +220,9 @@ into a fresh DB before `alembic upgrade head` (usually a no-op) and `up -d`.
   | 4 cores (RS 1000, CCX23) | 3 | 1 |
   | 8 cores (RS 2000, CCX33) | 3 | 2 |
 
+  `RENDER_PARALLEL` (default 3) can't go above `WORKER_CONCURRENCY`: at the default of 2, a
+  render only ever cuts two clips at a time.
+
   This gives every job a fixed, equal slice regardless of load — job N+1 waits in the arq
   queue (roughly FIFO) rather than slowing down jobs already running. Uncomment the
   `deploy.resources.limits.cpus` guard on `worker` in `compose.yaml` as a hard backstop

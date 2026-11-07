@@ -55,7 +55,7 @@ export function clipVisualStyle(
   color: ClipEdit["color"] | undefined,
   gradeId?: string,
 ): ClipVisual {
-  // the same matrix the render bakes into its lut3d; "none" when the look is neutral
+  // the same matrix the render applies; "none" when the look is neutral
   const grade = gradeId && colorMatrix(color) ? `url(#${gradeId})` : "none";
   const vertical = look?.vertical ?? false;
   const mode = look?.mode ?? "crop";

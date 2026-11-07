@@ -3,8 +3,8 @@
 Find short-form clips in long videos — transcribe with Groq Whisper, pick the best
 moments with an LLM (Groq free tier by default, Claude optionally), then reframe,
 caption, color-grade and render them. Self-hosted, multi-user, with open or invite-only
-signup. English-language videos only for now: other languages are stopped before they use any
-minutes, and the user can choose to analyze them anyway.
+signup. Videos can be in most spoken languages, and the language is worked out automatically
+(see "Languages" below for what's been tested).
 
 Before putting it online, read [DEPLOY.md](DEPLOY.md), including "Before you let anyone in".
 
@@ -75,6 +75,44 @@ docker compose exec web python -m app.cli eval-labels     # against moments mark
 docker compose exec web python -m app.cli train-weights   # learn the score weights
 ```
 
+## Languages
+
+Nobody has to say what language a video is in. Whisper hears three 20-second samples (about $0.0007),
+the whole video is transcribed in the language most of them agree on, and the picker and judge are told
+its name, so titles come back in it. An English video gets `en`, as it always did.
+
+The app was built for English, and most of what broke elsewhere failed quietly:
+
+- **Counting words by spaces.** Chinese, Japanese and Thai have none, so a whole line was "one word". Every
+  line over 5 seconds was cut short as a held "ahhh", and pacing scored as if nobody spoke.
+- **Matching lines with `a-z`.** A line of Japanese normalised to nothing, so every hook "matched" every
+  payoff, and the payoff was thrown away as a repeat of the hook.
+- **Drawing captions.** The image had no fonts for most scripts, so those captions were empty boxes. Fonts
+  alone didn't fix it: ffmpeg's `subtitles` filter uses a simple shaper, so Arabic stayed as boxes, and
+  Bengali, Tamil and Khmer had vowels in the wrong place. Captions now use the `ass` filter with
+  `shaping=complex`.
+- **Wrapping captions.** libass only breaks lines at spaces, so a long line of Chinese ran off the frame.
+
+Tested by running the whole engine, from language detection to a rendered clip with burned captions:
+
+| Tested with | Languages | Result |
+|---|---|---|
+| Real people | Indonesian, Arabic, Hindi, Korean, Japanese, Thai | Right language, right script, clips titled in it |
+| A generated voice | Spanish, French, Russian, Chinese | The same |
+| A generated voice | Arabic, Hindi, Korean | **Heard as English, and came out as nonsense** |
+| Captions only, checked by eye | 28 languages | Drawn correctly |
+
+The third row is a voice too robotic for Whisper, since real speech in those languages worked, but it's the
+failure to expect from very unclear audio: forced into the wrong language, with no warning.
+
+Don't read too much into the rest. It's one short recording per language with no labelled moments, so it
+shows the engine runs, not that the picks are as good as in English. English has had far more testing. The
+rules for filler, reactions and calls to action are still English word lists, so other languages rely on the
+model for those. A title in a non-Latin script gives a file named `01_clip.mp4`, because bucket keys are ASCII.
+
+English got no worse, measured on one generated talk with the prompts as they were against as they are now,
+3 rounds each on the same transcript: 6.0 clips a round against 5.7, with a mean score of 66 against 67.
+
 ## The AI agent page
 
 `/app/agent` is a chat for working out what to do with a video. People ask questions, or drop a video
@@ -94,8 +132,8 @@ Measured with `tests/agent_eval.py`, using `--set page` and `--set page-holdout`
 
 | `openai/gpt-oss-120b` | Runs | Passed |
 |---|---|---|
-| **Held out:** 24 requests, each run 3 times | 72 | 72 |
-| Tuning set: 54 requests, each run twice, used to find and fix bugs | 108 | 107 |
+| **Held out:** 25 requests, each run 3 times | 75 | 75 |
+| Tuning set: 55 requests, each run twice, used to find and fix bugs | 110 | 106 |
 
 Don't read too much into the perfect held-out score. Earlier held-out runs missed 1 of 36, 2 of 33 and 2
 of 69. Those requests led to fixes, so they moved to the tuning set and new ones took their place. One
@@ -136,8 +174,8 @@ Working on the tone found bugs, and caused some:
 
 - **A failed message came back.** After a request failed, its question stayed in the history as if still
   waiting, so saying "hi" got an answer to it. Failed messages are no longer sent. The model given such a
-  history directly still often answers the old question, which is the one tuning miss above, so this is
-  fixed in the code and not by the prompt.
+  history directly still often answers the old question, which is 2 of the 4 tuning misses above, so this
+  is fixed in the code and not by the prompt.
 - **An opinion changed a clip.** "Clip 1 feels a bit boring to me" skipped clip 1 without being asked, in 2
   of 2 runs. It now asks first, in 10 of 10.
 - **Old facts stated as fact.** The model is sure YouTube Shorts stop at 60 seconds, which stopped being
@@ -146,8 +184,9 @@ Working on the tone found bugs, and caused some:
   own 2 GB limit, re-kept skipped clips so it could offer a render, and showed three clips when asked for
   the best one. Only the older tests caught that, which is why they run after any prompt change.
 
-The count moves a little between runs. Other runs of the same set also missed a reassurance with no next
-step, a good answer over the word limit, and describing a clip instead of pointing to the preview.
+The other 2 are a real weak spot: asked to "show me clip 3", the model said it was "playing now", though it
+can't move the preview. The count moves a little between runs. Others have also missed a reassurance with no
+next step, and a good answer over the word limit.
 
 ## The AI editor
 
@@ -182,9 +221,9 @@ The first run scored 71%, a few of those failures being the test's own mistakes,
 is what made it worth having: "cut 3 seconds" cut 5.6 because the model repeated a move that had already worked, and Groq refused 10 of 12 tries at
 "remove the sound effects" because the model sends `null` for optional settings. Both are fixed in
 the tools. An earlier held-out run scored 46 of 48. The request behind that led to a small fix, so it moved
-to the tuning set. The one tuning miss is a real weak spot: given three changes in one message, it did only
-two in 4 of 8 runs and still said it had done all three. The list of changes stays right, because it comes
-from the edits, but the sentence doesn't. The video is made up and the requests were written by the same hands as the agent, so these numbers
+to the tuning set. Which tuning request misses moves between runs, but one is a real weak spot: given three
+changes in one message, it did only two in 4 of 8 runs and still said it had done all three. The list of
+changes stays right, because it comes from the edits, but the sentence doesn't. The video is made up and the requests were written by the same hands as the agent, so these numbers
 say whether it follows instructions like these, not whether the edits look good or how real people
 will phrase things. A message takes about a second and 5,000 tokens.
 

@@ -165,7 +165,7 @@ export function AgentPage() {
       add({
         role: "agent",
         text: project.error || "The analysis stopped before it finished.",
-        retry: project.job?.language ? "language" : "failed",
+        retry: true,
       });
       return;
     }
@@ -208,7 +208,7 @@ export function AgentPage() {
   }, [rendering, renderProgress, add, qc]);
 
   const retry = useMutation({
-    mutationFn: (language: boolean) => jpost(`/api/projects/${projectId}/analyze`, language ? { any_language: true } : undefined),
+    mutationFn: () => jpost(`/api/projects/${projectId}/analyze`),
     onSuccess: () => {
       if (projectId) setAwaiting({ projectId, ask: null });
       qc.removeQueries({ queryKey: ["edit", projectId] });
@@ -325,7 +325,7 @@ export function AgentPage() {
                   canUndo={t.id === lastUndo}
                   projectId={projectId}
                   onChoice={(o) => void send(o)}
-                  onRetry={(language) => retry.mutate(language)}
+                  onRetry={() => retry.mutate()}
                 />
               ))}
               {isThisUpload && (
@@ -356,7 +356,7 @@ export function AgentPage() {
               dragging={dragging}
               busy={asking}
             />
-            <p className="muted chat-note">Kappacut works with English-language videos for now. Only upload videos you own or have permission to use.</p>
+            <p className="muted chat-note">Only upload videos you own or have permission to use.</p>
           </div>
         </section>
 

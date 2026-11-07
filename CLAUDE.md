@@ -102,8 +102,7 @@ the page down when it opens.
 ## Words
 
 - Plain sentences in sentence case, and say what to do next. Never show raw errors to users.
-- Keep this wherever a video can be uploaded: "Kappacut works with English-language videos for now.
-  Only upload videos you own or have permission to use."
+- Keep this wherever a video can be uploaded: "Only upload videos you own or have permission to use."
 
 ## Accessibility
 

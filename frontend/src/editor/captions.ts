@@ -7,6 +7,10 @@ import type { ClipEdit } from "./types";
 
 const KAR_MAX_WORDS = 5;
 const KAR_MAX_SPAN = 2.6;
+const KAR_MAX_CHARS = 10;       // the same limit in a script with no spaces between words
+// Chinese, Japanese, Thai, Lao, Burmese and Khmer: kappacut.NO_SPACE_RE
+const NO_SPACE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u0e00-\u0e7f\u0e80-\u0eff\u1000-\u109f\u1780-\u17ff]/;
+const SENTENCE_END = /[.!?\u3002\uff01\uff1f\u061f\u06d4\u0964]$/;
 
 /** Sizes are in pixels of the render's frame, 1080 wide (1920 for a horizontal clip). */
 export const CAP_STYLES = {
@@ -25,6 +29,8 @@ export interface CaptionCue {
   words: string[];
   /** The karaoke word lit up right now, or -1. */
   hot: number;
+  /** Put a space between the words. Not in a script that doesn't use them. */
+  spaced: boolean;
 }
 
 interface Word {
@@ -38,14 +44,18 @@ function cleanText(t: string | undefined, upper: boolean): string {
   return upper ? s.toUpperCase() : s;
 }
 
+const noSpaces = (words: Word[]) => words.some((w) => NO_SPACE.test(w.w));
+
 function chunkWords(words: Word[]): Word[][] {
   const sorted = [...words].sort((a, b) => a.start - b.start);
   const groups: Word[][] = [];
   let cur: Word[] = [];
   for (const w of sorted) {
     cur.push(w);
-    const full = cur.length >= KAR_MAX_WORDS || w.end - cur[0].start > KAR_MAX_SPAN;
-    if (full || (/[.!?]$/.test(w.w) && cur.length >= 3)) {
+    const bare = noSpaces(cur);
+    const many = bare ? cur.reduce((n, x) => n + x.w.length, 0) >= KAR_MAX_CHARS : cur.length >= KAR_MAX_WORDS;
+    const full = many || w.end - cur[0].start > KAR_MAX_SPAN;
+    if (full || (SENTENCE_END.test(w.w) && (cur.length >= 3 || bare))) {
       groups.push(cur);
       cur = [];
     }
@@ -97,6 +107,7 @@ export function buildCues(
             end: start + Math.max(next, w.start + 0.05),
             words: texts,
             hot: i,
+            spaced: !noSpaces(g),
           });
         });
       });
@@ -111,6 +122,7 @@ export function buildCues(
           end: start + Math.max(to, from + 0.05),
           words: [text],
           hot: -1,
+          spaced: true,
         });
       }
     }

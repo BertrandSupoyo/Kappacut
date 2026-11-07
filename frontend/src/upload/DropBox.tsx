@@ -48,7 +48,7 @@ export function DropBox({ dragging, onOpenSettings }: { dragging: boolean; onOpe
                 e.target.value = "";
               }}
             />
-            <p className="dropbox-note">Kappacut works with English-language videos for now. Only upload videos you own or have permission to use.</p>
+            <p className="dropbox-note">Only upload videos you own or have permission to use.</p>
             {error && <p className="dropbox-error" role="alert">{error}</p>}
           </>
         )}
